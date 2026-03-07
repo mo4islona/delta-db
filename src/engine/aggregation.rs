@@ -1,0 +1,1097 @@
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::types::{BlockNumber, Value};
+
+/// Trait for rollback-aware aggregation functions.
+///
+/// Each function tracks per-block contributions separately from finalized state,
+/// enabling surgical rollback to any block boundary.
+pub trait AggregationFunc: Send + Sync {
+    /// Feed values from a single block into the aggregation.
+    fn add_block(&mut self, block: BlockNumber, values: &[Value]);
+
+    /// Remove a block's contributions (rollback).
+    fn remove_block(&mut self, block: BlockNumber);
+
+    /// Remove all blocks after fork_point in one operation (batch rollback).
+    /// Default implementation calls remove_block for each, but implementations
+    /// can use split_off for O(log N) performance.
+    fn remove_blocks_after(&mut self, fork_point: BlockNumber);
+
+    /// Finalize all blocks up to and including the given block.
+    /// Merges their contributions into the finalized state and discards per-block data.
+    fn finalize_up_to(&mut self, block: BlockNumber);
+
+    /// Compute the current aggregated value (finalized + all unfinalized blocks).
+    fn current_value(&self) -> Value;
+
+    /// Returns true if the aggregation has any data (finalized or unfinalized).
+    fn has_data(&self) -> bool;
+
+    /// Serialize to bytes for persistence.
+    fn to_bytes(&self) -> Vec<u8>;
+
+    /// Serialize only the finalized portion (no unfinalized block data).
+    /// Used for crash-safe MV persistence — unfinalized blocks are replayed on recovery.
+    fn to_finalized_bytes(&self) -> Vec<u8>;
+
+    /// Deserialize from bytes.
+    fn from_bytes(bytes: &[u8]) -> Self
+    where
+        Self: Sized;
+}
+
+// ---------------------------------------------------------------------------
+// Sum
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SumAgg {
+    finalized: f64,
+    blocks: BTreeMap<BlockNumber, f64>,
+}
+
+impl SumAgg {
+    pub fn new() -> Self {
+        Self {
+            finalized: 0.0,
+            blocks: BTreeMap::new(),
+        }
+    }
+}
+
+impl AggregationFunc for SumAgg {
+    fn add_block(&mut self, block: BlockNumber, values: &[Value]) {
+        let partial: f64 = values.iter().filter_map(|v| v.as_f64()).sum();
+        *self.blocks.entry(block).or_insert(0.0) += partial;
+    }
+
+    fn remove_block(&mut self, block: BlockNumber) {
+        self.blocks.remove(&block);
+    }
+
+    fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
+        let _ = self.blocks.split_off(&(fork_point + 1));
+    }
+
+    fn finalize_up_to(&mut self, block: BlockNumber) {
+        let to_finalize: Vec<_> = self
+            .blocks
+            .range(..=block)
+            .map(|(&b, &v)| (b, v))
+            .collect();
+        for (b, v) in to_finalize {
+            self.finalized += v;
+            self.blocks.remove(&b);
+        }
+    }
+
+    fn current_value(&self) -> Value {
+        let total = self.finalized + self.blocks.values().sum::<f64>();
+        Value::Float64(total)
+    }
+
+    fn has_data(&self) -> bool {
+        self.finalized != 0.0 || !self.blocks.is_empty()
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        rmp_serde::to_vec(self).unwrap()
+    }
+
+    fn to_finalized_bytes(&self) -> Vec<u8> {
+        let mut copy = self.clone();
+        copy.blocks.clear();
+        rmp_serde::to_vec(&copy).unwrap()
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Self {
+        rmp_serde::from_slice(bytes).unwrap()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Count
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CountAgg {
+    finalized: u64,
+    blocks: BTreeMap<BlockNumber, u64>,
+}
+
+impl CountAgg {
+    pub fn new() -> Self {
+        Self {
+            finalized: 0,
+            blocks: BTreeMap::new(),
+        }
+    }
+}
+
+impl AggregationFunc for CountAgg {
+    fn add_block(&mut self, block: BlockNumber, values: &[Value]) {
+        let count = values.iter().filter(|v| !v.is_null()).count() as u64;
+        *self.blocks.entry(block).or_insert(0) += count;
+    }
+
+    fn remove_block(&mut self, block: BlockNumber) {
+        self.blocks.remove(&block);
+    }
+
+    fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
+        let _ = self.blocks.split_off(&(fork_point + 1));
+    }
+
+    fn finalize_up_to(&mut self, block: BlockNumber) {
+        let to_finalize: Vec<_> = self
+            .blocks
+            .range(..=block)
+            .map(|(&b, &v)| (b, v))
+            .collect();
+        for (b, v) in to_finalize {
+            self.finalized += v;
+            self.blocks.remove(&b);
+        }
+    }
+
+    fn current_value(&self) -> Value {
+        let total = self.finalized + self.blocks.values().sum::<u64>();
+        Value::UInt64(total)
+    }
+
+    fn has_data(&self) -> bool {
+        self.finalized > 0 || !self.blocks.is_empty()
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        rmp_serde::to_vec(self).unwrap()
+    }
+
+    fn to_finalized_bytes(&self) -> Vec<u8> {
+        let mut copy = self.clone();
+        copy.blocks.clear();
+        rmp_serde::to_vec(&copy).unwrap()
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Self {
+        rmp_serde::from_slice(bytes).unwrap()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Min
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MinAgg {
+    finalized: Option<f64>,
+    blocks: BTreeMap<BlockNumber, f64>,
+}
+
+impl MinAgg {
+    pub fn new() -> Self {
+        Self {
+            finalized: None,
+            blocks: BTreeMap::new(),
+        }
+    }
+}
+
+impl AggregationFunc for MinAgg {
+    fn add_block(&mut self, block: BlockNumber, values: &[Value]) {
+        let block_min = values.iter().filter_map(|v| v.as_f64()).reduce(f64::min);
+        if let Some(min_val) = block_min {
+            let entry = self.blocks.entry(block).or_insert(f64::INFINITY);
+            *entry = entry.min(min_val);
+        }
+    }
+
+    fn remove_block(&mut self, block: BlockNumber) {
+        self.blocks.remove(&block);
+    }
+
+    fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
+        let _ = self.blocks.split_off(&(fork_point + 1));
+    }
+
+    fn finalize_up_to(&mut self, block: BlockNumber) {
+        let to_finalize: Vec<_> = self
+            .blocks
+            .range(..=block)
+            .map(|(&b, &v)| (b, v))
+            .collect();
+        for (b, v) in to_finalize {
+            self.finalized = Some(match self.finalized {
+                Some(f) => f.min(v),
+                None => v,
+            });
+            self.blocks.remove(&b);
+        }
+    }
+
+    fn current_value(&self) -> Value {
+        let unfinalized_min = self.blocks.values().copied().reduce(f64::min);
+        let result = match (self.finalized, unfinalized_min) {
+            (Some(f), Some(u)) => Some(f.min(u)),
+            (Some(f), None) => Some(f),
+            (None, Some(u)) => Some(u),
+            (None, None) => None,
+        };
+        match result {
+            Some(v) => Value::Float64(v),
+            None => Value::Null,
+        }
+    }
+
+    fn has_data(&self) -> bool {
+        self.finalized.is_some() || !self.blocks.is_empty()
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        rmp_serde::to_vec(self).unwrap()
+    }
+
+    fn to_finalized_bytes(&self) -> Vec<u8> {
+        let mut copy = self.clone();
+        copy.blocks.clear();
+        rmp_serde::to_vec(&copy).unwrap()
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Self {
+        rmp_serde::from_slice(bytes).unwrap()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Max
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaxAgg {
+    finalized: Option<f64>,
+    blocks: BTreeMap<BlockNumber, f64>,
+}
+
+impl MaxAgg {
+    pub fn new() -> Self {
+        Self {
+            finalized: None,
+            blocks: BTreeMap::new(),
+        }
+    }
+}
+
+impl AggregationFunc for MaxAgg {
+    fn add_block(&mut self, block: BlockNumber, values: &[Value]) {
+        let block_max = values.iter().filter_map(|v| v.as_f64()).reduce(f64::max);
+        if let Some(max_val) = block_max {
+            let entry = self.blocks.entry(block).or_insert(f64::NEG_INFINITY);
+            *entry = entry.max(max_val);
+        }
+    }
+
+    fn remove_block(&mut self, block: BlockNumber) {
+        self.blocks.remove(&block);
+    }
+
+    fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
+        let _ = self.blocks.split_off(&(fork_point + 1));
+    }
+
+    fn finalize_up_to(&mut self, block: BlockNumber) {
+        let to_finalize: Vec<_> = self
+            .blocks
+            .range(..=block)
+            .map(|(&b, &v)| (b, v))
+            .collect();
+        for (b, v) in to_finalize {
+            self.finalized = Some(match self.finalized {
+                Some(f) => f.max(v),
+                None => v,
+            });
+            self.blocks.remove(&b);
+        }
+    }
+
+    fn current_value(&self) -> Value {
+        let unfinalized_max = self.blocks.values().copied().reduce(f64::max);
+        let result = match (self.finalized, unfinalized_max) {
+            (Some(f), Some(u)) => Some(f.max(u)),
+            (Some(f), None) => Some(f),
+            (None, Some(u)) => Some(u),
+            (None, None) => None,
+        };
+        match result {
+            Some(v) => Value::Float64(v),
+            None => Value::Null,
+        }
+    }
+
+    fn has_data(&self) -> bool {
+        self.finalized.is_some() || !self.blocks.is_empty()
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        rmp_serde::to_vec(self).unwrap()
+    }
+
+    fn to_finalized_bytes(&self) -> Vec<u8> {
+        let mut copy = self.clone();
+        copy.blocks.clear();
+        rmp_serde::to_vec(&copy).unwrap()
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Self {
+        rmp_serde::from_slice(bytes).unwrap()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Avg — stored as (sum, count) internally
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AvgAgg {
+    finalized_sum: f64,
+    finalized_count: u64,
+    blocks: BTreeMap<BlockNumber, (f64, u64)>,
+}
+
+impl AvgAgg {
+    pub fn new() -> Self {
+        Self {
+            finalized_sum: 0.0,
+            finalized_count: 0,
+            blocks: BTreeMap::new(),
+        }
+    }
+}
+
+impl AggregationFunc for AvgAgg {
+    fn add_block(&mut self, block: BlockNumber, values: &[Value]) {
+        let nums: Vec<f64> = values.iter().filter_map(|v| v.as_f64()).collect();
+        if !nums.is_empty() {
+            let entry = self.blocks.entry(block).or_insert((0.0, 0));
+            entry.0 += nums.iter().sum::<f64>();
+            entry.1 += nums.len() as u64;
+        }
+    }
+
+    fn remove_block(&mut self, block: BlockNumber) {
+        self.blocks.remove(&block);
+    }
+
+    fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
+        let _ = self.blocks.split_off(&(fork_point + 1));
+    }
+
+    fn finalize_up_to(&mut self, block: BlockNumber) {
+        let to_finalize: Vec<_> = self
+            .blocks
+            .range(..=block)
+            .map(|(&b, &v)| (b, v))
+            .collect();
+        for (b, (s, c)) in to_finalize {
+            self.finalized_sum += s;
+            self.finalized_count += c;
+            self.blocks.remove(&b);
+        }
+    }
+
+    fn current_value(&self) -> Value {
+        let total_sum: f64 =
+            self.finalized_sum + self.blocks.values().map(|(s, _)| s).sum::<f64>();
+        let total_count: u64 =
+            self.finalized_count + self.blocks.values().map(|(_, c)| c).sum::<u64>();
+        if total_count == 0 {
+            Value::Null
+        } else {
+            Value::Float64(total_sum / total_count as f64)
+        }
+    }
+
+    fn has_data(&self) -> bool {
+        self.finalized_count > 0 || !self.blocks.is_empty()
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        rmp_serde::to_vec(self).unwrap()
+    }
+
+    fn to_finalized_bytes(&self) -> Vec<u8> {
+        let mut copy = self.clone();
+        copy.blocks.clear();
+        rmp_serde::to_vec(&copy).unwrap()
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Self {
+        rmp_serde::from_slice(bytes).unwrap()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// First — finalized value is immutable once set; per-block first candidates
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FirstAgg {
+    finalized: Option<Value>,
+    /// block -> first value seen in that block
+    blocks: BTreeMap<BlockNumber, Value>,
+}
+
+impl FirstAgg {
+    pub fn new() -> Self {
+        Self {
+            finalized: None,
+            blocks: BTreeMap::new(),
+        }
+    }
+}
+
+impl AggregationFunc for FirstAgg {
+    fn add_block(&mut self, block: BlockNumber, values: &[Value]) {
+        if self.blocks.contains_key(&block) {
+            return; // keep the first value for this block
+        }
+        if let Some(first) = values.iter().find(|v| !v.is_null()) {
+            self.blocks.insert(block, first.clone());
+        }
+    }
+
+    fn remove_block(&mut self, block: BlockNumber) {
+        self.blocks.remove(&block);
+    }
+
+    fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
+        let _ = self.blocks.split_off(&(fork_point + 1));
+    }
+
+    fn finalize_up_to(&mut self, block: BlockNumber) {
+        // Finalized first = earliest block's first value
+        if self.finalized.is_none() {
+            let earliest = self.blocks.range(..=block).next().map(|(_, v)| v.clone());
+            if let Some(v) = earliest {
+                self.finalized = Some(v);
+            }
+        }
+        let to_remove: Vec<_> = self.blocks.range(..=block).map(|(&b, _)| b).collect();
+        for b in to_remove {
+            self.blocks.remove(&b);
+        }
+    }
+
+    fn current_value(&self) -> Value {
+        // Finalized takes priority (it's the earliest value ever)
+        if let Some(v) = &self.finalized {
+            return v.clone();
+        }
+        // Otherwise pick the earliest unfinalized block's first value
+        self.blocks
+            .values()
+            .next()
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    fn has_data(&self) -> bool {
+        self.finalized.is_some() || !self.blocks.is_empty()
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        rmp_serde::to_vec(self).unwrap()
+    }
+
+    fn to_finalized_bytes(&self) -> Vec<u8> {
+        let mut copy = self.clone();
+        copy.blocks.clear();
+        rmp_serde::to_vec(&copy).unwrap()
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Self {
+        rmp_serde::from_slice(bytes).unwrap()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Last — per-block last values; pick latest remaining
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LastAgg {
+    finalized: Option<Value>,
+    /// block -> last value seen in that block
+    blocks: BTreeMap<BlockNumber, Value>,
+}
+
+impl LastAgg {
+    pub fn new() -> Self {
+        Self {
+            finalized: None,
+            blocks: BTreeMap::new(),
+        }
+    }
+}
+
+impl AggregationFunc for LastAgg {
+    fn add_block(&mut self, block: BlockNumber, values: &[Value]) {
+        // Always update to the last non-null value for this block
+        if let Some(last) = values.iter().rev().find(|v| !v.is_null()) {
+            self.blocks.insert(block, last.clone());
+        }
+    }
+
+    fn remove_block(&mut self, block: BlockNumber) {
+        self.blocks.remove(&block);
+    }
+
+    fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
+        let _ = self.blocks.split_off(&(fork_point + 1));
+    }
+
+    fn finalize_up_to(&mut self, block: BlockNumber) {
+        // Finalized last = latest value from blocks being finalized
+        let latest = self
+            .blocks
+            .range(..=block)
+            .next_back()
+            .map(|(_, v)| v.clone());
+        if let Some(v) = latest {
+            self.finalized = Some(v);
+        }
+        let to_remove: Vec<_> = self.blocks.range(..=block).map(|(&b, _)| b).collect();
+        for b in to_remove {
+            self.blocks.remove(&b);
+        }
+    }
+
+    fn current_value(&self) -> Value {
+        // Latest unfinalized block takes priority, else finalized
+        if let Some((_, v)) = self.blocks.iter().next_back() {
+            return v.clone();
+        }
+        self.finalized.clone().unwrap_or(Value::Null)
+    }
+
+    fn has_data(&self) -> bool {
+        self.finalized.is_some() || !self.blocks.is_empty()
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        rmp_serde::to_vec(self).unwrap()
+    }
+
+    fn to_finalized_bytes(&self) -> Vec<u8> {
+        let mut copy = self.clone();
+        copy.blocks.clear();
+        rmp_serde::to_vec(&copy).unwrap()
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Self {
+        rmp_serde::from_slice(bytes).unwrap()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// toStartOfInterval — pure function
+// ---------------------------------------------------------------------------
+
+/// Truncate a DateTime (milliseconds) to the start of the given interval.
+pub fn to_start_of_interval(datetime_ms: i64, interval_seconds: u64) -> i64 {
+    let interval_ms = interval_seconds as i64 * 1000;
+    if interval_ms == 0 {
+        return datetime_ms;
+    }
+    (datetime_ms / interval_ms) * interval_ms
+}
+
+// ---------------------------------------------------------------------------
+// Factory
+// ---------------------------------------------------------------------------
+
+use crate::schema::ast::AggFunc;
+
+/// Create a boxed aggregation function from the schema's AggFunc enum.
+pub fn create_agg(func: &AggFunc) -> Box<dyn AggregationFunc> {
+    match func {
+        AggFunc::Sum => Box::new(SumAgg::new()),
+        AggFunc::Count => Box::new(CountAgg::new()),
+        AggFunc::Min => Box::new(MinAgg::new()),
+        AggFunc::Max => Box::new(MaxAgg::new()),
+        AggFunc::Avg => Box::new(AvgAgg::new()),
+        AggFunc::First => Box::new(FirstAgg::new()),
+        AggFunc::Last => Box::new(LastAgg::new()),
+    }
+}
+
+/// Restore a boxed aggregation function from persisted bytes.
+pub fn restore_agg(func: &AggFunc, bytes: &[u8]) -> Box<dyn AggregationFunc> {
+    match func {
+        AggFunc::Sum => Box::new(SumAgg::from_bytes(bytes)),
+        AggFunc::Count => Box::new(CountAgg::from_bytes(bytes)),
+        AggFunc::Min => Box::new(MinAgg::from_bytes(bytes)),
+        AggFunc::Max => Box::new(MaxAgg::from_bytes(bytes)),
+        AggFunc::Avg => Box::new(AvgAgg::from_bytes(bytes)),
+        AggFunc::First => Box::new(FirstAgg::from_bytes(bytes)),
+        AggFunc::Last => Box::new(LastAgg::from_bytes(bytes)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Sum ---
+
+    #[test]
+    fn sum_basic() {
+        let mut agg = SumAgg::new();
+        agg.add_block(100, &[Value::Float64(10.0), Value::Float64(20.0)]);
+        agg.add_block(101, &[Value::Float64(5.0)]);
+        assert_eq!(agg.current_value(), Value::Float64(35.0));
+    }
+
+    #[test]
+    fn sum_rollback() {
+        let mut agg = SumAgg::new();
+        agg.add_block(100, &[Value::Float64(10.0)]);
+        agg.add_block(101, &[Value::Float64(20.0)]);
+        agg.add_block(102, &[Value::Float64(30.0)]);
+
+        agg.remove_block(102);
+        assert_eq!(agg.current_value(), Value::Float64(30.0));
+
+        agg.remove_block(101);
+        assert_eq!(agg.current_value(), Value::Float64(10.0));
+    }
+
+    #[test]
+    fn sum_finalize() {
+        let mut agg = SumAgg::new();
+        agg.add_block(100, &[Value::Float64(10.0)]);
+        agg.add_block(101, &[Value::Float64(20.0)]);
+        agg.add_block(102, &[Value::Float64(30.0)]);
+
+        agg.finalize_up_to(101);
+        // Finalized: 10+20=30, unfinalized: 30
+        assert_eq!(agg.current_value(), Value::Float64(60.0));
+
+        // Rollback block 102
+        agg.remove_block(102);
+        assert_eq!(agg.current_value(), Value::Float64(30.0));
+    }
+
+    #[test]
+    fn sum_with_integers() {
+        let mut agg = SumAgg::new();
+        agg.add_block(100, &[Value::UInt64(10), Value::Int64(5)]);
+        assert_eq!(agg.current_value(), Value::Float64(15.0));
+    }
+
+    #[test]
+    fn sum_ignores_non_numeric() {
+        let mut agg = SumAgg::new();
+        agg.add_block(100, &[Value::Float64(10.0), Value::String("hello".into()), Value::Null]);
+        assert_eq!(agg.current_value(), Value::Float64(10.0));
+    }
+
+    // --- Count ---
+
+    #[test]
+    fn count_basic() {
+        let mut agg = CountAgg::new();
+        agg.add_block(100, &[Value::Float64(1.0), Value::Float64(2.0)]);
+        agg.add_block(101, &[Value::Float64(3.0)]);
+        assert_eq!(agg.current_value(), Value::UInt64(3));
+    }
+
+    #[test]
+    fn count_skips_null() {
+        let mut agg = CountAgg::new();
+        agg.add_block(100, &[Value::Float64(1.0), Value::Null, Value::Float64(2.0)]);
+        assert_eq!(agg.current_value(), Value::UInt64(2));
+    }
+
+    #[test]
+    fn count_rollback() {
+        let mut agg = CountAgg::new();
+        agg.add_block(100, &[Value::Float64(1.0)]);
+        agg.add_block(101, &[Value::Float64(2.0), Value::Float64(3.0)]);
+
+        agg.remove_block(101);
+        assert_eq!(agg.current_value(), Value::UInt64(1));
+    }
+
+    #[test]
+    fn count_finalize_then_rollback() {
+        let mut agg = CountAgg::new();
+        agg.add_block(100, &[Value::Float64(1.0)]);
+        agg.add_block(101, &[Value::Float64(2.0)]);
+        agg.add_block(102, &[Value::Float64(3.0)]);
+
+        agg.finalize_up_to(101);
+        assert_eq!(agg.current_value(), Value::UInt64(3));
+
+        agg.remove_block(102);
+        assert_eq!(agg.current_value(), Value::UInt64(2));
+    }
+
+    // --- Min ---
+
+    #[test]
+    fn min_basic() {
+        let mut agg = MinAgg::new();
+        agg.add_block(100, &[Value::Float64(30.0), Value::Float64(10.0)]);
+        agg.add_block(101, &[Value::Float64(20.0)]);
+        assert_eq!(agg.current_value(), Value::Float64(10.0));
+    }
+
+    #[test]
+    fn min_rollback_recomputes() {
+        let mut agg = MinAgg::new();
+        agg.add_block(100, &[Value::Float64(20.0)]);
+        agg.add_block(101, &[Value::Float64(5.0)]); // this is the global min
+        agg.add_block(102, &[Value::Float64(15.0)]);
+
+        agg.remove_block(101);
+        // Min should now be 15.0 (recomputed from remaining blocks 100, 102)
+        assert_eq!(agg.current_value(), Value::Float64(15.0));
+    }
+
+    #[test]
+    fn min_finalize_preserves() {
+        let mut agg = MinAgg::new();
+        agg.add_block(100, &[Value::Float64(10.0)]);
+        agg.add_block(101, &[Value::Float64(5.0)]);
+        agg.add_block(102, &[Value::Float64(20.0)]);
+
+        agg.finalize_up_to(101);
+        // Finalized min: 5.0
+        assert_eq!(agg.current_value(), Value::Float64(5.0));
+
+        agg.remove_block(102);
+        // Still 5.0 (finalized)
+        assert_eq!(agg.current_value(), Value::Float64(5.0));
+    }
+
+    #[test]
+    fn min_empty() {
+        let agg = MinAgg::new();
+        assert_eq!(agg.current_value(), Value::Null);
+        assert!(!agg.has_data());
+    }
+
+    // --- Max ---
+
+    #[test]
+    fn max_basic() {
+        let mut agg = MaxAgg::new();
+        agg.add_block(100, &[Value::Float64(10.0), Value::Float64(30.0)]);
+        agg.add_block(101, &[Value::Float64(20.0)]);
+        assert_eq!(agg.current_value(), Value::Float64(30.0));
+    }
+
+    #[test]
+    fn max_rollback_recomputes() {
+        let mut agg = MaxAgg::new();
+        agg.add_block(100, &[Value::Float64(10.0)]);
+        agg.add_block(101, &[Value::Float64(50.0)]); // global max
+        agg.add_block(102, &[Value::Float64(30.0)]);
+
+        agg.remove_block(101);
+        assert_eq!(agg.current_value(), Value::Float64(30.0));
+    }
+
+    #[test]
+    fn max_finalize_preserves() {
+        let mut agg = MaxAgg::new();
+        agg.add_block(100, &[Value::Float64(50.0)]);
+        agg.add_block(101, &[Value::Float64(10.0)]);
+        agg.add_block(102, &[Value::Float64(30.0)]);
+
+        agg.finalize_up_to(101);
+        // Finalized max: 50.0
+        agg.remove_block(102);
+        assert_eq!(agg.current_value(), Value::Float64(50.0));
+    }
+
+    // --- Avg ---
+
+    #[test]
+    fn avg_basic() {
+        let mut agg = AvgAgg::new();
+        agg.add_block(100, &[Value::Float64(10.0), Value::Float64(20.0)]);
+        agg.add_block(101, &[Value::Float64(30.0)]);
+        // avg(10, 20, 30) = 20
+        assert_eq!(agg.current_value(), Value::Float64(20.0));
+    }
+
+    #[test]
+    fn avg_rollback() {
+        let mut agg = AvgAgg::new();
+        agg.add_block(100, &[Value::Float64(10.0)]);
+        agg.add_block(101, &[Value::Float64(30.0)]);
+        // avg(10, 30) = 20
+        assert_eq!(agg.current_value(), Value::Float64(20.0));
+
+        agg.remove_block(101);
+        // avg(10) = 10
+        assert_eq!(agg.current_value(), Value::Float64(10.0));
+    }
+
+    #[test]
+    fn avg_finalize_then_rollback() {
+        let mut agg = AvgAgg::new();
+        agg.add_block(100, &[Value::Float64(10.0)]);
+        agg.add_block(101, &[Value::Float64(20.0)]);
+        agg.add_block(102, &[Value::Float64(60.0)]);
+
+        agg.finalize_up_to(101);
+        // finalized: sum=30, count=2. unfinalized: block 102 sum=60, count=1
+        // total avg = 90/3 = 30
+        assert_eq!(agg.current_value(), Value::Float64(30.0));
+
+        agg.remove_block(102);
+        // avg = 30/2 = 15
+        assert_eq!(agg.current_value(), Value::Float64(15.0));
+    }
+
+    #[test]
+    fn avg_empty() {
+        let agg = AvgAgg::new();
+        assert_eq!(agg.current_value(), Value::Null);
+    }
+
+    // --- First ---
+
+    #[test]
+    fn first_basic() {
+        let mut agg = FirstAgg::new();
+        agg.add_block(100, &[Value::Float64(10.0)]);
+        agg.add_block(101, &[Value::Float64(20.0)]);
+        assert_eq!(agg.current_value(), Value::Float64(10.0));
+    }
+
+    #[test]
+    fn first_rollback_earliest() {
+        let mut agg = FirstAgg::new();
+        agg.add_block(100, &[Value::Float64(10.0)]);
+        agg.add_block(101, &[Value::Float64(20.0)]);
+
+        agg.remove_block(100);
+        assert_eq!(agg.current_value(), Value::Float64(20.0));
+    }
+
+    #[test]
+    fn first_finalized_immutable() {
+        let mut agg = FirstAgg::new();
+        agg.add_block(100, &[Value::Float64(10.0)]);
+        agg.add_block(101, &[Value::Float64(20.0)]);
+        agg.add_block(102, &[Value::Float64(30.0)]);
+
+        agg.finalize_up_to(101);
+        // Finalized first: 10.0
+        assert_eq!(agg.current_value(), Value::Float64(10.0));
+
+        agg.remove_block(102);
+        // Still 10.0 — finalized is immutable
+        assert_eq!(agg.current_value(), Value::Float64(10.0));
+    }
+
+    #[test]
+    fn first_skips_null() {
+        let mut agg = FirstAgg::new();
+        agg.add_block(100, &[Value::Null, Value::Float64(10.0)]);
+        assert_eq!(agg.current_value(), Value::Float64(10.0));
+    }
+
+    // --- Last ---
+
+    #[test]
+    fn last_basic() {
+        let mut agg = LastAgg::new();
+        agg.add_block(100, &[Value::Float64(10.0)]);
+        agg.add_block(101, &[Value::Float64(20.0)]);
+        assert_eq!(agg.current_value(), Value::Float64(20.0));
+    }
+
+    #[test]
+    fn last_rollback_falls_back() {
+        let mut agg = LastAgg::new();
+        agg.add_block(100, &[Value::Float64(10.0)]);
+        agg.add_block(101, &[Value::Float64(20.0)]);
+
+        agg.remove_block(101);
+        assert_eq!(agg.current_value(), Value::Float64(10.0));
+    }
+
+    #[test]
+    fn last_finalize_then_rollback_to_finalized() {
+        let mut agg = LastAgg::new();
+        agg.add_block(100, &[Value::Float64(10.0)]);
+        agg.add_block(101, &[Value::Float64(20.0)]);
+        agg.add_block(102, &[Value::Float64(30.0)]);
+
+        agg.finalize_up_to(101);
+        // Finalized last: 20.0, unfinalized latest: 30.0
+        assert_eq!(agg.current_value(), Value::Float64(30.0));
+
+        agg.remove_block(102);
+        // Falls back to finalized: 20.0
+        assert_eq!(agg.current_value(), Value::Float64(20.0));
+    }
+
+    #[test]
+    fn last_multiple_values_in_block() {
+        let mut agg = LastAgg::new();
+        agg.add_block(100, &[Value::Float64(10.0), Value::Float64(20.0), Value::Float64(30.0)]);
+        assert_eq!(agg.current_value(), Value::Float64(30.0));
+    }
+
+    #[test]
+    fn last_skips_trailing_null() {
+        let mut agg = LastAgg::new();
+        agg.add_block(100, &[Value::Float64(10.0), Value::Null]);
+        assert_eq!(agg.current_value(), Value::Float64(10.0));
+    }
+
+    // --- toStartOfInterval ---
+
+    #[test]
+    fn interval_5min() {
+        // 5 minutes = 300 seconds
+        let ts = 1_700_000_123_456i64; // some timestamp in ms
+        let result = to_start_of_interval(ts, 300);
+        assert_eq!(result % (300 * 1000), 0);
+        assert!(result <= ts);
+        assert!(ts - result < 300 * 1000);
+    }
+
+    #[test]
+    fn interval_1hour() {
+        let ts = 1_700_000_123_456i64;
+        let result = to_start_of_interval(ts, 3600);
+        assert_eq!(result % (3600 * 1000), 0);
+        assert!(result <= ts);
+    }
+
+    #[test]
+    fn interval_exact_boundary() {
+        let ts = 300_000i64; // exactly 5 minutes in ms
+        assert_eq!(to_start_of_interval(ts, 300), 300_000);
+    }
+
+    // --- Serialization roundtrip ---
+
+    #[test]
+    fn sum_serde_roundtrip() {
+        let mut agg = SumAgg::new();
+        agg.add_block(100, &[Value::Float64(10.0)]);
+        agg.add_block(101, &[Value::Float64(20.0)]);
+        agg.finalize_up_to(100);
+
+        let bytes = agg.to_bytes();
+        let restored = SumAgg::from_bytes(&bytes);
+        assert_eq!(restored.current_value(), agg.current_value());
+    }
+
+    #[test]
+    fn first_serde_roundtrip() {
+        let mut agg = FirstAgg::new();
+        agg.add_block(100, &[Value::String("hello".into())]);
+        agg.finalize_up_to(100);
+
+        let bytes = agg.to_bytes();
+        let restored = FirstAgg::from_bytes(&bytes);
+        assert_eq!(restored.current_value(), Value::String("hello".into()));
+    }
+
+    #[test]
+    fn last_serde_roundtrip() {
+        let mut agg = LastAgg::new();
+        agg.add_block(100, &[Value::UInt64(42)]);
+        agg.add_block(101, &[Value::UInt64(99)]);
+
+        let bytes = agg.to_bytes();
+        let restored = LastAgg::from_bytes(&bytes);
+        assert_eq!(restored.current_value(), Value::UInt64(99));
+    }
+
+    // --- OHLCV candle scenario from RFC Section 10 ---
+
+    #[test]
+    fn ohlcv_candle_rollback() {
+        // Simulate: 50 trades across blocks 1000-1003. Block 1003 gets rolled back.
+        let mut open = FirstAgg::new();
+        let mut high = MaxAgg::new();
+        let mut low = MinAgg::new();
+        let mut close = LastAgg::new();
+        let mut volume = SumAgg::new();
+        let mut count = CountAgg::new();
+
+        // Block 1000: price=100, amount=1
+        let prices_1000 = &[Value::Float64(100.0)];
+        let amounts_1000 = &[Value::Float64(1.0)];
+        open.add_block(1000, prices_1000);
+        high.add_block(1000, prices_1000);
+        low.add_block(1000, prices_1000);
+        close.add_block(1000, prices_1000);
+        volume.add_block(1000, amounts_1000);
+        count.add_block(1000, prices_1000);
+
+        // Block 1001: price=110, amount=2
+        let prices_1001 = &[Value::Float64(110.0)];
+        let amounts_1001 = &[Value::Float64(2.0)];
+        open.add_block(1001, prices_1001);
+        high.add_block(1001, prices_1001);
+        low.add_block(1001, prices_1001);
+        close.add_block(1001, prices_1001);
+        volume.add_block(1001, amounts_1001);
+        count.add_block(1001, prices_1001);
+
+        // Block 1002: price=90, amount=3
+        let prices_1002 = &[Value::Float64(90.0)];
+        let amounts_1002 = &[Value::Float64(3.0)];
+        open.add_block(1002, prices_1002);
+        high.add_block(1002, prices_1002);
+        low.add_block(1002, prices_1002);
+        close.add_block(1002, prices_1002);
+        volume.add_block(1002, amounts_1002);
+        count.add_block(1002, prices_1002);
+
+        // Block 1003: price=200, amount=10 (will be rolled back)
+        let prices_1003 = &[Value::Float64(200.0)];
+        let amounts_1003 = &[Value::Float64(10.0)];
+        open.add_block(1003, prices_1003);
+        high.add_block(1003, prices_1003);
+        low.add_block(1003, prices_1003);
+        close.add_block(1003, prices_1003);
+        volume.add_block(1003, amounts_1003);
+        count.add_block(1003, prices_1003);
+
+        // Before rollback
+        assert_eq!(high.current_value(), Value::Float64(200.0));
+        assert_eq!(close.current_value(), Value::Float64(200.0));
+        assert_eq!(volume.current_value(), Value::Float64(16.0));
+        assert_eq!(count.current_value(), Value::UInt64(4));
+
+        // Rollback block 1003
+        open.remove_block(1003);
+        high.remove_block(1003);
+        low.remove_block(1003);
+        close.remove_block(1003);
+        volume.remove_block(1003);
+        count.remove_block(1003);
+
+        // After rollback
+        assert_eq!(open.current_value(), Value::Float64(100.0)); // unchanged
+        assert_eq!(high.current_value(), Value::Float64(110.0)); // recomputed
+        assert_eq!(low.current_value(), Value::Float64(90.0));   // recomputed
+        assert_eq!(close.current_value(), Value::Float64(90.0)); // falls back to block 1002
+        assert_eq!(volume.current_value(), Value::Float64(6.0)); // subtracted
+        assert_eq!(count.current_value(), Value::UInt64(3));      // subtracted
+    }
+}
