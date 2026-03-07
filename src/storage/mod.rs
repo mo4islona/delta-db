@@ -1,0 +1,409 @@
+pub mod memory;
+pub mod rocks;
+
+use crate::error::Result;
+use crate::types::{BlockNumber, ColumnRegistry, Row, RowMap, Value};
+use std::sync::Arc;
+
+/// An operation to be committed atomically as part of a WriteBatch.
+pub enum BatchOp {
+    SetReducerFinalized {
+        reducer: String,
+        group_key: Vec<u8>,
+        state: Vec<u8>,
+    },
+    PutMvState {
+        view: String,
+        group_key: Vec<u8>,
+        state: Vec<u8>,
+    },
+    PutMeta {
+        key: String,
+        value: Vec<u8>,
+    },
+}
+
+/// A collection of operations to be committed atomically.
+/// Used for crash-safe finalization: all reducer state + metadata
+/// is written in a single atomic operation.
+pub struct StorageWriteBatch {
+    pub ops: Vec<BatchOp>,
+}
+
+impl StorageWriteBatch {
+    pub fn new() -> Self {
+        Self { ops: Vec::new() }
+    }
+
+    pub fn set_reducer_finalized(&mut self, reducer: &str, group_key: &[u8], state: &[u8]) {
+        self.ops.push(BatchOp::SetReducerFinalized {
+            reducer: reducer.to_string(),
+            group_key: group_key.to_vec(),
+            state: state.to_vec(),
+        });
+    }
+
+    pub fn put_mv_state(&mut self, view: &str, group_key: &[u8], state: &[u8]) {
+        self.ops.push(BatchOp::PutMvState {
+            view: view.to_string(),
+            group_key: group_key.to_vec(),
+            state: state.to_vec(),
+        });
+    }
+
+    pub fn put_meta(&mut self, key: &str, value: &[u8]) {
+        self.ops.push(BatchOp::PutMeta {
+            key: key.to_string(),
+            value: value.to_vec(),
+        });
+    }
+}
+
+/// Serialized state blob (MessagePack-encoded).
+pub type StateBytes = Vec<u8>;
+
+/// A composite key for reducer/MV group lookups, serialized for storage.
+pub type GroupKeyBytes = Vec<u8>;
+
+/// Encode a group key (Vec<Value>) into deterministic bytes for storage keying.
+pub fn encode_group_key(key: &[Value]) -> GroupKeyBytes {
+    rmp_serde::to_vec(key).expect("group key serialization should not fail")
+}
+
+/// Decode a group key from storage bytes.
+pub fn decode_group_key(bytes: &[u8]) -> Vec<Value> {
+    rmp_serde::from_slice(bytes).expect("group key deserialization should not fail")
+}
+
+/// Encode reducer state (RowMap) to bytes.
+pub fn encode_state(state: &RowMap) -> StateBytes {
+    rmp_serde::to_vec(state).expect("state serialization should not fail")
+}
+
+/// Decode reducer state from bytes.
+pub fn decode_state(bytes: &[u8]) -> RowMap {
+    rmp_serde::from_slice(bytes).expect("state deserialization should not fail")
+}
+
+// --- Custom binary row encoding ---
+//
+// Format:
+//   num_rows: u32 LE
+//   num_cols: u16 LE
+//   For each row × column:
+//     type_tag: u8
+//     data (varies by type — see encode_value/decode_value)
+//
+// This avoids serde/msgpack overhead for the inner Value serialization loop.
+
+const TAG_NULL: u8 = 0;
+const TAG_UINT64: u8 = 1;
+const TAG_INT64: u8 = 2;
+const TAG_FLOAT64: u8 = 3;
+const TAG_STRING: u8 = 4;
+const TAG_DATETIME: u8 = 5;
+const TAG_BOOLEAN: u8 = 6;
+const TAG_BYTES: u8 = 7;
+const TAG_UINT256: u8 = 8;
+const TAG_BASE58: u8 = 9;
+
+fn encode_value(buf: &mut Vec<u8>, val: &Value) {
+    match val {
+        Value::Null => buf.push(TAG_NULL),
+        Value::UInt64(v) => {
+            buf.push(TAG_UINT64);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        Value::Int64(v) => {
+            buf.push(TAG_INT64);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        Value::Float64(v) => {
+            buf.push(TAG_FLOAT64);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        Value::String(s) => {
+            buf.push(TAG_STRING);
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        Value::DateTime(v) => {
+            buf.push(TAG_DATETIME);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        Value::Boolean(v) => {
+            buf.push(TAG_BOOLEAN);
+            buf.push(if *v { 1 } else { 0 });
+        }
+        Value::Bytes(v) => {
+            buf.push(TAG_BYTES);
+            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            buf.extend_from_slice(v);
+        }
+        Value::Uint256(v) => {
+            buf.push(TAG_UINT256);
+            buf.extend_from_slice(v);
+        }
+        Value::Base58(v) => {
+            buf.push(TAG_BASE58);
+            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            buf.extend_from_slice(v);
+        }
+    }
+}
+
+fn decode_value(bytes: &[u8], pos: &mut usize) -> Value {
+    let tag = bytes[*pos];
+    *pos += 1;
+    match tag {
+        TAG_NULL => Value::Null,
+        TAG_UINT64 => {
+            let v = u64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
+            *pos += 8;
+            Value::UInt64(v)
+        }
+        TAG_INT64 => {
+            let v = i64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
+            *pos += 8;
+            Value::Int64(v)
+        }
+        TAG_FLOAT64 => {
+            let v = f64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
+            *pos += 8;
+            Value::Float64(v)
+        }
+        TAG_STRING => {
+            let len = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap()) as usize;
+            *pos += 4;
+            let s = std::str::from_utf8(&bytes[*pos..*pos + len])
+                .expect("invalid utf8 in stored string")
+                .to_string();
+            *pos += len;
+            Value::String(s)
+        }
+        TAG_DATETIME => {
+            let v = i64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
+            *pos += 8;
+            Value::DateTime(v)
+        }
+        TAG_BOOLEAN => {
+            let v = bytes[*pos] != 0;
+            *pos += 1;
+            Value::Boolean(v)
+        }
+        TAG_BYTES => {
+            let len = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap()) as usize;
+            *pos += 4;
+            let v = bytes[*pos..*pos + len].to_vec();
+            *pos += len;
+            Value::Bytes(v)
+        }
+        TAG_UINT256 => {
+            let v: [u8; 32] = bytes[*pos..*pos + 32].try_into().unwrap();
+            *pos += 32;
+            Value::Uint256(v)
+        }
+        TAG_BASE58 => {
+            let len = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap()) as usize;
+            *pos += 4;
+            let v = bytes[*pos..*pos + len].to_vec();
+            *pos += len;
+            Value::Base58(v)
+        }
+        _ => panic!("unknown value type tag: {tag}"),
+    }
+}
+
+/// Encode rows directly from RowMaps using the registry's column order.
+/// Avoids creating intermediate Row objects.
+pub fn encode_rows_from_maps(maps: &[RowMap], registry: &ColumnRegistry) -> Vec<u8> {
+    let num_rows = maps.len();
+    let num_cols = registry.len();
+    let mut buf = Vec::with_capacity(6 + num_rows * num_cols * 10);
+
+    buf.extend_from_slice(&(num_rows as u32).to_le_bytes());
+    buf.extend_from_slice(&(num_cols as u16).to_le_bytes());
+
+    for map in maps {
+        for name in registry.names() {
+            match map.get(name) {
+                None => buf.push(TAG_NULL),
+                Some(val) => encode_value(&mut buf, val),
+            }
+        }
+    }
+
+    buf
+}
+
+/// Encode Row objects into bytes for storage.
+pub fn encode_rows(rows: &[Row]) -> Vec<u8> {
+    if rows.is_empty() {
+        let mut buf = Vec::with_capacity(6);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        return buf;
+    }
+    let num_rows = rows.len();
+    let num_cols = rows[0].registry().len();
+    let mut buf = Vec::with_capacity(6 + num_rows * num_cols * 10);
+
+    buf.extend_from_slice(&(num_rows as u32).to_le_bytes());
+    buf.extend_from_slice(&(num_cols as u16).to_le_bytes());
+
+    for row in rows {
+        for val in row.values() {
+            encode_value(&mut buf, val);
+        }
+    }
+
+    buf
+}
+
+/// Decode rows from bytes, wrapping each with the given registry.
+pub fn decode_rows(bytes: &[u8], registry: &Arc<ColumnRegistry>) -> Vec<Row> {
+    let mut pos = 0;
+    let num_rows = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    let num_cols = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
+    pos += 2;
+
+    let mut rows = Vec::with_capacity(num_rows);
+    for _ in 0..num_rows {
+        let mut values = Vec::with_capacity(num_cols);
+        for _ in 0..num_cols {
+            values.push(decode_value(bytes, &mut pos));
+        }
+        rows.push(Row::from_values(registry.clone(), values));
+    }
+    rows
+}
+
+/// Storage backend trait for Delta DB persistence.
+///
+/// All methods use `&self` with interior mutability (the implementation
+/// is expected to use internal locking).
+///
+/// Raw row methods operate on pre-encoded bytes. The engine layer handles
+/// encoding/decoding with the appropriate ColumnRegistry.
+pub trait StorageBackend: Send + Sync {
+    // --- Raw table rows (encoded bytes) ---
+
+    /// Store encoded rows for a given table and block number.
+    fn put_raw_rows(&self, table: &str, block: BlockNumber, data: &[u8]) -> Result<()>;
+
+    /// Get encoded rows for a table in the given block range (inclusive).
+    /// Returns (block_number, encoded_bytes) pairs ordered by block number.
+    fn get_raw_rows(
+        &self,
+        table: &str,
+        from_block: BlockNumber,
+        to_block: BlockNumber,
+    ) -> Result<Vec<(BlockNumber, Vec<u8>)>>;
+
+    /// Delete all rows for a table where block_number > after_block.
+    fn delete_raw_rows_after(&self, table: &str, after_block: BlockNumber) -> Result<()>;
+
+    /// Remove and return encoded rows where block_number > after_block in one pass.
+    fn take_raw_rows_after(
+        &self,
+        table: &str,
+        after_block: BlockNumber,
+    ) -> Result<Vec<(BlockNumber, Vec<u8>)>> {
+        let rows = self.get_raw_rows(table, after_block + 1, BlockNumber::MAX)?;
+        self.delete_raw_rows_after(table, after_block)?;
+        Ok(rows)
+    }
+
+    // --- Reducer state snapshots ---
+
+    fn put_reducer_state(
+        &self,
+        reducer: &str,
+        group_key: &[u8],
+        block: BlockNumber,
+        state: &[u8],
+    ) -> Result<()>;
+
+    fn get_reducer_state(
+        &self,
+        reducer: &str,
+        group_key: &[u8],
+        block: BlockNumber,
+    ) -> Result<Option<Vec<u8>>>;
+
+    fn get_reducer_state_at_or_before(
+        &self,
+        reducer: &str,
+        group_key: &[u8],
+        block: BlockNumber,
+    ) -> Result<Option<(BlockNumber, Vec<u8>)>>;
+
+    fn delete_reducer_states_after(
+        &self,
+        reducer: &str,
+        group_key: &[u8],
+        after_block: BlockNumber,
+    ) -> Result<()>;
+
+    // --- Reducer finalized state ---
+
+    fn get_reducer_finalized(
+        &self,
+        reducer: &str,
+        group_key: &[u8],
+    ) -> Result<Option<Vec<u8>>>;
+
+    fn set_reducer_finalized(
+        &self,
+        reducer: &str,
+        group_key: &[u8],
+        state: &[u8],
+    ) -> Result<()>;
+
+    fn delete_reducer_states_up_to(
+        &self,
+        reducer: &str,
+        group_key: &[u8],
+        up_to_block: BlockNumber,
+    ) -> Result<()>;
+
+    // --- MV state ---
+
+    fn put_mv_state(
+        &self,
+        view: &str,
+        group_key: &[u8],
+        state: &[u8],
+    ) -> Result<()>;
+
+    fn get_mv_state(
+        &self,
+        view: &str,
+        group_key: &[u8],
+    ) -> Result<Option<Vec<u8>>>;
+
+    fn delete_mv_state(
+        &self,
+        view: &str,
+        group_key: &[u8],
+    ) -> Result<()>;
+
+    fn list_mv_group_keys(&self, view: &str) -> Result<Vec<Vec<u8>>>;
+
+    // --- Metadata ---
+
+    fn put_meta(&self, key: &str, value: &[u8]) -> Result<()>;
+    fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>>;
+
+    // --- Bulk operations ---
+
+    fn list_reducer_group_keys(&self, reducer: &str) -> Result<Vec<Vec<u8>>>;
+
+    // --- Atomic batch commit ---
+
+    /// Atomically commit a batch of operations.
+    /// All operations in the batch either succeed together or fail together.
+    /// Used for crash-safe finalization.
+    fn commit(&self, batch: &StorageWriteBatch) -> Result<()>;
+}
