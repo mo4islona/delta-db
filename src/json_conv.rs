@@ -39,6 +39,7 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Bytes(b) => serde_json::Value::String(bytes_to_hex(b)),
         Value::Uint256(b) => serde_json::Value::String(format!("0x{}", bytes_to_hex(b))),
         Value::Base58(b) => serde_json::Value::String(bytes_to_hex(b)),
+        Value::JSON(v) => v.clone(),
     }
 }
 

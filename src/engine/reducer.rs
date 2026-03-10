@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use rustc_hash::FxHashMap;
+
 use crate::error::Result;
 use crate::reducer_runtime::event_rules::EventRulesRuntime;
 use crate::reducer_runtime::lua::LuaRuntime;
@@ -22,10 +24,10 @@ pub struct ReducerEngine {
     runtime: Box<dyn ReducerRuntime>,
     storage: Arc<dyn StorageBackend>,
     /// Current hot state per group key.
-    state_cache: HashMap<Vec<u8>, State>,
+    state_cache: FxHashMap<Vec<u8>, State>,
     /// In-memory state snapshots: group_key -> (block -> state).
     /// Only contains unfinalized blocks. Used for rollback.
-    block_snapshots: HashMap<Vec<u8>, BTreeMap<BlockNumber, State>>,
+    block_snapshots: FxHashMap<Vec<u8>, BTreeMap<BlockNumber, State>>,
     /// Tracks which blocks have been processed and which group keys were touched.
     /// BTreeMap for O(log N) range queries during rollback/finalize.
     block_groups: BTreeMap<BlockNumber, HashSet<Vec<u8>>>,
@@ -35,15 +37,21 @@ impl ReducerEngine {
     pub fn new(def: ReducerDef, storage: Arc<dyn StorageBackend>) -> Self {
         let runtime: Box<dyn ReducerRuntime> = match &def.body {
             ReducerBody::EventRules { .. } => Box::new(EventRulesRuntime::new(&def.body)),
-            ReducerBody::Lua { script } => Box::new(LuaRuntime::new(script)),
+            ReducerBody::Lua { script } => {
+                let state_fields: Vec<String> =
+                    def.state.iter().map(|f| f.name.clone()).collect();
+                let state_types: Vec<(String, crate::types::ColumnType)> =
+                    def.state.iter().map(|f| (f.name.clone(), f.column_type.clone())).collect();
+                Box::new(LuaRuntime::with_state_fields(script, &state_fields, &state_types))
+            }
         };
 
         Self {
             def,
             runtime,
             storage,
-            state_cache: HashMap::new(),
-            block_snapshots: HashMap::new(),
+            state_cache: FxHashMap::default(),
+            block_snapshots: FxHashMap::default(),
             block_groups: BTreeMap::new(),
         }
     }
@@ -82,12 +90,12 @@ impl ReducerEngine {
             let state = self.state_cache.get_mut(&group_key_bytes).unwrap();
 
             // Call the runtime
-            let emit = self.runtime.process(state, row);
+            let emits = self.runtime.process(state, row);
 
             // Track touched key for deferred snapshot
             touched_keys.insert(group_key_bytes);
 
-            if let Some(mut emit_row) = emit {
+            for mut emit_row in emits {
                 // Add group-by columns to the output row for downstream MVs
                 for col in &self.def.group_by {
                     if let Some(v) = row.get(col.as_str()) {
@@ -278,6 +286,11 @@ fn parse_default(default_str: &str, column_type: &crate::types::ColumnType) -> V
         }
         ColumnType::Boolean => {
             Value::Boolean(default_str == "true" || default_str == "1")
+        }
+        ColumnType::JSON => {
+            let s = default_str.trim_matches('\'').trim_matches('"');
+            let json_val = serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
+            Value::JSON(json_val)
         }
         _ => column_type.default_value(),
     }

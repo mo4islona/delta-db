@@ -14,6 +14,8 @@ sqlparser = { version = "0.55", features = ["visitor"] }
 rmp-serde = "1"
 mlua = { version = "0.10", features = ["lua54", "vendored"] }
 rocksdb = "0.22"
+rustc-hash = "2"
+rayon = "1"
 napi = { version = "2", features = ["napi9", "serde-json"], optional = true }
 napi-derive = { version = "2", optional = true }
 
@@ -27,6 +29,26 @@ tempfile = "3"
 default = []
 napi = ["dep:napi", "dep:napi-derive", "dep:napi-build"]
 
+[[test]]
+name = "dex"
+path = "tests/dex/tests.rs"
+
+[[test]]
+name = "uniswap"
+path = "tests/uniswap/tests.rs"
+
+[[test]]
+name = "polymarket"
+path = "tests/polymarket/tests.rs"
+
 [[bench]]
 name = "throughput"
+harness = false
+
+[[bench]]
+name = "profile_polymarket"
+harness = false
+
+[[bench]]
+name = "profile_breakdown"
 harness = false

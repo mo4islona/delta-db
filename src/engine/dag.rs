@@ -1,5 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+
+use rayon::prelude::*;
 
 use crate::error::{Error, Result};
 use crate::schema::ast::Schema;
@@ -19,14 +21,28 @@ enum PipelineNode {
     MV(String),
 }
 
+/// An independent reducer→MV chain that can be processed in parallel.
+/// Engines are stored inline to avoid HashMap extraction/reinsertion per batch.
+struct PipelineBranch {
+    reducer_name: String,
+    reducer: ReducerEngine,
+    mv_entries: Vec<(String, MVEngine)>,
+}
+
 /// Top-level engine that wires the computation DAG:
 /// Raw Tables → Reducers → Materialized Views
 pub struct DeltaEngine {
     raw_tables: HashMap<String, RawTableEngine>,
     reducers: HashMap<String, ReducerEngine>,
     mvs: HashMap<String, MVEngine>,
+    /// Tables marked as VIRTUAL — stored but no deltas emitted.
+    virtual_tables: HashSet<String>,
     /// Topologically sorted processing order.
     pipeline: Vec<PipelineNode>,
+    /// MVs that source directly from raw tables (processed before branches).
+    direct_mvs: Vec<String>,
+    /// Independent reducer→MV branches. When len() >= 2, processed in parallel.
+    branches: Vec<PipelineBranch>,
     /// Sequence number for delta batches.
     sequence: u64,
     /// Latest processed block number (for ordering/rollback logic).
@@ -66,13 +82,45 @@ impl DeltaEngine {
             );
         }
 
+        let virtual_tables: HashSet<String> = schema
+            .tables
+            .iter()
+            .filter(|t| t.virtual_table)
+            .map(|t| t.name.clone())
+            .collect();
+
         let pipeline = build_pipeline(schema);
+        let (direct_mvs, branch_specs) = compute_branches(&pipeline, &reducers, &mvs);
+
+        // Move branch engines out of HashMaps into PipelineBranch structs
+        // to avoid per-batch HashMap extraction/reinsertion in parallel path.
+        let branches: Vec<PipelineBranch> = branch_specs
+            .into_iter()
+            .map(|(reducer_name, mv_names)| {
+                let reducer = reducers.remove(&reducer_name).unwrap();
+                let mv_entries: Vec<_> = mv_names
+                    .into_iter()
+                    .map(|name| {
+                        let mv = mvs.remove(&name).unwrap();
+                        (name, mv)
+                    })
+                    .collect();
+                PipelineBranch {
+                    reducer_name,
+                    reducer,
+                    mv_entries,
+                }
+            })
+            .collect();
 
         Self {
             raw_tables,
             reducers,
             mvs,
+            virtual_tables,
             pipeline,
+            direct_mvs,
+            branches,
             sequence: 0,
             latest_block: 0,
             finalized_block: 0,
@@ -82,6 +130,10 @@ impl DeltaEngine {
 
     /// Process a batch of rows for a raw table at the given block.
     /// Cascades through reducers and MVs, returning all delta records.
+    ///
+    /// When multiple independent reducer branches exist (e.g. two reducers
+    /// both sourcing from the same raw table), they are executed in parallel
+    /// using rayon's thread pool.
     pub fn process_batch(
         &mut self,
         table: &str,
@@ -95,37 +147,159 @@ impl DeltaEngine {
         let mut all_deltas = Vec::new();
 
         // Accumulated output rows per source name, to be consumed by downstream nodes.
-        // Uses RowMaps throughout — no Row conversion needed for pipeline processing.
         let mut output_rows: HashMap<String, Vec<RowMap>> = HashMap::new();
         output_rows.insert(table.to_string(), row_maps);
 
+        // Phase 1: Process raw tables
         for node in &self.pipeline {
-            match node {
-                PipelineNode::RawTable(name) => {
-                    if let Some(maps) = output_rows.get(name) {
-                        let raw_eng = self.raw_tables.get(name).unwrap();
+            if let PipelineNode::RawTable(name) = node {
+                if let Some(maps) = output_rows.get(name) {
+                    let raw_eng = self.raw_tables.get(name).unwrap();
+                    if self.virtual_tables.contains(name) {
+                        raw_eng.ingest_no_deltas(block, maps)?;
+                    } else {
                         let deltas = raw_eng.ingest(block, maps)?;
                         all_deltas.extend(deltas);
                     }
                 }
-                PipelineNode::Reducer(name) => {
-                    let reducer = self.reducers.get_mut(name).unwrap();
-                    let source = reducer.source().to_string();
+            }
+        }
 
-                    if let Some(source_rows) = output_rows.get(&source) {
-                        let enriched = reducer.process_block(block, source_rows)?;
+        // Check if parallel branch execution is possible:
+        // - 2+ branches, and all reducers source from raw tables (not from each other)
+        let can_parallelize = self.branches.len() >= 2
+            && self.branches.iter().all(|b| {
+                self.raw_tables.contains_key(b.reducer.source())
+            });
+
+        if can_parallelize {
+            // Phase 2a: Process MVs that source directly from raw tables
+            for mv_name in &self.direct_mvs {
+                let mv = self.mvs.get_mut(mv_name).unwrap();
+                let source = mv.source().to_string();
+                if let Some(source_rows) = output_rows.get(&source) {
+                    let deltas = mv.process_block(block, source_rows);
+                    all_deltas.extend(deltas);
+                }
+            }
+
+            // Phase 2b: Process reducer branches in parallel.
+            // Engines are stored inline in PipelineBranch — no HashMap extraction needed.
+            if self.branches.len() == 2 {
+                // Fast path: exactly 2 branches — rayon::join with split_at_mut.
+                // First closure runs on current thread; put the heavier branch first.
+                let (first, second) = self.branches.split_at_mut(1);
+                let branch_0 = &mut first[0];
+                let branch_1 = &mut second[0];
+
+                let (result_0, result_1) = rayon::join(
+                    || -> Result<Vec<DeltaRecord>> {
+                        let source = branch_0.reducer.source();
+                        let mut deltas = Vec::new();
+                        if let Some(rows) = output_rows.get(source) {
+                            let enriched = branch_0.reducer.process_block(block, rows)?;
+                            if !enriched.is_empty() {
+                                for (_, mv) in branch_0.mv_entries.iter_mut() {
+                                    deltas.extend(mv.process_block(block, &enriched));
+                                }
+                            }
+                        }
+                        Ok(deltas)
+                    },
+                    || -> Result<Vec<DeltaRecord>> {
+                        let source = branch_1.reducer.source();
+                        let mut deltas = Vec::new();
+                        if let Some(rows) = output_rows.get(source) {
+                            let enriched = branch_1.reducer.process_block(block, rows)?;
+                            if !enriched.is_empty() {
+                                for (_, mv) in branch_1.mv_entries.iter_mut() {
+                                    deltas.extend(mv.process_block(block, &enriched));
+                                }
+                            }
+                        }
+                        Ok(deltas)
+                    },
+                );
+
+                all_deltas.extend(result_0?);
+                all_deltas.extend(result_1?);
+            } else {
+                // General N-branch parallel using par_iter_mut
+                let results: Vec<Result<Vec<DeltaRecord>>> = self
+                    .branches
+                    .par_iter_mut()
+                    .map(|branch| {
+                        let source = branch.reducer.source();
+                        let mut deltas = Vec::new();
+                        if let Some(rows) = output_rows.get(source) {
+                            let enriched = branch.reducer.process_block(block, rows)?;
+                            if !enriched.is_empty() {
+                                for (_, mv) in branch.mv_entries.iter_mut() {
+                                    deltas.extend(mv.process_block(block, &enriched));
+                                }
+                            }
+                        }
+                        Ok(deltas)
+                    })
+                    .collect();
+
+                for result in results {
+                    all_deltas.extend(result?);
+                }
+            }
+        } else {
+            // Sequential execution: process branches + remaining engines
+            for node in &self.pipeline {
+                match node {
+                    PipelineNode::RawTable(_) => {} // Already processed in Phase 1
+                    PipelineNode::Reducer(name) => {
+                        // Check branches first, then fallback to HashMap
+                        let (source, enriched) =
+                            if let Some(branch) = self.branches.iter_mut().find(|b| b.reducer_name == *name) {
+                                let source = branch.reducer.source().to_string();
+                                let enriched = if let Some(source_rows) = output_rows.get(&source) {
+                                    branch.reducer.process_block(block, source_rows)?
+                                } else {
+                                    Vec::new()
+                                };
+                                (source, enriched)
+                            } else {
+                                let reducer = self.reducers.get_mut(name).unwrap();
+                                let source = reducer.source().to_string();
+                                let enriched = if let Some(source_rows) = output_rows.get(&source) {
+                                    reducer.process_block(block, source_rows)?
+                                } else {
+                                    Vec::new()
+                                };
+                                (source, enriched)
+                            };
+                        let _ = source;
                         if !enriched.is_empty() {
                             output_rows.insert(name.clone(), enriched);
                         }
                     }
-                }
-                PipelineNode::MV(name) => {
-                    let mv = self.mvs.get_mut(name).unwrap();
-                    let source = mv.source().to_string();
-
-                    if let Some(source_rows) = output_rows.get(&source) {
-                        let deltas = mv.process_block(block, source_rows);
-                        all_deltas.extend(deltas);
+                    PipelineNode::MV(name) => {
+                        // Check branch MVs first, then fallback to HashMap
+                        let found_in_branch = self.branches.iter_mut().any(|branch| {
+                            if let Some((_, mv)) = branch.mv_entries.iter_mut().find(|(n, _)| n == name) {
+                                let source = mv.source().to_string();
+                                if let Some(source_rows) = output_rows.get(&source) {
+                                    let deltas = mv.process_block(block, source_rows);
+                                    all_deltas.extend(deltas);
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if !found_in_branch {
+                            let mv = self.mvs.get_mut(name).unwrap();
+                            let source = mv.source().to_string();
+                            if let Some(source_rows) = output_rows.get(&source) {
+                                let deltas = mv.process_block(block, source_rows);
+                                all_deltas.extend(deltas);
+                            }
+                        }
                     }
                 }
             }
@@ -177,20 +351,43 @@ impl DeltaEngine {
                             // Skip — rows already in storage
                         }
                         PipelineNode::Reducer(name) => {
-                            let reducer = self.reducers.get_mut(name).unwrap();
-                            let source = reducer.source().to_string();
-                            if let Some(source_rows) = output_rows.get(&source) {
-                                let enriched = reducer.process_block(block, source_rows)?;
-                                if !enriched.is_empty() {
-                                    output_rows.insert(name.clone(), enriched);
+                            if let Some(branch) = self.branches.iter_mut().find(|b| b.reducer_name == *name) {
+                                let source = branch.reducer.source().to_string();
+                                if let Some(source_rows) = output_rows.get(&source) {
+                                    let enriched = branch.reducer.process_block(block, source_rows)?;
+                                    if !enriched.is_empty() {
+                                        output_rows.insert(name.clone(), enriched);
+                                    }
+                                }
+                            } else {
+                                let reducer = self.reducers.get_mut(name).unwrap();
+                                let source = reducer.source().to_string();
+                                if let Some(source_rows) = output_rows.get(&source) {
+                                    let enriched = reducer.process_block(block, source_rows)?;
+                                    if !enriched.is_empty() {
+                                        output_rows.insert(name.clone(), enriched);
+                                    }
                                 }
                             }
                         }
                         PipelineNode::MV(name) => {
-                            let mv = self.mvs.get_mut(name).unwrap();
-                            let source = mv.source().to_string();
-                            if let Some(source_rows) = output_rows.get(&source) {
-                                mv.process_block(block, source_rows);
+                            let mut found = false;
+                            for branch in &mut self.branches {
+                                if let Some((_, mv)) = branch.mv_entries.iter_mut().find(|(n, _)| n == name) {
+                                    let source = mv.source().to_string();
+                                    if let Some(source_rows) = output_rows.get(&source) {
+                                        mv.process_block(block, source_rows);
+                                    }
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if !found {
+                                let mv = self.mvs.get_mut(name).unwrap();
+                                let source = mv.source().to_string();
+                                if let Some(source_rows) = output_rows.get(&source) {
+                                    mv.process_block(block, source_rows);
+                                }
                             }
                         }
                     }
@@ -209,18 +406,35 @@ impl DeltaEngine {
         for node in self.pipeline.iter().rev() {
             match node {
                 PipelineNode::MV(name) => {
-                    let mv = self.mvs.get_mut(name).unwrap();
-                    let deltas = mv.rollback(fork_point);
-                    all_deltas.extend(deltas);
+                    // Check branch MVs first, then HashMap
+                    let mut found = false;
+                    for branch in &mut self.branches {
+                        if let Some((_, mv)) = branch.mv_entries.iter_mut().find(|(n, _)| n == name) {
+                            all_deltas.extend(mv.rollback(fork_point));
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        let mv = self.mvs.get_mut(name).unwrap();
+                        all_deltas.extend(mv.rollback(fork_point));
+                    }
                 }
                 PipelineNode::Reducer(name) => {
-                    let reducer = self.reducers.get_mut(name).unwrap();
-                    reducer.rollback(fork_point)?;
+                    // Check branches first, then HashMap
+                    if let Some(branch) = self.branches.iter_mut().find(|b| b.reducer_name == *name) {
+                        branch.reducer.rollback(fork_point)?;
+                    } else {
+                        let reducer = self.reducers.get_mut(name).unwrap();
+                        reducer.rollback(fork_point)?;
+                    }
                 }
                 PipelineNode::RawTable(name) => {
                     let raw_engine = self.raw_tables.get(name).unwrap();
                     let deltas = raw_engine.rollback(fork_point)?;
-                    all_deltas.extend(deltas);
+                    if !self.virtual_tables.contains(name) {
+                        all_deltas.extend(deltas);
+                    }
                 }
             }
         }
@@ -239,12 +453,26 @@ impl DeltaEngine {
         for node in &self.pipeline {
             match node {
                 PipelineNode::Reducer(name) => {
-                    let reducer = self.reducers.get_mut(name).unwrap();
-                    reducer.finalize(block, batch);
+                    if let Some(branch) = self.branches.iter_mut().find(|b| b.reducer_name == *name) {
+                        branch.reducer.finalize(block, batch);
+                    } else {
+                        let reducer = self.reducers.get_mut(name).unwrap();
+                        reducer.finalize(block, batch);
+                    }
                 }
                 PipelineNode::MV(name) => {
-                    let mv = self.mvs.get_mut(name).unwrap();
-                    mv.finalize(block, batch);
+                    let mut found = false;
+                    for branch in &mut self.branches {
+                        if let Some((_, mv)) = branch.mv_entries.iter_mut().find(|(n, _)| n == name) {
+                            mv.finalize(block, batch);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        let mv = self.mvs.get_mut(name).unwrap();
+                        mv.finalize(block, batch);
+                    }
                 }
                 PipelineNode::RawTable(_) => {
                     // Raw table finalization = eviction eligibility (not implemented yet)
@@ -334,6 +562,56 @@ impl DeltaEngine {
     }
 }
 
+/// Identify independent branches and direct MVs from the pipeline.
+///
+/// A branch is a reducer + its downstream MVs. Branches that all source
+/// from raw tables (not from each other) can be executed in parallel.
+/// Direct MVs source from raw tables and are processed before branches.
+///
+/// Returns (direct_mv_names, Vec<(reducer_name, mv_names)>).
+fn compute_branches(
+    pipeline: &[PipelineNode],
+    reducers: &HashMap<String, ReducerEngine>,
+    mvs: &HashMap<String, MVEngine>,
+) -> (Vec<String>, Vec<(String, Vec<String>)>) {
+    let reducer_names: HashSet<&str> = reducers.keys().map(|s| s.as_str()).collect();
+
+    let mut branches = Vec::new();
+    let mut direct_mvs = Vec::new();
+
+    // Build branches: each reducer + its downstream MVs
+    for node in pipeline {
+        if let PipelineNode::Reducer(name) = node {
+            let downstream: Vec<String> = pipeline
+                .iter()
+                .filter_map(|n| {
+                    if let PipelineNode::MV(mv_name) = n {
+                        let mv = mvs.get(mv_name).unwrap();
+                        if mv.source() == name.as_str() {
+                            return Some(mv_name.clone());
+                        }
+                    }
+                    None
+                })
+                .collect();
+
+            branches.push((name.clone(), downstream));
+        }
+    }
+
+    // Find MVs sourcing from raw tables (not from reducers)
+    for node in pipeline {
+        if let PipelineNode::MV(name) = node {
+            let mv = mvs.get(name).unwrap();
+            if !reducer_names.contains(mv.source()) {
+                direct_mvs.push(name.clone());
+            }
+        }
+    }
+
+    (direct_mvs, branches)
+}
+
 /// Build the topologically sorted pipeline from the schema.
 fn build_pipeline(schema: &Schema) -> Vec<PipelineNode> {
     let mut pipeline = Vec::new();
@@ -398,6 +676,7 @@ mod tests {
                     ColumnDef { name: "amount".to_string(), column_type: ColumnType::Float64 },
                     ColumnDef { name: "price".to_string(), column_type: ColumnType::Float64 },
                 ],
+                virtual_table: false,
             }],
             reducers: vec![ReducerDef {
                 name: "pnl".to_string(),
@@ -524,6 +803,7 @@ mod tests {
                     ColumnDef { name: "pool".to_string(), column_type: ColumnType::String },
                     ColumnDef { name: "amount".to_string(), column_type: ColumnType::Float64 },
                 ],
+                virtual_table: false,
             }],
             reducers: vec![],
             materialized_views: vec![MVDef {

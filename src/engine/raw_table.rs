@@ -65,6 +65,17 @@ impl RawTableEngine {
         Ok(deltas)
     }
 
+    /// Ingest rows without creating delta records (for virtual tables).
+    /// Stores the rows for replay but skips the expensive delta record allocation.
+    pub fn ingest_no_deltas(&self, block: BlockNumber, row_maps: &[RowMap]) -> Result<()> {
+        if row_maps.is_empty() {
+            return Ok(());
+        }
+        let encoded = storage::encode_rows_from_maps(row_maps, &self.registry);
+        self.storage.put_raw_rows(&self.def.name, block, &encoded)?;
+        Ok(())
+    }
+
     /// Roll back all rows where block_number > fork_point.
     /// Returns compensating Delete delta records for the rolled-back rows.
     pub fn rollback(&self, fork_point: BlockNumber) -> Result<Vec<DeltaRecord>> {
@@ -124,6 +135,7 @@ mod tests {
                 ColumnDef { name: "user".to_string(), column_type: ColumnType::String },
                 ColumnDef { name: "amount".to_string(), column_type: ColumnType::Float64 },
             ],
+            virtual_table: false,
         }
     }
 

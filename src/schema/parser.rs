@@ -11,6 +11,10 @@ pub fn parse_schema(input: &str) -> Result<Schema, Error> {
     // Split out CREATE REDUCER blocks before sqlparser sees them
     let (sql_part, reducers) = extract_reducers(input)?;
 
+    // Preprocess: replace "CREATE VIRTUAL TABLE" with "CREATE TABLE"
+    // and track which table names are virtual.
+    let (sql_part, virtual_tables) = extract_virtual_tables(&sql_part);
+
     let dialect = GenericDialect {};
     let statements = Parser::parse_sql(&dialect, &sql_part)
         .map_err(|e| Error::Schema(format!("SQL parse error: {e}")))?;
@@ -21,7 +25,11 @@ pub fn parse_schema(input: &str) -> Result<Schema, Error> {
     for stmt in statements {
         match stmt {
             sql::Statement::CreateTable(ct) => {
-                tables.push(parse_create_table(&ct)?);
+                let mut def = parse_create_table(&ct)?;
+                if virtual_tables.contains(&def.name) {
+                    def.virtual_table = true;
+                }
+                tables.push(def);
             }
             sql::Statement::CreateView { name, query, materialized: true, .. } => {
                 materialized_views.push(parse_create_mv(&name, &query)?);
@@ -47,7 +55,51 @@ fn parse_create_table(ct: &sql::CreateTable) -> Result<TableDef, Error> {
             column_type,
         });
     }
-    Ok(TableDef { name, columns })
+    Ok(TableDef { name, columns, virtual_table: false })
+}
+
+/// Replace `CREATE VIRTUAL TABLE` with `CREATE TABLE` and return the set
+/// of table names that were marked virtual.
+fn extract_virtual_tables(input: &str) -> (String, Vec<String>) {
+    let mut result = String::with_capacity(input.len());
+    let mut virtual_names = Vec::new();
+    let upper = input.to_uppercase();
+    let mut pos = 0;
+
+    while pos < input.len() {
+        if let Some(offset) = upper[pos..].find("CREATE VIRTUAL TABLE") {
+            let abs = pos + offset;
+            // Ensure word boundary (start of input or whitespace/semicolon before)
+            if abs > 0 && !input.as_bytes()[abs - 1].is_ascii_whitespace()
+                && input.as_bytes()[abs - 1] != b';'
+            {
+                result.push_str(&input[pos..=abs]);
+                pos = abs + 1;
+                continue;
+            }
+            result.push_str(&input[pos..abs]);
+            // Skip "CREATE VIRTUAL TABLE" → emit "CREATE TABLE"
+            let after_keyword = abs + "CREATE VIRTUAL TABLE".len();
+            result.push_str("CREATE TABLE");
+            // Extract table name
+            let rest = &input[after_keyword..];
+            let name_start = rest.find(|c: char| !c.is_ascii_whitespace()).unwrap_or(0);
+            let name_end = rest[name_start..]
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .map(|i| name_start + i)
+                .unwrap_or(rest.len());
+            let name = rest[name_start..name_end].to_string();
+            if !name.is_empty() {
+                virtual_names.push(name);
+            }
+            pos = after_keyword;
+        } else {
+            result.push_str(&input[pos..]);
+            break;
+        }
+    }
+
+    (result, virtual_names)
 }
 
 fn map_column_type(dt: &sql::DataType, col_name: &sql::Ident) -> Result<ColumnType, Error> {
@@ -75,6 +127,7 @@ fn map_column_type(dt: &sql::DataType, col_name: &sql::Ident) -> Result<ColumnTy
                 "boolean" => Ok(ColumnType::Boolean),
                 "bytes" => Ok(ColumnType::Bytes),
                 "base58" => Ok(ColumnType::Base58),
+                "json" | "jsonb" => Ok(ColumnType::JSON),
                 other => Err(Error::Schema(format!(
                     "unknown type '{other}' for column '{col_name}'"
                 ))),
@@ -1088,6 +1141,7 @@ fn str_to_column_type(s: &str) -> Result<ColumnType, Error> {
         "boolean" => Ok(ColumnType::Boolean),
         "bytes" => Ok(ColumnType::Bytes),
         "base58" => Ok(ColumnType::Base58),
+        "json" | "jsonb" => Ok(ColumnType::JSON),
         _ => Err(Error::Schema(format!("unknown type: '{s}'"))),
     }
 }

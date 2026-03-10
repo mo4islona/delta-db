@@ -1,5 +1,7 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::schema::ast::{AggFunc, MVDef, SelectExpr, SelectItem};
 use crate::storage::{self, StorageBackend, StorageWriteBatch};
@@ -18,6 +20,12 @@ enum OutputColumn {
     Agg { source_col: Option<String>, agg_index: usize, output_name: String },
 }
 
+/// Pre-computed info for feeding a single aggregation from a source row.
+struct AggFeedInfo {
+    source_col: Option<String>,
+    agg_index: usize,
+}
+
 /// Manages a single materialized view: GROUP BY routing, aggregation, rollback, deltas.
 pub struct MVEngine {
     def: MVDef,
@@ -27,13 +35,15 @@ pub struct MVEngine {
     agg_funcs: Vec<AggFunc>,
     /// Number of aggregation functions per group.
     agg_count: usize,
+    /// Pre-computed list of agg columns for fast row feeding (avoids per-row pattern matching).
+    agg_feeds: Vec<AggFeedInfo>,
     /// group_key -> aggregation state (one AggregationFunc per agg column).
-    groups: HashMap<GroupKey, Vec<Box<dyn AggregationFunc>>>,
+    groups: FxHashMap<GroupKey, Vec<Box<dyn AggregationFunc>>>,
     /// Tracks which blocks have been ingested (for rollback).
     /// block -> set of group keys touched. BTreeMap for O(log N) range queries.
-    block_groups: BTreeMap<BlockNumber, HashSet<GroupKey>>,
+    block_groups: BTreeMap<BlockNumber, FxHashSet<GroupKey>>,
     /// Snapshot of previous output values per group key, for delta computation.
-    prev_output: HashMap<GroupKey, HashMap<String, Value>>,
+    prev_output: FxHashMap<GroupKey, HashMap<String, Value>>,
     /// Storage backend for persisting finalized MV state.
     storage: Arc<dyn StorageBackend>,
 }
@@ -74,9 +84,29 @@ impl MVEngine {
 
         let agg_count = agg_index;
 
+        // Pre-compute agg feed info for fast row processing
+        let agg_feeds: Vec<AggFeedInfo> = output_columns
+            .iter()
+            .filter_map(|col| {
+                if let OutputColumn::Agg {
+                    source_col,
+                    agg_index,
+                    ..
+                } = col
+                {
+                    Some(AggFeedInfo {
+                        source_col: source_col.clone(),
+                        agg_index: *agg_index,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         // Restore finalized MV state from storage
-        let mut groups: HashMap<GroupKey, Vec<Box<dyn AggregationFunc>>> = HashMap::new();
-        let mut prev_output: HashMap<GroupKey, HashMap<String, Value>> = HashMap::new();
+        let mut groups: FxHashMap<GroupKey, Vec<Box<dyn AggregationFunc>>> = FxHashMap::default();
+        let mut prev_output: FxHashMap<GroupKey, HashMap<String, Value>> = FxHashMap::default();
 
         if let Ok(group_keys) = storage.list_mv_group_keys(&def.name) {
             for gk_bytes in group_keys {
@@ -99,6 +129,7 @@ impl MVEngine {
             output_columns,
             agg_funcs,
             agg_count,
+            agg_feeds,
             groups,
             block_groups: BTreeMap::new(),
             prev_output,
@@ -118,7 +149,7 @@ impl MVEngine {
     /// Returns delta records for new/updated groups.
     pub fn process_block(&mut self, block: BlockNumber, rows: &[RowMap]) -> Vec<DeltaRecord> {
         // Snapshot current output for touched groups before mutation
-        let mut touched_keys: HashSet<GroupKey> = HashSet::new();
+        let mut touched_keys: FxHashSet<GroupKey> = FxHashSet::default();
 
         for row in rows {
             let group_key = self.compute_group_key(row);
@@ -138,12 +169,13 @@ impl MVEngine {
             }
             let aggs = self.groups.get_mut(&group_key).unwrap();
 
-            // Feed values to each aggregation
-            for col in &self.output_columns {
-                if let OutputColumn::Agg { source_col, agg_index, .. } = col {
-                    let values = extract_agg_values(row, source_col.as_deref());
-                    aggs[*agg_index].add_block(block, &values);
-                }
+            // Feed values to each aggregation using pre-computed agg info
+            for feed in &self.agg_feeds {
+                let value = match feed.source_col.as_deref() {
+                    Some(col) => row.get(col).cloned().unwrap_or(Value::Null),
+                    None => Value::UInt64(1),
+                };
+                aggs[feed.agg_index].add_block(block, std::slice::from_ref(&value));
             }
 
             // Track block -> group key mapping for rollback
@@ -168,7 +200,7 @@ impl MVEngine {
         }
 
         // Collect all group keys affected by rolled-back blocks (consume by value)
-        let mut touched_keys: HashSet<GroupKey> = HashSet::new();
+        let mut touched_keys: FxHashSet<GroupKey> = FxHashSet::default();
         for (_block, keys) in rolled_back {
             for key in keys {
                 touched_keys.insert(key);
@@ -245,7 +277,7 @@ impl MVEngine {
 
     fn compute_output(&self, group_key: &GroupKey) -> Option<HashMap<String, Value>> {
         let aggs = self.groups.get(group_key)?;
-        let mut output = HashMap::new();
+        let mut output = HashMap::with_capacity(self.output_columns.len());
 
         let mut key_idx = 0;
         for col in &self.output_columns {
@@ -264,7 +296,7 @@ impl MVEngine {
         Some(output)
     }
 
-    fn emit_deltas(&mut self, touched_keys: &HashSet<GroupKey>) -> Vec<DeltaRecord> {
+    fn emit_deltas(&mut self, touched_keys: &FxHashSet<GroupKey>) -> Vec<DeltaRecord> {
         let mut deltas = Vec::new();
 
         for key in touched_keys {
@@ -390,18 +422,6 @@ fn resolve_output_name(item: &SelectItem) -> String {
             }
         }
         SelectExpr::WindowFunc { column, .. } => column.clone(),
-    }
-}
-
-fn extract_agg_values(row: &RowMap, source_col: Option<&str>) -> Vec<Value> {
-    match source_col {
-        Some(col) => {
-            vec![row.get(col).cloned().unwrap_or(Value::Null)]
-        }
-        None => {
-            // count() with no column — count the row itself
-            vec![Value::UInt64(1)]
-        }
     }
 }
 

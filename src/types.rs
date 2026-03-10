@@ -167,6 +167,7 @@ pub enum ColumnType {
     Boolean,
     Bytes,
     Base58,
+    JSON,
 }
 
 impl ColumnType {
@@ -181,6 +182,7 @@ impl ColumnType {
             ColumnType::Boolean => Value::Boolean(false),
             ColumnType::Bytes => Value::Bytes(Vec::new()),
             ColumnType::Base58 => Value::Base58(Vec::new()),
+            ColumnType::JSON => Value::JSON(serde_json::Value::Null),
         }
     }
 }
@@ -197,6 +199,7 @@ impl fmt::Display for ColumnType {
             ColumnType::Boolean => write!(f, "Boolean"),
             ColumnType::Bytes => write!(f, "Bytes"),
             ColumnType::Base58 => write!(f, "Base58"),
+            ColumnType::JSON => write!(f, "JSON"),
         }
     }
 }
@@ -214,6 +217,8 @@ pub enum Value {
     Bytes(Vec<u8>),
     /// Base58-encoded byte string (Solana addresses, Bitcoin addresses, IPFS CIDs).
     Base58(Vec<u8>),
+    /// Structured JSON data, pushed to Lua as native tables (no json.decode/encode needed).
+    JSON(serde_json::Value),
     Null,
 }
 
@@ -273,6 +278,7 @@ impl Value {
             Value::Int64(v) => *v != 0,
             Value::Float64(v) => *v != 0.0,
             Value::String(v) => !v.is_empty(),
+            Value::JSON(v) => !v.is_null(),
             Value::Null => false,
             _ => true,
         }
@@ -289,6 +295,7 @@ impl Value {
             Value::Boolean(_) => Some(ColumnType::Boolean),
             Value::Bytes(_) => Some(ColumnType::Bytes),
             Value::Base58(_) => Some(ColumnType::Base58),
+            Value::JSON(_) => Some(ColumnType::JSON),
             Value::Null => None,
         }
     }
@@ -307,6 +314,7 @@ impl PartialEq for Value {
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Bytes(a), Value::Bytes(b)) => a == b,
             (Value::Base58(a), Value::Base58(b)) => a == b,
+            (Value::JSON(a), Value::JSON(b)) => a == b,
             (Value::Null, Value::Null) => true,
             _ => false,
         }
@@ -328,6 +336,7 @@ impl Hash for Value {
             Value::Boolean(v) => v.hash(state),
             Value::Bytes(v) => v.hash(state),
             Value::Base58(v) => v.hash(state),
+            Value::JSON(v) => v.to_string().hash(state),
             Value::Null => {}
         }
     }
@@ -345,6 +354,7 @@ impl PartialOrd for Value {
             (Value::Boolean(a), Value::Boolean(b)) => a.partial_cmp(b),
             (Value::Bytes(a), Value::Bytes(b)) => a.partial_cmp(b),
             (Value::Base58(a), Value::Base58(b)) => a.partial_cmp(b),
+            (Value::JSON(_), Value::JSON(_)) => None,
             (Value::Null, Value::Null) => Some(std::cmp::Ordering::Equal),
             _ => None,
         }
@@ -372,6 +382,7 @@ impl fmt::Display for Value {
                 // Display raw bytes as hex; actual base58 encoding is done at the boundary
                 write!(f, "base58:{v:?}")
             }
+            Value::JSON(v) => write!(f, "{v}"),
             Value::Null => write!(f, "NULL"),
         }
     }

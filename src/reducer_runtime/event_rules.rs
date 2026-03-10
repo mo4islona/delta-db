@@ -14,7 +14,10 @@ pub struct EventRulesRuntime {
 impl EventRulesRuntime {
     pub fn new(body: &ReducerBody) -> Self {
         match body {
-            ReducerBody::EventRules { when_blocks, always_emit } => Self {
+            ReducerBody::EventRules {
+                when_blocks,
+                always_emit,
+            } => Self {
                 when_blocks: when_blocks.clone(),
                 always_emit: always_emit.clone(),
             },
@@ -24,32 +27,48 @@ impl EventRulesRuntime {
 }
 
 impl ReducerRuntime for EventRulesRuntime {
-    fn process(&self, state: &mut HashMap<String, Value>, row: &RowMap) -> Option<RowMap> {
+    fn process(&self, state: &mut HashMap<String, Value>, row: &RowMap) -> Vec<RowMap> {
         let mut output = HashMap::new();
         let mut matched = false;
 
         // First-match semantics: evaluate WHEN blocks in order
         for block in &self.when_blocks {
-            let ctx = EvalContext { state, row, locals: &HashMap::new() };
+            let ctx = EvalContext {
+                state,
+                row,
+                locals: &HashMap::new(),
+            };
             if eval_expr(&block.condition, &ctx).is_truthy() {
                 // Evaluate LET bindings
                 let mut locals = HashMap::new();
                 for (name, expr) in &block.lets {
-                    let ctx = EvalContext { state, row, locals: &locals };
+                    let ctx = EvalContext {
+                        state,
+                        row,
+                        locals: &locals,
+                    };
                     let val = eval_expr(expr, &ctx);
                     locals.insert(name.clone(), val);
                 }
 
                 // Evaluate SET (state mutations)
                 for (field, expr) in &block.sets {
-                    let ctx = EvalContext { state, row, locals: &locals };
+                    let ctx = EvalContext {
+                        state,
+                        row,
+                        locals: &locals,
+                    };
                     let val = eval_expr(expr, &ctx);
                     state.insert(field.clone(), val);
                 }
 
                 // Evaluate EMIT
                 for (name, expr) in &block.emits {
-                    let ctx = EvalContext { state, row, locals: &locals };
+                    let ctx = EvalContext {
+                        state,
+                        row,
+                        locals: &locals,
+                    };
                     let val = eval_expr(expr, &ctx);
                     output.insert(name.clone(), val);
                 }
@@ -62,16 +81,20 @@ impl ReducerRuntime for EventRulesRuntime {
         // ALWAYS EMIT — runs regardless of which WHEN matched (or none)
         if let Some(always) = &self.always_emit {
             for (name, expr) in &always.emits {
-                let ctx = EvalContext { state, row, locals: &HashMap::new() };
+                let ctx = EvalContext {
+                    state,
+                    row,
+                    locals: &HashMap::new(),
+                };
                 let val = eval_expr(expr, &ctx);
                 output.insert(name.clone(), val);
             }
         }
 
         if matched || self.always_emit.is_some() {
-            Some(output)
+            vec![output]
         } else {
-            None
+            vec![]
         }
     }
 }
@@ -93,12 +116,8 @@ fn eval_expr(expr: &Expr, ctx: &EvalContext) -> Value {
                 Value::Int64(*v)
             }
         }
-        Expr::StateRef(field) => {
-            ctx.state.get(field).cloned().unwrap_or(Value::Null)
-        }
-        Expr::RowRef(field) => {
-            ctx.row.get(field).cloned().unwrap_or(Value::Null)
-        }
+        Expr::StateRef(field) => ctx.state.get(field).cloned().unwrap_or(Value::Null),
+        Expr::RowRef(field) => ctx.row.get(field).cloned().unwrap_or(Value::Null),
         Expr::ColumnRef(name) => {
             // Check locals first, then row, then state
             if let Some(v) = ctx.locals.get(name) {
@@ -117,7 +136,11 @@ fn eval_expr(expr: &Expr, ctx: &EvalContext) -> Value {
             let rval = eval_expr(right, ctx);
             eval_binary_op(&lval, op, &rval)
         }
-        Expr::If { condition, then_expr, else_expr } => {
+        Expr::If {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
             if eval_expr(condition, ctx).is_truthy() {
                 eval_expr(then_expr, ctx)
             } else {
@@ -138,10 +161,18 @@ fn eval_binary_op(left: &Value, op: &BinaryOp, right: &Value) -> Value {
         // Comparison
         BinaryOp::Eq => Value::Boolean(values_eq(left, right)),
         BinaryOp::Neq => Value::Boolean(!values_eq(left, right)),
-        BinaryOp::Gt => Value::Boolean(values_cmp(left, right).map_or(false, |o| o == std::cmp::Ordering::Greater)),
-        BinaryOp::Lt => Value::Boolean(values_cmp(left, right).map_or(false, |o| o == std::cmp::Ordering::Less)),
-        BinaryOp::Gte => Value::Boolean(values_cmp(left, right).map_or(false, |o| o != std::cmp::Ordering::Less)),
-        BinaryOp::Lte => Value::Boolean(values_cmp(left, right).map_or(false, |o| o != std::cmp::Ordering::Greater)),
+        BinaryOp::Gt => Value::Boolean(
+            values_cmp(left, right).map_or(false, |o| o == std::cmp::Ordering::Greater),
+        ),
+        BinaryOp::Lt => {
+            Value::Boolean(values_cmp(left, right).map_or(false, |o| o == std::cmp::Ordering::Less))
+        }
+        BinaryOp::Gte => {
+            Value::Boolean(values_cmp(left, right).map_or(false, |o| o != std::cmp::Ordering::Less))
+        }
+        BinaryOp::Lte => Value::Boolean(
+            values_cmp(left, right).map_or(false, |o| o != std::cmp::Ordering::Greater),
+        ),
 
         // Logical
         BinaryOp::And => Value::Boolean(left.is_truthy() && right.is_truthy()),
@@ -175,7 +206,7 @@ fn values_cmp(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::ast::{AlwaysEmit, Expr, BinaryOp as AstBinaryOp, ReducerBody, WhenBlock};
+    use crate::schema::ast::{AlwaysEmit, BinaryOp as AstBinaryOp, Expr, ReducerBody, WhenBlock};
 
     fn pnl_reducer_body() -> ReducerBody {
         // PnL tracker from RFC Section 5.6
@@ -191,25 +222,29 @@ mod tests {
                     lets: vec![],
                     sets: vec![
                         // state.quantity = state.quantity + row.amount
-                        ("quantity".into(), Expr::BinaryOp {
-                            left: Box::new(Expr::StateRef("quantity".into())),
-                            op: AstBinaryOp::Add,
-                            right: Box::new(Expr::RowRef("amount".into())),
-                        }),
+                        (
+                            "quantity".into(),
+                            Expr::BinaryOp {
+                                left: Box::new(Expr::StateRef("quantity".into())),
+                                op: AstBinaryOp::Add,
+                                right: Box::new(Expr::RowRef("amount".into())),
+                            },
+                        ),
                         // state.cost_basis = state.cost_basis + row.amount * row.price
-                        ("cost_basis".into(), Expr::BinaryOp {
-                            left: Box::new(Expr::StateRef("cost_basis".into())),
-                            op: AstBinaryOp::Add,
-                            right: Box::new(Expr::BinaryOp {
-                                left: Box::new(Expr::RowRef("amount".into())),
-                                op: AstBinaryOp::Mul,
-                                right: Box::new(Expr::RowRef("price".into())),
-                            }),
-                        }),
+                        (
+                            "cost_basis".into(),
+                            Expr::BinaryOp {
+                                left: Box::new(Expr::StateRef("cost_basis".into())),
+                                op: AstBinaryOp::Add,
+                                right: Box::new(Expr::BinaryOp {
+                                    left: Box::new(Expr::RowRef("amount".into())),
+                                    op: AstBinaryOp::Mul,
+                                    right: Box::new(Expr::RowRef("price".into())),
+                                }),
+                            },
+                        ),
                     ],
-                    emits: vec![
-                        ("trade_pnl".into(), Expr::Int(0)),
-                    ],
+                    emits: vec![("trade_pnl".into(), Expr::Int(0))],
                 },
                 // WHEN row.side = 'sell'
                 WhenBlock {
@@ -220,41 +255,53 @@ mod tests {
                     },
                     lets: vec![
                         // LET avg_cost = state.cost_basis / state.quantity
-                        ("avg_cost".into(), Expr::BinaryOp {
-                            left: Box::new(Expr::StateRef("cost_basis".into())),
-                            op: AstBinaryOp::Div,
-                            right: Box::new(Expr::StateRef("quantity".into())),
-                        }),
+                        (
+                            "avg_cost".into(),
+                            Expr::BinaryOp {
+                                left: Box::new(Expr::StateRef("cost_basis".into())),
+                                op: AstBinaryOp::Div,
+                                right: Box::new(Expr::StateRef("quantity".into())),
+                            },
+                        ),
                     ],
                     sets: vec![
                         // state.quantity = state.quantity - row.amount
-                        ("quantity".into(), Expr::BinaryOp {
-                            left: Box::new(Expr::StateRef("quantity".into())),
-                            op: AstBinaryOp::Sub,
-                            right: Box::new(Expr::RowRef("amount".into())),
-                        }),
+                        (
+                            "quantity".into(),
+                            Expr::BinaryOp {
+                                left: Box::new(Expr::StateRef("quantity".into())),
+                                op: AstBinaryOp::Sub,
+                                right: Box::new(Expr::RowRef("amount".into())),
+                            },
+                        ),
                         // state.cost_basis = state.cost_basis - row.amount * avg_cost
-                        ("cost_basis".into(), Expr::BinaryOp {
-                            left: Box::new(Expr::StateRef("cost_basis".into())),
-                            op: AstBinaryOp::Sub,
-                            right: Box::new(Expr::BinaryOp {
-                                left: Box::new(Expr::RowRef("amount".into())),
-                                op: AstBinaryOp::Mul,
-                                right: Box::new(Expr::ColumnRef("avg_cost".into())),
-                            }),
-                        }),
+                        (
+                            "cost_basis".into(),
+                            Expr::BinaryOp {
+                                left: Box::new(Expr::StateRef("cost_basis".into())),
+                                op: AstBinaryOp::Sub,
+                                right: Box::new(Expr::BinaryOp {
+                                    left: Box::new(Expr::RowRef("amount".into())),
+                                    op: AstBinaryOp::Mul,
+                                    right: Box::new(Expr::ColumnRef("avg_cost".into())),
+                                }),
+                            },
+                        ),
                     ],
                     emits: vec![
                         // EMIT trade_pnl = row.amount * (row.price - avg_cost)
-                        ("trade_pnl".into(), Expr::BinaryOp {
-                            left: Box::new(Expr::RowRef("amount".into())),
-                            op: AstBinaryOp::Mul,
-                            right: Box::new(Expr::BinaryOp {
-                                left: Box::new(Expr::RowRef("price".into())),
-                                op: AstBinaryOp::Sub,
-                                right: Box::new(Expr::ColumnRef("avg_cost".into())),
-                            }),
-                        }),
+                        (
+                            "trade_pnl".into(),
+                            Expr::BinaryOp {
+                                left: Box::new(Expr::RowRef("amount".into())),
+                                op: AstBinaryOp::Mul,
+                                right: Box::new(Expr::BinaryOp {
+                                    left: Box::new(Expr::RowRef("price".into())),
+                                    op: AstBinaryOp::Sub,
+                                    right: Box::new(Expr::ColumnRef("avg_cost".into())),
+                                }),
+                            },
+                        ),
                     ],
                 },
             ],
@@ -263,19 +310,22 @@ mod tests {
                     // state.quantity AS position_size
                     ("position_size".into(), Expr::StateRef("quantity".into())),
                     // IF(state.quantity > 0, state.cost_basis / state.quantity, 0) AS avg_cost
-                    ("avg_cost".into(), Expr::If {
-                        condition: Box::new(Expr::BinaryOp {
-                            left: Box::new(Expr::StateRef("quantity".into())),
-                            op: AstBinaryOp::Gt,
-                            right: Box::new(Expr::Int(0)),
-                        }),
-                        then_expr: Box::new(Expr::BinaryOp {
-                            left: Box::new(Expr::StateRef("cost_basis".into())),
-                            op: AstBinaryOp::Div,
-                            right: Box::new(Expr::StateRef("quantity".into())),
-                        }),
-                        else_expr: Box::new(Expr::Int(0)),
-                    }),
+                    (
+                        "avg_cost".into(),
+                        Expr::If {
+                            condition: Box::new(Expr::BinaryOp {
+                                left: Box::new(Expr::StateRef("quantity".into())),
+                                op: AstBinaryOp::Gt,
+                                right: Box::new(Expr::Int(0)),
+                            }),
+                            then_expr: Box::new(Expr::BinaryOp {
+                                left: Box::new(Expr::StateRef("cost_basis".into())),
+                                op: AstBinaryOp::Div,
+                                right: Box::new(Expr::StateRef("quantity".into())),
+                            }),
+                            else_expr: Box::new(Expr::Int(0)),
+                        },
+                    ),
                 ],
             }),
         }
@@ -302,7 +352,11 @@ mod tests {
 
         // Trade 1: BUY 10 ETH @ $2000
         let row1 = make_trade("buy", 10.0, 2000.0);
-        let out1 = runtime.process(&mut state, &row1).unwrap();
+        let out1 = runtime
+            .process(&mut state, &row1)
+            .into_iter()
+            .next()
+            .unwrap();
         assert_eq!(state.get("quantity"), Some(&Value::Float64(10.0)));
         assert_eq!(state.get("cost_basis"), Some(&Value::Float64(20000.0)));
         assert_eq!(out1.get("trade_pnl"), Some(&Value::UInt64(0)));
@@ -311,7 +365,11 @@ mod tests {
 
         // Trade 2: BUY 5 ETH @ $2100
         let row2 = make_trade("buy", 5.0, 2100.0);
-        let out2 = runtime.process(&mut state, &row2).unwrap();
+        let out2 = runtime
+            .process(&mut state, &row2)
+            .into_iter()
+            .next()
+            .unwrap();
         assert_eq!(state.get("quantity"), Some(&Value::Float64(15.0)));
         assert_eq!(state.get("cost_basis"), Some(&Value::Float64(30500.0)));
         assert_eq!(out2.get("trade_pnl"), Some(&Value::UInt64(0)));
@@ -321,7 +379,11 @@ mod tests {
 
         // Trade 3: SELL 8 ETH @ $2200
         let row3 = make_trade("sell", 8.0, 2200.0);
-        let out3 = runtime.process(&mut state, &row3).unwrap();
+        let out3 = runtime
+            .process(&mut state, &row3)
+            .into_iter()
+            .next()
+            .unwrap();
 
         let trade_pnl = out3.get("trade_pnl").unwrap().as_f64().unwrap();
         // 8 * (2200 - 2033.33) = 1333.33
@@ -362,48 +424,48 @@ mod tests {
         let runtime = EventRulesRuntime::new(&body);
         let mut state = HashMap::new();
         let row = HashMap::from([("x".to_string(), Value::Float64(1.0))]);
-        let out = runtime.process(&mut state, &row).unwrap();
+        let out = runtime
+            .process(&mut state, &row)
+            .into_iter()
+            .next()
+            .unwrap();
         assert_eq!(out.get("matched"), Some(&Value::String("first".into())));
     }
 
     #[test]
     fn no_match_no_always_returns_none() {
         let body = ReducerBody::EventRules {
-            when_blocks: vec![
-                WhenBlock {
-                    condition: Expr::BinaryOp {
-                        left: Box::new(Expr::RowRef("x".into())),
-                        op: AstBinaryOp::Gt,
-                        right: Box::new(Expr::Int(100)),
-                    },
-                    lets: vec![],
-                    sets: vec![],
-                    emits: vec![("out".into(), Expr::Int(1))],
+            when_blocks: vec![WhenBlock {
+                condition: Expr::BinaryOp {
+                    left: Box::new(Expr::RowRef("x".into())),
+                    op: AstBinaryOp::Gt,
+                    right: Box::new(Expr::Int(100)),
                 },
-            ],
+                lets: vec![],
+                sets: vec![],
+                emits: vec![("out".into(), Expr::Int(1))],
+            }],
             always_emit: None,
         };
         let runtime = EventRulesRuntime::new(&body);
         let mut state = HashMap::new();
         let row = HashMap::from([("x".to_string(), Value::Float64(1.0))]);
-        assert!(runtime.process(&mut state, &row).is_none());
+        assert!(runtime.process(&mut state, &row).is_empty());
     }
 
     #[test]
     fn always_emit_without_match() {
         let body = ReducerBody::EventRules {
-            when_blocks: vec![
-                WhenBlock {
-                    condition: Expr::BinaryOp {
-                        left: Box::new(Expr::RowRef("x".into())),
-                        op: AstBinaryOp::Gt,
-                        right: Box::new(Expr::Int(100)),
-                    },
-                    lets: vec![],
-                    sets: vec![],
-                    emits: vec![],
+            when_blocks: vec![WhenBlock {
+                condition: Expr::BinaryOp {
+                    left: Box::new(Expr::RowRef("x".into())),
+                    op: AstBinaryOp::Gt,
+                    right: Box::new(Expr::Int(100)),
                 },
-            ],
+                lets: vec![],
+                sets: vec![],
+                emits: vec![],
+            }],
             always_emit: Some(AlwaysEmit {
                 emits: vec![("always".into(), Expr::Int(42))],
             }),
@@ -411,7 +473,11 @@ mod tests {
         let runtime = EventRulesRuntime::new(&body);
         let mut state = HashMap::new();
         let row = HashMap::from([("x".to_string(), Value::Float64(1.0))]);
-        let out = runtime.process(&mut state, &row).unwrap();
+        let out = runtime
+            .process(&mut state, &row)
+            .into_iter()
+            .next()
+            .unwrap();
         assert_eq!(out.get("always"), Some(&Value::UInt64(42)));
     }
 

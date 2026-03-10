@@ -1,10 +1,9 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use std::collections::HashMap;
 
 use crate::db::{Config, DeltaDb as DeltaDbInner, IngestInput as IngestInputInner};
-use crate::json_conv::{json_object_to_row, value_map_to_json};
-use crate::types::{BlockCursor, DeltaOperation, RowMap, Value};
+use crate::msgpack_conv::{decode_data_from_msgpack, decode_rows_from_msgpack, encode_batch_to_msgpack};
+use crate::types::BlockCursor;
 
 /// Configuration for opening a DeltaDb instance.
 #[napi(object)]
@@ -25,25 +24,6 @@ pub struct DeltaDbCursor {
     pub hash: String,
 }
 
-/// A single delta record.
-#[napi(object)]
-pub struct DeltaRecord {
-    pub table: String,
-    pub operation: String,
-    pub key: serde_json::Value,
-    pub values: serde_json::Value,
-    pub prev_values: Option<serde_json::Value>,
-}
-
-/// A batch of delta records.
-#[napi(object)]
-pub struct DeltaBatch {
-    pub sequence: u32,
-    pub finalized_head: Option<DeltaDbCursor>,
-    pub latest_head: Option<DeltaDbCursor>,
-    pub records: Vec<DeltaRecord>,
-}
-
 impl From<BlockCursor> for DeltaDbCursor {
     fn from(c: BlockCursor) -> Self {
         DeltaDbCursor {
@@ -53,38 +33,11 @@ impl From<BlockCursor> for DeltaDbCursor {
     }
 }
 
-fn option_cursor_to_js(c: Option<BlockCursor>) -> Option<DeltaDbCursor> {
-    c.map(|c| c.into())
-}
-
-fn batch_to_js(batch: crate::types::DeltaBatch) -> DeltaBatch {
-    DeltaBatch {
-        sequence: batch.sequence as u32,
-        finalized_head: option_cursor_to_js(batch.finalized_head),
-        latest_head: option_cursor_to_js(batch.latest_head),
-        records: batch
-            .records
-            .into_iter()
-            .map(|r| DeltaRecord {
-                table: r.table,
-                operation: match r.operation {
-                    DeltaOperation::Insert => "insert".to_string(),
-                    DeltaOperation::Update => "update".to_string(),
-                    DeltaOperation::Delete => "delete".to_string(),
-                },
-                key: value_map_to_json(&r.key),
-                values: value_map_to_json(&r.values),
-                prev_values: r.prev_values.as_ref().map(value_map_to_json),
-            })
-            .collect(),
-    }
-}
-
 /// Input for the atomic `ingest()` method.
 #[napi(object)]
 pub struct IngestInput {
-    /// Table name → rows. Rows must contain `block_number`.
-    pub data: HashMap<String, Vec<serde_json::Value>>,
+    /// Table name → rows, msgpack-encoded as `{tableName: [{col: val}, ...], ...}`.
+    pub data: Buffer,
     /// Unfinalized blocks with hashes for fork resolution.
     pub rollback_chain: Option<Vec<DeltaDbCursor>>,
     /// Finalized head cursor — both number and hash stored.
@@ -119,22 +72,17 @@ impl DeltaDb {
     }
 
     /// Process a batch of rows for a raw table.
-    /// `rows` is an array of JSON objects.
+    /// `rows` is a msgpack-encoded Buffer: `[{col: val, ...}, ...]`.
     /// Returns true if backpressure should be applied.
     #[napi]
     pub fn process_batch(
         &mut self,
         table: String,
         block: u32,
-        rows: Vec<serde_json::Value>,
+        rows: Buffer,
     ) -> Result<bool> {
-        let rows: Vec<RowMap> = rows
-            .into_iter()
-            .map(|v| {
-                json_object_to_row(&v)
-                    .ok_or_else(|| Error::new(Status::InvalidArg, "row must be a JSON object"))
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let rows = decode_rows_from_msgpack(&rows)
+            .map_err(|e| Error::new(Status::InvalidArg, e))?;
 
         self.inner
             .process_batch(&table, block as u64, rows)
@@ -158,22 +106,11 @@ impl DeltaDb {
     }
 
     /// Atomic ingest: process all tables, store rollback chain, finalize, flush.
-    /// Returns the delta batch, or null if no records produced.
+    /// Returns a msgpack-encoded DeltaBatch buffer, or null if no records produced.
     #[napi]
-    pub fn ingest(&mut self, input: IngestInput) -> Result<Option<DeltaBatch>> {
-        // Convert JS rows to internal rows
-        let mut data = std::collections::HashMap::new();
-        for (table, js_rows) in input.data {
-            let rows: Vec<RowMap> = js_rows
-                .into_iter()
-                .map(|v| {
-                    json_object_to_row(&v).ok_or_else(|| {
-                        Error::new(Status::InvalidArg, "row must be a JSON object")
-                    })
-                })
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            data.insert(table, rows);
-        }
+    pub fn ingest(&mut self, input: IngestInput) -> Result<Option<Buffer>> {
+        let data = decode_data_from_msgpack(&input.data)
+            .map_err(|e| Error::new(Status::InvalidArg, e))?;
 
         let rollback_chain = input
             .rollback_chain
@@ -199,7 +136,7 @@ impl DeltaDb {
             .ingest(ingest_input)
             .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;
 
-        Ok(batch.map(|b| batch_to_js(b)))
+        Ok(batch.map(|b| Buffer::from(encode_batch_to_msgpack(&b))))
     }
 
     /// Find the common ancestor between our state and the Portal's chain.
@@ -214,13 +151,16 @@ impl DeltaDb {
             .map(|c| (c.number as u64, c.hash))
             .collect();
         let refs: Vec<(u64, &str)> = blocks.iter().map(|(n, h)| (*n, h.as_str())).collect();
-        option_cursor_to_js(self.inner.resolve_fork_cursor(&refs))
+        self.inner.resolve_fork_cursor(&refs).map(|c| c.into())
     }
 
-    /// Flush buffered deltas into a batch. Returns null if no pending records.
+    /// Flush buffered deltas into a msgpack-encoded batch.
+    /// Returns null if no pending records.
     #[napi]
-    pub fn flush(&mut self) -> Option<DeltaBatch> {
-        self.inner.flush().map(batch_to_js)
+    pub fn flush(&mut self) -> Option<Buffer> {
+        self.inner
+            .flush()
+            .map(|b| Buffer::from(encode_batch_to_msgpack(&b)))
     }
 
     /// Acknowledge a flushed batch by sequence number.
@@ -244,6 +184,6 @@ impl DeltaDb {
     /// Current cursor: latest processed block + hash. Null if no blocks processed.
     #[napi(getter)]
     pub fn cursor(&self) -> Option<DeltaDbCursor> {
-        option_cursor_to_js(self.inner.latest_cursor())
+        self.inner.latest_cursor().map(|c| c.into())
     }
 }
