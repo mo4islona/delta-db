@@ -1,7 +1,7 @@
 //! End-to-end integration test: full DEX dashboard pipeline.
 //!
 //! Based on PLAN.md Step 15 and RFC Section 11:
-//! 1. Parse DEX schema (trades → pnl reducer → position_summary MV + volume MV)
+//! 1. Parse DEX schema (trades -> pnl reducer -> position_summary MV + volume MV)
 //! 2. Ingest synthetic trade data across 100 blocks
 //! 3. Trigger rollback at block 75
 //! 4. Re-process blocks 75-100 with different data
@@ -13,58 +13,7 @@ use std::collections::HashMap;
 use delta_db::db::{Config, DeltaDb};
 use delta_db::types::{DeltaBatch, DeltaOperation, DeltaRecord, RowMap, Value};
 
-const DEX_SCHEMA: &str = r#"
-    CREATE TABLE trades (
-        block_number UInt64,
-        user         String,
-        side         String,
-        amount       Float64,
-        price        Float64
-    );
-
-    CREATE REDUCER pnl
-    SOURCE trades
-    GROUP BY user
-    STATE (
-        quantity   Float64 DEFAULT 0,
-        cost_basis Float64 DEFAULT 0
-    )
-        WHEN row.side = 'buy' THEN
-            SET state.quantity = state.quantity + row.amount
-            SET state.cost_basis = state.cost_basis + row.amount * row.price
-            EMIT trade_pnl = 0
-        WHEN row.side = 'sell' THEN
-            LET avg_cost = state.cost_basis / state.quantity
-            SET state.quantity = state.quantity - row.amount
-            SET state.cost_basis = state.cost_basis - row.amount * avg_cost
-            EMIT trade_pnl = row.amount * (row.price - avg_cost)
-        ALWAYS EMIT
-            state.quantity AS position_size
-    END;
-
-    CREATE MATERIALIZED VIEW position_summary AS
-    SELECT
-        user,
-        sum(trade_pnl)       AS total_pnl,
-        last(position_size)  AS current_position,
-        count()              AS trade_count
-    FROM pnl
-    GROUP BY user;
-
-    CREATE TABLE swaps (
-        block_number UInt64,
-        pool         String,
-        amount       Float64
-    );
-
-    CREATE MATERIALIZED VIEW volume_by_pool AS
-    SELECT
-        pool,
-        sum(amount) AS total_volume,
-        count()     AS swap_count
-    FROM swaps
-    GROUP BY pool;
-"#;
+const DEX_SCHEMA: &str = include_str!("schema.sql");
 
 fn make_trade(user: &str, side: &str, amount: f64, price: f64) -> RowMap {
     HashMap::from([

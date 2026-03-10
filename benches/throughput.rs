@@ -484,6 +484,340 @@ fn bench_many_group_keys(backend: Backend) -> BenchResult {
     }
 }
 
+// ─── Polymarket schemas ───────────────────────────────────────────
+
+const POLYMARKET_FULL_SCHEMA: &str =
+    include_str!("../tests/polymarket/schema.sql");
+
+const POLYMARKET_MARKET_STATS_ONLY: &str = r#"
+CREATE VIRTUAL TABLE orders (
+    block_number UInt64,
+    timestamp    UInt64,
+    trader       String,
+    asset_id     String,
+    usdc         UInt64,
+    shares       UInt64,
+    side         UInt64
+);
+
+CREATE REDUCER market_stats
+SOURCE orders
+GROUP BY asset_id
+STATE (
+    volume      Float64 DEFAULT 0,
+    trades      UInt64  DEFAULT 0,
+    sum_price   Float64 DEFAULT 0,
+    sum_price_sq Float64 DEFAULT 0,
+    first_seen  UInt64  DEFAULT 0,
+    last_seen   UInt64  DEFAULT 0
+)
+LANGUAGE lua
+PROCESS $$
+    if row.shares == 0 then return end
+    local price = row.usdc / row.shares
+    local vol = row.usdc / 1000000
+    state.volume = state.volume + vol
+    state.trades = state.trades + 1
+    state.sum_price = state.sum_price + price
+    state.sum_price_sq = state.sum_price_sq + price * price
+    if state.first_seen == 0 then state.first_seen = row.timestamp end
+    state.last_seen = row.timestamp
+    emit.asset_id = row.asset_id
+    emit.volume = vol
+    emit.price = price
+    emit.price_sq = price * price
+$$;
+
+CREATE MATERIALIZED VIEW token_summary AS
+SELECT
+    asset_id,
+    sum(volume)    AS total_volume,
+    count()        AS trade_count,
+    last(price)    AS last_price,
+    sum(price)     AS sum_price,
+    sum(price_sq)  AS sum_price_sq
+FROM market_stats
+GROUP BY asset_id;
+"#;
+
+const POLYMARKET_INSIDER_ONLY: &str = r#"
+CREATE VIRTUAL TABLE orders (
+    block_number UInt64,
+    timestamp    UInt64,
+    trader       String,
+    asset_id     String,
+    usdc         UInt64,
+    shares       UInt64,
+    side         UInt64
+);
+
+CREATE REDUCER insider_classifier
+SOURCE orders
+GROUP BY trader
+STATE (
+    status       String  DEFAULT 'unknown',
+    window_start UInt64  DEFAULT 0,
+    window_vol   UInt64  DEFAULT 0,
+    window_trades UInt64 DEFAULT 0,
+    positions    Json    DEFAULT '{}'
+)
+LANGUAGE lua
+PROCESS $$
+    if row.shares == 0 then return end
+    local FIFTEEN_MIN = 900
+    local VOLUME_THRESHOLD = 4000000000
+    local MIN_PRICE_BPS = 9500
+    local BPS_SCALE = 10000
+    if row.side ~= 0 then return end
+    if row.usdc * BPS_SCALE >= row.shares * MIN_PRICE_BPS then return end
+    if state.status ~= "unknown" then
+        if state.status == "insider" then
+            local price = row.usdc / row.shares
+            emit {
+                trader = row.trader,
+                asset_id = row.asset_id,
+                volume = row.usdc / 1000000,
+                price = price,
+                price_sq = price * price,
+                timestamp = row.timestamp,
+                detected_at = row.timestamp
+            }
+        end
+        return
+    end
+    if state.window_start == 0 then
+        state.window_start = row.timestamp
+    elseif row.timestamp - state.window_start > FIFTEEN_MIN then
+        state.status = "clean"
+        return
+    end
+    state.window_vol = state.window_vol + row.usdc
+    state.window_trades = state.window_trades + 1
+    local token = row.asset_id
+    local price = row.usdc / row.shares
+    local vol = row.usdc / 1000000
+    local pos = state.positions[token]
+    if not pos then
+        pos = { volume = 0, trades = 0, sum_price = 0, sum_price_sq = 0,
+                first_seen = row.timestamp, last_seen = row.timestamp }
+    end
+    pos.volume = pos.volume + vol
+    pos.trades = pos.trades + 1
+    pos.sum_price = pos.sum_price + price
+    pos.sum_price_sq = pos.sum_price_sq + price * price
+    if row.timestamp < pos.first_seen then pos.first_seen = row.timestamp end
+    if row.timestamp > pos.last_seen then pos.last_seen = row.timestamp end
+    state.positions[token] = pos
+    if state.window_vol >= VOLUME_THRESHOLD then
+        state.status = "insider"
+        for tid, p in pairs(state.positions) do
+            emit {
+                trader = row.trader,
+                asset_id = tid,
+                volume = p.volume,
+                price = p.sum_price / p.trades,
+                price_sq = p.sum_price_sq / p.trades,
+                timestamp = p.first_seen,
+                detected_at = row.timestamp
+            }
+        end
+    end
+$$;
+
+CREATE MATERIALIZED VIEW insider_positions AS
+SELECT
+    trader,
+    asset_id,
+    sum(volume)      AS total_volume,
+    count()          AS trade_count,
+    sum(price)       AS sum_price,
+    sum(price_sq)    AS sum_price_sq,
+    first(timestamp) AS first_seen,
+    last(timestamp)  AS last_seen,
+    first(detected_at) AS detected_at
+FROM insider_classifier
+GROUP BY trader, asset_id;
+"#;
+
+// ─── Polymarket data generation ───────────────────────────────────
+
+/// Generate a realistic Polymarket order for benchmarking.
+///
+/// Distribution (per plan):
+/// - 80% of orders from 10% of traders (power law)
+/// - 60/40 BUY/SELL split
+/// - 70% price above 0.95 (filtered by insider logic), 30% below
+/// - ~10K unique asset_ids
+fn make_polymarket_order(i: usize, num_traders: usize) -> RowMap {
+    // Power law: 80% of orders from top 10% of traders
+    let top_traders = num_traders / 10;
+    let remaining = num_traders - top_traders;
+    let trader_idx = if i % 5 < 4 {
+        i % top_traders
+    } else {
+        top_traders + (i % remaining)
+    };
+    let trader = format!("0xtrader{trader_idx:06x}");
+
+    // ~10K unique tokens
+    let asset_id = format!("token_{:04}", i % 10_000);
+
+    // 60/40 BUY/SELL
+    let side: u64 = if i % 5 < 3 { 0 } else { 1 };
+
+    // Price distribution: 70% above 0.95, 30% below
+    let (usdc, shares) = if i % 10 < 7 {
+        // High price: 0.96-0.99 (filtered out by insider logic)
+        let price_bps = 9600 + (i % 400); // 0.96 to 0.9999
+        let shares_val = 1_000_000_000u64;
+        let usdc_val = shares_val * price_bps as u64 / 10_000;
+        (usdc_val, shares_val)
+    } else {
+        // Low price: 0.30-0.90 (tracked by insider logic)
+        let price_bps = 3000 + (i % 6000); // 0.30 to 0.8999
+        let shares_val = 1_000_000_000u64;
+        let usdc_val = shares_val * price_bps as u64 / 10_000;
+        (usdc_val, shares_val)
+    };
+
+    // Timestamp: monotonically increasing, all within 15-min windows
+    let timestamp = 1_000_000 + (i as u64 / 500); // increments every 500 orders
+
+    HashMap::from([
+        ("trader".to_string(), Value::String(trader)),
+        ("asset_id".to_string(), Value::String(asset_id)),
+        ("usdc".to_string(), Value::UInt64(usdc)),
+        ("shares".to_string(), Value::UInt64(shares)),
+        ("side".to_string(), Value::UInt64(side)),
+        ("timestamp".to_string(), Value::UInt64(timestamp)),
+    ])
+}
+
+// ─── Polymarket benchmarks ────────────────────────────────────────
+
+/// market_stats reducer only — GROUP BY asset_id, ~10K unique tokens.
+fn bench_polymarket_market_stats(backend: Backend) -> BenchResult {
+    let total_rows = 200_000;
+    let batch_size = 500;
+    let (cfg, _dir) = make_config(POLYMARKET_MARKET_STATS_ONLY, backend);
+    let mut db = DeltaDb::open(cfg).unwrap();
+
+    let rows: Vec<RowMap> = (0..total_rows)
+        .map(|i| make_polymarket_order(i, 10_000))
+        .collect();
+
+    let start = Instant::now();
+    for (block, chunk) in rows.chunks(batch_size).enumerate() {
+        db.process_batch("orders", block as u64, chunk.to_vec()).unwrap();
+    }
+    db.flush();
+    let elapsed = start.elapsed();
+
+    let rows_per_sec = total_rows as f64 / elapsed.as_secs_f64();
+    BenchResult {
+        name: format!("Polymarket: market_stats only [{}]", backend),
+        backend: backend.to_string(),
+        total_rows,
+        elapsed_ms: elapsed.as_secs_f64() * 1000.0,
+        rows_per_sec,
+        pass: rows_per_sec > 160_000.0,
+        target: ">160K rows/sec".to_string(),
+    }
+}
+
+/// insider_classifier reducer only — GROUP BY trader, 100K unique traders.
+fn bench_polymarket_insider_detect(backend: Backend) -> BenchResult {
+    let total_rows = 200_000;
+    let batch_size = 500;
+    let num_traders = 100_000;
+    let (cfg, _dir) = make_config(POLYMARKET_INSIDER_ONLY, backend);
+    let mut db = DeltaDb::open(cfg).unwrap();
+
+    let rows: Vec<RowMap> = (0..total_rows)
+        .map(|i| make_polymarket_order(i, num_traders))
+        .collect();
+
+    let start = Instant::now();
+    for (block, chunk) in rows.chunks(batch_size).enumerate() {
+        db.process_batch("orders", block as u64, chunk.to_vec()).unwrap();
+    }
+    db.flush();
+    let elapsed = start.elapsed();
+
+    let rows_per_sec = total_rows as f64 / elapsed.as_secs_f64();
+    BenchResult {
+        name: format!("Polymarket: insider_classifier only [{}]", backend),
+        backend: backend.to_string(),
+        total_rows,
+        elapsed_ms: elapsed.as_secs_f64() * 1000.0,
+        rows_per_sec,
+        pass: rows_per_sec > 300_000.0,
+        target: ">300K rows/sec".to_string(),
+    }
+}
+
+/// Full pipeline — both reducers + MVs, realistic data distribution.
+fn bench_polymarket_full_pipeline(backend: Backend) -> BenchResult {
+    let total_rows = 200_000;
+    let batch_size = 500;
+    let num_traders = 100_000;
+    let (cfg, _dir) = make_config(POLYMARKET_FULL_SCHEMA, backend);
+    let mut db = DeltaDb::open(cfg).unwrap();
+
+    let rows: Vec<RowMap> = (0..total_rows)
+        .map(|i| make_polymarket_order(i, num_traders))
+        .collect();
+
+    let start = Instant::now();
+    for (block, chunk) in rows.chunks(batch_size).enumerate() {
+        db.process_batch("orders", block as u64, chunk.to_vec()).unwrap();
+    }
+    db.flush();
+    let elapsed = start.elapsed();
+
+    let rows_per_sec = total_rows as f64 / elapsed.as_secs_f64();
+    BenchResult {
+        name: format!("Polymarket: full pipeline [{}]", backend),
+        backend: backend.to_string(),
+        total_rows,
+        elapsed_ms: elapsed.as_secs_f64() * 1000.0,
+        rows_per_sec,
+        pass: rows_per_sec > 150_000.0,
+        target: ">150K rows/sec".to_string(),
+    }
+}
+
+/// High cardinality — 1M unique traders, measure throughput degradation.
+fn bench_polymarket_high_cardinality(backend: Backend) -> BenchResult {
+    let total_rows = 500_000;
+    let batch_size = 1000;
+    let num_traders = 1_000_000;
+    let (cfg, _dir) = make_config(POLYMARKET_FULL_SCHEMA, backend);
+    let mut db = DeltaDb::open(cfg).unwrap();
+
+    let rows: Vec<RowMap> = (0..total_rows)
+        .map(|i| make_polymarket_order(i, num_traders))
+        .collect();
+
+    let start = Instant::now();
+    for (block, chunk) in rows.chunks(batch_size).enumerate() {
+        db.process_batch("orders", block as u64, chunk.to_vec()).unwrap();
+    }
+    db.flush();
+    let elapsed = start.elapsed();
+
+    let rows_per_sec = total_rows as f64 / elapsed.as_secs_f64();
+    BenchResult {
+        name: format!("Polymarket: 1M traders [{}]", backend),
+        backend: backend.to_string(),
+        total_rows,
+        elapsed_ms: elapsed.as_secs_f64() * 1000.0,
+        rows_per_sec,
+        pass: rows_per_sec > 75_000.0,
+        target: ">75K rows/sec".to_string(),
+    }
+}
+
 fn main() {
     println!("=== Delta DB Benchmarks ===\n");
 
@@ -506,6 +840,16 @@ fn main() {
     // Reducer-only (memory only, no storage)
     println!("--- Isolated ---");
     let r = bench_reducer_event_rules_only(); r.print(); results.push(r);
+
+    // Polymarket-specific benchmarks
+    println!("\n--- Polymarket ---");
+    for &backend in &backends {
+        let r = bench_polymarket_market_stats(backend); r.print(); results.push(r);
+        let r = bench_polymarket_insider_detect(backend); r.print(); results.push(r);
+        let r = bench_polymarket_full_pipeline(backend); r.print(); results.push(r);
+        let r = bench_polymarket_high_cardinality(backend); r.print(); results.push(r);
+        println!();
+    }
 
     println!("\n=== Summary ===\n");
 

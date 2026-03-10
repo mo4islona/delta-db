@@ -106,6 +106,7 @@ const TAG_BOOLEAN: u8 = 6;
 const TAG_BYTES: u8 = 7;
 const TAG_UINT256: u8 = 8;
 const TAG_BASE58: u8 = 9;
+const TAG_JSON: u8 = 10;
 
 fn encode_value(buf: &mut Vec<u8>, val: &Value) {
     match val {
@@ -148,6 +149,12 @@ fn encode_value(buf: &mut Vec<u8>, val: &Value) {
             buf.push(TAG_BASE58);
             buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
             buf.extend_from_slice(v);
+        }
+        Value::JSON(v) => {
+            buf.push(TAG_JSON);
+            let s = serde_json::to_string(v).unwrap_or_default();
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
         }
     }
 }
@@ -209,6 +216,15 @@ fn decode_value(bytes: &[u8], pos: &mut usize) -> Value {
             let v = bytes[*pos..*pos + len].to_vec();
             *pos += len;
             Value::Base58(v)
+        }
+        TAG_JSON => {
+            let len = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap()) as usize;
+            *pos += 4;
+            let s = std::str::from_utf8(&bytes[*pos..*pos + len])
+                .expect("invalid utf8 in stored json");
+            let v = serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
+            *pos += len;
+            Value::JSON(v)
         }
         _ => panic!("unknown value type tag: {tag}"),
     }

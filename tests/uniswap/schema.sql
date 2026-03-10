@@ -1,0 +1,183 @@
+-- Raw Uniswap swap events with token addresses
+CREATE TABLE swaps (
+    block_number UInt64,
+    block_time   DateTime,
+    tx_hash      String,
+    network      String,
+    pool         String,
+    token0       String,
+    token1       String,
+    sender       String,
+    amount0      Float64,
+    amount1      Float64
+);
+
+-- Price oracle: computes USD price for each swap.
+-- Groups by network (constant) to maintain a global ETH/USD reference.
+-- Cross-prices tokens via ETH when no direct stablecoin pair exists.
+CREATE REDUCER swap_prices
+SOURCE swaps
+GROUP BY network
+STATE (
+    eth_usd Float64 DEFAULT 0
+)
+LANGUAGE lua
+PROCESS $$
+    local USDT = "0xdac17f958d2ee523a2206206994597c13d831ec7"
+    local USDC = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+    local WETH = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+
+    if row.amount0 == 0 then return end
+
+    local ratio = math.abs(row.amount1 / row.amount0)
+    local t0 = string.lower(row.token0)
+    local t1 = string.lower(row.token1)
+    local price_usd = 0
+    local target = ""
+    local vol_usd = 0
+
+    -- Case 1: token1 is stablecoin -> direct pricing
+    -- ratio = STABLE_per_TOKEN0 -> 1 TOKEN0 = ratio USD
+    if t1 == USDT or t1 == USDC then
+        price_usd = ratio
+        target = t0
+        if t0 == WETH then state.eth_usd = price_usd end
+        vol_usd = math.abs(row.amount1)
+
+    -- Case 2: token0 is stablecoin -> inverse pricing
+    -- ratio = TOKEN1_per_STABLE -> 1 TOKEN1 = 1/ratio USD
+    elseif t0 == USDT or t0 == USDC then
+        if ratio > 0 then price_usd = 1 / ratio end
+        target = t1
+        if t1 == WETH then state.eth_usd = price_usd end
+        vol_usd = math.abs(row.amount0)
+
+    -- Case 3: token1 is WETH -> cross via ETH
+    -- ratio = WETH_per_TOKEN0 -> TOKEN0_usd = ratio * eth_usd
+    elseif t1 == WETH then
+        price_usd = ratio * state.eth_usd
+        target = t0
+        vol_usd = math.abs(row.amount1) * state.eth_usd
+
+    -- Case 4: token0 is WETH -> cross via ETH (inverted)
+    -- ratio = TOKEN1_per_WETH -> TOKEN1_usd = eth_usd / ratio
+    elseif t0 == WETH then
+        if ratio > 0 then price_usd = state.eth_usd / ratio end
+        target = t1
+        vol_usd = math.abs(row.amount0) * state.eth_usd
+    end
+
+    if price_usd > 0 then
+        emit.pool = row.pool
+        emit.token = target
+        emit.block_time = row.block_time
+        emit.price_usd = price_usd
+        emit.volume_usd = vol_usd
+    end
+$$;
+
+-- OHLC 5-minute candles per pool, in USD
+CREATE MATERIALIZED VIEW candles_5m AS
+SELECT
+    pool,
+    toStartOfInterval(block_time, INTERVAL 5 MINUTE) AS window_start,
+    first(price_usd)  AS open,
+    max(price_usd)    AS high,
+    min(price_usd)    AS low,
+    last(price_usd)   AS close,
+    sum(volume_usd)   AS volume,
+    count()            AS trade_count
+FROM swap_prices
+GROUP BY pool, window_start;
+
+-- Wallet PnL tracker: USD-denominated position tracking.
+-- Groups by network (constant) to maintain global price + position state.
+CREATE REDUCER wallet_pnl
+SOURCE swaps
+GROUP BY network
+STATE (
+    eth_usd       Float64 DEFAULT 0,
+    positions    Json    DEFAULT '{}'
+)
+LANGUAGE lua
+PROCESS $$
+    local USDT = "0xdac17f958d2ee523a2206206994597c13d831ec7"
+    local USDC = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+    local WETH = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+
+    if row.amount0 == 0 then return end
+
+    local t0 = string.lower(row.token0)
+    local t1 = string.lower(row.token1)
+    local ratio = math.abs(row.amount1 / row.amount0)
+
+    -- Update ETH/USD reference (mirrors swap_prices logic)
+    if t1 == USDT or t1 == USDC then
+        if t0 == WETH then state.eth_usd = ratio end
+    elseif t0 == USDT or t0 == USDC then
+        if t1 == WETH and ratio > 0 then state.eth_usd = 1 / ratio end
+    end
+
+    -- Determine base token (non-stablecoin side) and USD price
+    local base, price_usd, base_delta
+    if t1 == USDT or t1 == USDC then
+        base = t0
+        price_usd = ratio
+        base_delta = row.amount0
+    elseif t0 == USDT or t0 == USDC then
+        base = t1
+        if ratio > 0 then price_usd = 1 / ratio else price_usd = 0 end
+        base_delta = row.amount1
+    elseif t1 == WETH then
+        base = t0
+        price_usd = ratio * state.eth_usd
+        base_delta = row.amount0
+    elseif t0 == WETH then
+        base = t1
+        if ratio > 0 then price_usd = state.eth_usd / ratio else price_usd = 0 end
+        base_delta = row.amount1
+    else
+        return
+    end
+
+    if not price_usd or price_usd <= 0 then
+        return
+    end
+
+    -- Track position and realized PnL (cost-basis accounting)
+    local pos_key = row.sender .. ":" .. base
+    local pos = state.positions[pos_key]
+    if not pos then pos = { balance = 0, cost_usd = 0 } end
+
+    local pnl = 0
+    if base_delta > 0 then
+        -- Buy: accumulate cost basis
+        pos.balance = pos.balance + base_delta
+        pos.cost_usd = pos.cost_usd + base_delta * price_usd
+    elseif base_delta < 0 and pos.balance > 0 then
+        -- Sell: realize PnL vs average cost
+        local sold = math.abs(base_delta)
+        local avg_cost = pos.cost_usd / pos.balance
+        pnl = sold * (price_usd - avg_cost)
+        pos.balance = pos.balance - sold
+        pos.cost_usd = pos.cost_usd - sold * avg_cost
+    end
+
+    state.positions[pos_key] = pos
+
+    emit.sender = row.sender
+    emit.pool = row.pool
+    emit.realized_pnl = pnl
+    emit.position = pos.balance
+$$;
+
+-- Aggregate PnL per wallet per pool
+CREATE MATERIALIZED VIEW wallet_summary AS
+SELECT
+    sender,
+    pool,
+    sum(realized_pnl) AS total_pnl,
+    last(position)    AS current_position,
+    count()           AS trade_count
+FROM wallet_pnl
+GROUP BY sender, pool;
