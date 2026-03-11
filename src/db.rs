@@ -237,8 +237,11 @@ impl DeltaDb {
     /// Replaces separate `process_batch` + `set_rollback_chain` + `finalize` + `flush`.
     /// Each row must contain a `block_number` field (UInt64).
     pub fn ingest(&mut self, input: IngestInput) -> Result<Option<DeltaBatch>> {
+        // Single WriteBatch for all storage writes (raw rows + finalize + meta)
+        let mut write_batch = StorageWriteBatch::new();
+
         // 1. For each table, group rows by block_number and process in order
-        for (table, rows) in &input.data {
+        for (table, rows) in input.data {
             let mut by_block: BTreeMap<BlockNumber, Vec<RowMap>> = BTreeMap::new();
             for row in rows {
                 let block = row
@@ -249,11 +252,13 @@ impl DeltaDb {
                             "row in table '{table}' missing block_number"
                         ))
                     })?;
-                by_block.entry(block).or_default().push(row.clone());
+                by_block.entry(block).or_default().push(row);
             }
 
             for (block, block_rows) in by_block {
-                let deltas = self.engine.process_batch(table, block, block_rows)?;
+                let deltas = self.engine.process_batch_deferred(
+                    &table, block, block_rows, &mut write_batch,
+                )?;
                 self.buffer.push(
                     deltas,
                     self.engine.finalized_cursor(),
@@ -275,7 +280,6 @@ impl DeltaDb {
             input.finalized_head.number,
             input.finalized_head.hash.clone(),
         )]);
-        let mut write_batch = StorageWriteBatch::new();
         self.engine.finalize(input.finalized_head.number, &mut write_batch);
         self.append_meta_to_batch(&mut write_batch)?;
         self.storage.commit(&write_batch)?;

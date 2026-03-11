@@ -7,6 +7,11 @@ use std::sync::Arc;
 
 /// An operation to be committed atomically as part of a WriteBatch.
 pub enum BatchOp {
+    PutRawRows {
+        table: String,
+        block: BlockNumber,
+        data: Vec<u8>,
+    },
     SetReducerFinalized {
         reducer: String,
         group_key: Vec<u8>,
@@ -33,6 +38,14 @@ pub struct StorageWriteBatch {
 impl StorageWriteBatch {
     pub fn new() -> Self {
         Self { ops: Vec::new() }
+    }
+
+    pub fn put_raw_rows(&mut self, table: &str, block: BlockNumber, data: Vec<u8>) {
+        self.ops.push(BatchOp::PutRawRows {
+            table: table.to_string(),
+            block,
+            data,
+        });
     }
 
     pub fn set_reducer_finalized(&mut self, reducer: &str, group_key: &[u8], state: &[u8]) {

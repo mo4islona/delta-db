@@ -144,15 +144,40 @@ impl DeltaEngine {
         block: BlockNumber,
         row_maps: Vec<RowMap>,
     ) -> Result<Vec<DeltaRecord>> {
+        self.process_batch_inner(table, block, row_maps, None)
+    }
+
+    /// Process a batch, deferring raw row storage writes to the given WriteBatch.
+    pub fn process_batch_deferred(
+        &mut self,
+        table: &str,
+        block: BlockNumber,
+        row_maps: Vec<RowMap>,
+        write_batch: &mut StorageWriteBatch,
+    ) -> Result<Vec<DeltaRecord>> {
+        self.process_batch_inner(table, block, row_maps, Some(write_batch))
+    }
+
+    fn process_batch_inner(
+        &mut self,
+        table: &str,
+        block: BlockNumber,
+        row_maps: Vec<RowMap>,
+        write_batch: Option<&mut StorageWriteBatch>,
+    ) -> Result<Vec<DeltaRecord>> {
         if !self.raw_tables.contains_key(table) {
             return Err(Error::InvalidOperation(format!("unknown table: {table}")));
         }
 
         let mut all_deltas = Vec::new();
 
-        // Phase 1: Raw table ingest (uses original RowMaps for storage + DeltaRecord creation)
+        // Phase 1: Raw table ingest
         let raw_eng = self.raw_tables.get(table).unwrap();
-        if self.virtual_tables.contains(table) {
+        let is_virtual = self.virtual_tables.contains(table);
+        if let Some(batch) = write_batch {
+            let deltas = raw_eng.ingest_to_batch(block, &row_maps, batch, is_virtual)?;
+            all_deltas.extend(deltas);
+        } else if is_virtual {
             raw_eng.ingest_no_deltas(block, &row_maps)?;
         } else {
             let deltas = raw_eng.ingest(block, &row_maps)?;

@@ -278,6 +278,9 @@ impl StorageBackend for MemoryBackend {
         let mut inner = self.inner.lock().unwrap();
         for op in &batch.ops {
             match op {
+                BatchOp::PutRawRows { table, block, data } => {
+                    inner.raw.insert((table.clone(), *block), data.clone());
+                }
                 BatchOp::SetReducerFinalized { reducer, group_key, state } => {
                     let key = (reducer.clone(), group_key.clone());
                     inner.reducer_finalized.insert(key, state.clone());
