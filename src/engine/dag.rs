@@ -75,14 +75,19 @@ impl DeltaEngine {
             .collect();
 
         for reducer_def in &schema.reducers {
-            let source_registry = raw_tables
-                .get(&reducer_def.source)
-                .expect("reducer source table must exist")
-                .registry();
-            reducers.insert(
-                reducer_def.name.clone(),
-                ReducerEngine::new(reducer_def.clone(), storage.clone(), source_registry, &modules),
-            );
+            if let Some(raw) = raw_tables.get(&reducer_def.source) {
+                // Source is a raw table — use its registry
+                reducers.insert(
+                    reducer_def.name.clone(),
+                    ReducerEngine::new(reducer_def.clone(), storage.clone(), raw.registry(), &modules),
+                );
+            } else {
+                // Source is another reducer — build registry dynamically per batch
+                reducers.insert(
+                    reducer_def.name.clone(),
+                    ReducerEngine::new_chained(reducer_def.clone(), storage.clone(), &modules),
+                );
+            }
         }
 
         for mv_def in &schema.materialized_views {
@@ -387,6 +392,8 @@ impl DeltaEngine {
                                 let source = branch.reducer.source().to_string();
                                 if let Some(source_rows) = row_cache.get(&source) {
                                     branch.reducer.process_block(block, source_rows)?
+                                } else if let Some(source_maps) = output_rows.get(&source) {
+                                    branch.reducer.process_block_maps(block, source_maps)?
                                 } else {
                                     Vec::new()
                                 }
@@ -395,6 +402,8 @@ impl DeltaEngine {
                                 let source = reducer.source().to_string();
                                 if let Some(source_rows) = row_cache.get(&source) {
                                     reducer.process_block(block, source_rows)?
+                                } else if let Some(source_maps) = output_rows.get(&source) {
+                                    reducer.process_block_maps(block, source_maps)?
                                 } else {
                                     Vec::new()
                                 }
@@ -685,10 +694,30 @@ fn build_pipeline(schema: &Schema) -> Vec<PipelineNode> {
         pipeline.push(PipelineNode::RawTable(name.to_string()));
     }
 
-    // Phase 2: Reducers that source from raw tables
-    // (currently reducers always source from raw tables per RFC)
-    for r in &schema.reducers {
-        pipeline.push(PipelineNode::Reducer(r.name.clone()));
+    // Phase 2: Reducers — topologically sorted so upstream reducers come first.
+    // Reducers sourcing from raw tables are roots; chained reducers follow.
+    let mut emitted: HashSet<&str> = HashSet::new();
+    let mut remaining: Vec<&str> = schema.reducers.iter().map(|r| r.name.as_str()).collect();
+
+    while !remaining.is_empty() {
+        let before = remaining.len();
+        remaining.retain(|name| {
+            let r = schema.reducers.iter().find(|r| r.name == *name).unwrap();
+            // Ready if source is a table or an already-emitted reducer
+            let source_is_table = table_names.contains(&r.source.as_str());
+            let source_emitted = emitted.contains(r.source.as_str());
+            if source_is_table || source_emitted {
+                pipeline.push(PipelineNode::Reducer(r.name.clone()));
+                emitted.insert(name);
+                false // remove from remaining
+            } else {
+                true // keep in remaining
+            }
+        });
+        if remaining.len() == before {
+            // No progress — shouldn't happen if validation caught cycles
+            break;
+        }
     }
 
     // Phase 3: MVs — sort by dependency
@@ -1145,5 +1174,120 @@ mod tests {
 
         let result = engine.process_batch("nonexistent", 1000, vec![]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn reducer_chaining() {
+        // Table → reducer_a (accumulates total) → reducer_b (detects doubles) → MV
+        let schema = Schema {
+            modules: vec![],
+            tables: vec![TableDef {
+                name: "events".to_string(),
+                columns: vec![
+                    ColumnDef { name: "user".to_string(), column_type: ColumnType::String },
+                    ColumnDef { name: "amount".to_string(), column_type: ColumnType::Float64 },
+                ],
+                virtual_table: false,
+            }],
+            reducers: vec![
+                ReducerDef {
+                    name: "totals".to_string(),
+                    source: "events".to_string(),
+                    group_by: vec!["user".to_string()],
+                    state: vec![StateField {
+                        name: "total".to_string(),
+                        column_type: ColumnType::Float64,
+                        default: "0".to_string(),
+                    }],
+                    requires: vec![],
+                    body: ReducerBody::Lua {
+                        script: r#"
+                            state.total = state.total + row.amount
+                            emit.user = row.user
+                            emit.total = state.total
+                        "#.to_string(),
+                    },
+                },
+                ReducerDef {
+                    name: "doubled".to_string(),
+                    source: "totals".to_string(), // chained!
+                    group_by: vec!["user".to_string()],
+                    state: vec![],
+                    requires: vec![],
+                    body: ReducerBody::Lua {
+                        script: r#"
+                            emit.user = row.user
+                            emit.doubled = row.total * 2
+                        "#.to_string(),
+                    },
+                },
+            ],
+            materialized_views: vec![MVDef {
+                name: "summary".to_string(),
+                source: "doubled".to_string(),
+                select: vec![
+                    SelectItem { expr: SelectExpr::Column("user".into()), alias: None },
+                    SelectItem {
+                        expr: SelectExpr::Agg(AggFunc::Last, Some("doubled".into())),
+                        alias: Some("latest_doubled".into()),
+                    },
+                ],
+                group_by: vec!["user".into()],
+            }],
+        };
+
+        let storage = Arc::new(MemoryBackend::new());
+        let mut engine = DeltaEngine::new(&schema, storage);
+
+        // Block 1: alice deposits 10
+        let deltas = engine.process_batch("events", 1000, vec![
+            HashMap::from([
+                ("user".to_string(), Value::String("alice".into())),
+                ("amount".to_string(), Value::Float64(10.0)),
+            ]),
+        ]).unwrap();
+
+        // Should have: events insert + summary insert (doubled=20)
+        let summary_deltas: Vec<_> = deltas.iter().filter(|d| d.table == "summary").collect();
+        assert_eq!(summary_deltas.len(), 1);
+        assert_eq!(
+            summary_deltas[0].values.get("latest_doubled"),
+            Some(&Value::Float64(20.0))
+        );
+
+        // Block 2: alice deposits 5 more (total=15, doubled=30)
+        let deltas2 = engine.process_batch("events", 1001, vec![
+            HashMap::from([
+                ("user".to_string(), Value::String("alice".into())),
+                ("amount".to_string(), Value::Float64(5.0)),
+            ]),
+        ]).unwrap();
+
+        let summary2: Vec<_> = deltas2.iter().filter(|d| d.table == "summary").collect();
+        assert_eq!(summary2.len(), 1);
+        assert_eq!(
+            summary2[0].values.get("latest_doubled"),
+            Some(&Value::Float64(30.0))
+        );
+
+        // Rollback block 1001
+        let rollback_deltas = engine.rollback(1000).unwrap();
+        let summary_rb: Vec<_> = rollback_deltas.iter().filter(|d| d.table == "summary").collect();
+        assert!(!summary_rb.is_empty(), "rollback should produce summary deltas");
+
+        // Re-ingest block 1001: alice deposits 20 (total=30, doubled=60)
+        let deltas3 = engine.process_batch("events", 1001, vec![
+            HashMap::from([
+                ("user".to_string(), Value::String("alice".into())),
+                ("amount".to_string(), Value::Float64(20.0)),
+            ]),
+        ]).unwrap();
+
+        let summary3: Vec<_> = deltas3.iter().filter(|d| d.table == "summary").collect();
+        assert_eq!(summary3.len(), 1);
+        assert_eq!(
+            summary3[0].values.get("latest_doubled"),
+            Some(&Value::Float64(60.0))
+        );
     }
 }

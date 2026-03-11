@@ -1374,20 +1374,58 @@ fn validate_schema(schema: &Schema) -> Result<(), Error> {
                 )));
             }
         }
-        if !table_names.contains(&reducer.source.as_str()) {
+        let source_is_table = table_names.contains(&reducer.source.as_str());
+        let source_is_reducer = reducer_names.contains(&reducer.source.as_str());
+
+        if !source_is_table && !source_is_reducer {
             return Err(Error::Schema(format!(
-                "reducer '{}': source table '{}' does not exist",
+                "reducer '{}': source '{}' is not a known table or reducer",
                 reducer.name, reducer.source
             )));
         }
 
-        let source_table = schema.tables.iter().find(|t| t.name == reducer.source).unwrap();
-        for col in &reducer.group_by {
-            if !source_table.columns.iter().any(|c| c.name == *col) {
-                return Err(Error::Schema(format!(
-                    "reducer '{}': GROUP BY column '{}' not found in source table '{}'",
-                    reducer.name, col, reducer.source
-                )));
+        // Self-cycle check
+        if reducer.source == reducer.name {
+            return Err(Error::Schema(format!(
+                "reducer '{}': cannot source from itself",
+                reducer.name
+            )));
+        }
+
+        // Validate GROUP BY columns against source table (only when source is a table;
+        // for chained reducers, output columns are dynamic and validated at runtime)
+        if source_is_table {
+            let source_table = schema.tables.iter().find(|t| t.name == reducer.source).unwrap();
+            for col in &reducer.group_by {
+                if !source_table.columns.iter().any(|c| c.name == *col) {
+                    return Err(Error::Schema(format!(
+                        "reducer '{}': GROUP BY column '{}' not found in source table '{}'",
+                        reducer.name, col, reducer.source
+                    )));
+                }
+            }
+        }
+    }
+
+    // Detect circular dependencies between reducers
+    {
+        let reducer_source_map: std::collections::HashMap<&str, &str> = schema
+            .reducers
+            .iter()
+            .filter(|r| reducer_names.contains(&r.source.as_str()))
+            .map(|r| (r.name.as_str(), r.source.as_str()))
+            .collect();
+
+        for start in reducer_source_map.keys() {
+            let mut visited = std::collections::HashSet::new();
+            let mut current = *start;
+            while let Some(&next) = reducer_source_map.get(current) {
+                if !visited.insert(current) {
+                    return Err(Error::Schema(format!(
+                        "circular dependency detected among reducers involving '{current}'"
+                    )));
+                }
+                current = next;
             }
         }
     }
@@ -1921,5 +1959,83 @@ mod tests {
         "#;
         let err = parse_schema(sql).unwrap_err();
         assert!(err.to_string().contains("duplicate module"));
+    }
+
+    #[test]
+    fn parse_reducer_chaining() {
+        let sql = r#"
+            CREATE TABLE events (
+                block_number UInt64,
+                user         String,
+                amount       Float64
+            );
+
+            CREATE REDUCER enriched
+              SOURCE events
+              GROUP BY user
+              STATE (total Float64 DEFAULT 0)
+              LANGUAGE lua
+              PROCESS $$
+                state.total = state.total + row.amount
+                emit.user = row.user
+                emit.total = state.total
+              $$;
+
+            CREATE REDUCER alerts
+              SOURCE enriched
+              GROUP BY user
+              STATE (prev Float64 DEFAULT 0)
+              LANGUAGE lua
+              PROCESS $$
+                if row.total > state.prev * 2 and state.prev > 0 then
+                    emit.user = row.user
+                    emit.spike = row.total
+                end
+                state.prev = row.total
+              $$;
+        "#;
+        let schema = parse_schema(sql).unwrap();
+        assert_eq!(schema.reducers.len(), 2);
+        assert_eq!(schema.reducers[0].source, "events");
+        assert_eq!(schema.reducers[1].source, "enriched");
+    }
+
+    #[test]
+    fn parse_reducer_circular_dependency() {
+        let sql = r#"
+            CREATE TABLE t (x UInt64);
+
+            CREATE REDUCER a
+              SOURCE b
+              GROUP BY x
+              STATE (v Float64 DEFAULT 0)
+              LANGUAGE lua
+              PROCESS $$ emit.x = 1 $$;
+
+            CREATE REDUCER b
+              SOURCE a
+              GROUP BY x
+              STATE (v Float64 DEFAULT 0)
+              LANGUAGE lua
+              PROCESS $$ emit.x = 1 $$;
+        "#;
+        let err = parse_schema(sql).unwrap_err();
+        assert!(err.to_string().contains("circular dependency"));
+    }
+
+    #[test]
+    fn parse_reducer_self_source() {
+        let sql = r#"
+            CREATE TABLE t (x UInt64);
+
+            CREATE REDUCER self_ref
+              SOURCE self_ref
+              GROUP BY x
+              STATE (v Float64 DEFAULT 0)
+              LANGUAGE lua
+              PROCESS $$ emit.x = 1 $$;
+        "#;
+        let err = parse_schema(sql).unwrap_err();
+        assert!(err.to_string().contains("cannot source from itself"));
     }
 }

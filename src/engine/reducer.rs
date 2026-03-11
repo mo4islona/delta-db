@@ -36,6 +36,9 @@ pub struct ReducerEngine {
     group_by_ids: Vec<Option<ColumnId>>,
     /// Source table's column registry, used for inline RowMap→Row conversion.
     source_registry: Arc<ColumnRegistry>,
+    /// When true, this reducer sources from another reducer (not a raw table).
+    /// The source_registry and group_by_ids are rebuilt per-batch from actual input data.
+    chained: bool,
 }
 
 impl ReducerEngine {
@@ -91,6 +94,53 @@ impl ReducerEngine {
             block_groups: BTreeMap::new(),
             group_by_ids,
             source_registry,
+            chained: false,
+        }
+    }
+
+    /// Create a ReducerEngine that sources from another reducer's output.
+    /// The source registry and group_by_ids are built dynamically per-batch
+    /// since the upstream reducer's output columns are not known at construction time.
+    pub fn new_chained(
+        def: ReducerDef,
+        storage: Arc<dyn StorageBackend>,
+        modules: &[(String, String)],
+    ) -> Self {
+        let runtime: Box<dyn ReducerRuntime> = match &def.body {
+            ReducerBody::EventRules { .. } => Box::new(EventRulesRuntime::new(&def.body)),
+            ReducerBody::Lua { script } => {
+                let required_modules: Vec<(String, String)> = def
+                    .requires
+                    .iter()
+                    .filter_map(|name| modules.iter().find(|(n, _)| n == name).cloned())
+                    .collect();
+                let state_fields: Vec<String> =
+                    def.state.iter().map(|f| f.name.clone()).collect();
+                let state_types: Vec<(String, crate::types::ColumnType)> =
+                    def.state.iter().map(|f| (f.name.clone(), f.column_type.clone())).collect();
+                // Empty source_columns — no accessed_fields optimization for chained reducers
+                Box::new(LuaRuntime::with_state_fields(
+                    script,
+                    &state_fields,
+                    &state_types,
+                    &[],
+                    &required_modules,
+                ))
+            }
+        };
+
+        let empty_registry = Arc::new(ColumnRegistry::new(vec![]));
+
+        Self {
+            def,
+            runtime,
+            storage,
+            state_cache: FxHashMap::default(),
+            block_snapshots: FxHashMap::default(),
+            block_groups: BTreeMap::new(),
+            group_by_ids: vec![],
+            source_registry: empty_registry,
+            chained: true,
         }
     }
 
@@ -160,11 +210,31 @@ impl ReducerEngine {
 
     /// Process a batch of RowMaps for a given block (normal ingestion path).
     /// Converts each RowMap to Row inline using the stored source registry.
+    /// For chained reducers, builds the registry dynamically from input data.
     pub fn process_block_maps(
         &mut self,
         block: BlockNumber,
         rows: &[RowMap],
     ) -> Result<Vec<RowMap>> {
+        if self.chained && !rows.is_empty() {
+            // Build registry from actual column names in this batch
+            let mut col_set = std::collections::HashSet::new();
+            for m in rows {
+                for k in m.keys() {
+                    col_set.insert(k.clone());
+                }
+            }
+            let columns: Vec<String> = col_set.into_iter().collect();
+            let registry = Arc::new(ColumnRegistry::new(columns));
+            // Re-compute group_by_ids against the actual columns
+            self.group_by_ids = self
+                .def
+                .group_by
+                .iter()
+                .map(|col| registry.get_id(col))
+                .collect();
+            self.source_registry = registry;
+        }
         let typed_rows: Vec<Row> = rows
             .iter()
             .map(|m| Row::from_map(self.source_registry.clone(), m))
