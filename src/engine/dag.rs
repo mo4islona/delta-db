@@ -68,6 +68,12 @@ impl DeltaEngine {
             );
         }
 
+        let modules: Vec<(String, String)> = schema
+            .modules
+            .iter()
+            .map(|m| (m.name.clone(), m.script.clone()))
+            .collect();
+
         for reducer_def in &schema.reducers {
             let source_registry = raw_tables
                 .get(&reducer_def.source)
@@ -75,7 +81,7 @@ impl DeltaEngine {
                 .registry();
             reducers.insert(
                 reducer_def.name.clone(),
-                ReducerEngine::new(reducer_def.clone(), storage.clone(), source_registry),
+                ReducerEngine::new(reducer_def.clone(), storage.clone(), source_registry, &modules),
             );
         }
 
@@ -713,6 +719,7 @@ mod tests {
 
     fn dex_schema() -> Schema {
         Schema {
+            modules: vec![],
             tables: vec![TableDef {
                 name: "trades".to_string(),
                 columns: vec![
@@ -755,6 +762,7 @@ mod tests {
                         default: "0".to_string(),
                     },
                 ],
+                requires: vec![],
                 body: ReducerBody::EventRules {
                     when_blocks: vec![
                         WhenBlock {
@@ -871,6 +879,7 @@ mod tests {
 
     fn simple_mv_only_schema() -> Schema {
         Schema {
+            modules: vec![],
             tables: vec![TableDef {
                 name: "swaps".to_string(),
                 columns: vec![

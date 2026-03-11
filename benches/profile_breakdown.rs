@@ -93,7 +93,7 @@ fn main() {
         let source_registry = ColumnRegistry::new(
             schema.tables[0].columns.iter().map(|c| c.name.clone()).collect()
         );
-        let mut engine = ReducerEngine::new(reducer_def, storage, &source_registry);
+        let mut engine = ReducerEngine::new(reducer_def, storage, &source_registry, &[]);
 
         // Convert RowMaps to Rows for reducer input
         let registry = Arc::new(source_registry);
