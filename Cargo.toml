@@ -15,6 +15,7 @@ rmp-serde = "1"
 mlua = { version = "0.10", features = ["lua54", "vendored"] }
 rocksdb = "0.22"
 rustc-hash = "2"
+smallvec = { version = "1", features = ["serde"] }
 rayon = "1"
 napi = { version = "2", features = ["napi9", "serde-json"], optional = true }
 napi-derive = { version = "2", optional = true }

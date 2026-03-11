@@ -1,0 +1,32 @@
+{
+  "name": "@sqd-pipes/delta-db",
+  "version": "0.0.1-alpha.5",
+  "description": "Embedded rollback-aware computation engine for blockchain data",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "napi": {
+    "name": "delta-db",
+    "triples": {
+      "defaults": true
+    }
+  },
+  "scripts": {
+    "build": "napi build --cargo-cwd ../../.. --features napi --release --dts native.d.ts src",
+    "build:debug": "napi build --cargo-cwd ../../.. --features napi --dts native.d.ts src",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@msgpack/msgpack": "^3.0.0"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0",
+    "vitest": "^3.0.0"
+  },
+  "files": [
+    "src/index.js",
+    "src/index.d.ts",
+    "src/delta-db.node"
+  ],
+  "license": "MIT"
+}

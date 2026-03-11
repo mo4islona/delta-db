@@ -3,7 +3,7 @@ pub mod lua;
 
 use std::collections::HashMap;
 
-use crate::types::{RowMap, Value};
+use crate::types::{Row, RowMap, Value};
 
 /// Trait for reducer process logic runtimes.
 ///
@@ -15,8 +15,8 @@ pub trait ReducerRuntime: Send + Sync {
     /// Process one input row against the current state.
     ///
     /// - `state`: mutable reducer state (read + write)
-    /// - `row`: the input row from the source table
+    /// - `row`: the input row from the source table (indexed access via ColumnRegistry)
     ///
     /// Returns zero or more output rows (the emitted columns).
-    fn process(&self, state: &mut HashMap<String, Value>, row: &RowMap) -> Vec<RowMap>;
+    fn process(&self, state: &mut HashMap<String, Value>, row: &Row) -> Vec<RowMap>;
 }

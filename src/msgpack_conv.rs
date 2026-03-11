@@ -200,8 +200,21 @@ impl Serialize for BatchRef<'_> {
             "latestHead",
             &self.0.latest_head.as_ref().map(|c| CursorRef(c)),
         )?;
-        let records: Vec<RecordRef> = self.0.records.iter().map(RecordRef).collect();
-        map.serialize_entry("records", &records)?;
+        map.serialize_entry("tables", &TablesRef(&self.0.tables))?;
+        map.end()
+    }
+}
+
+/// Wrapper for serializing HashMap<String, Vec<DeltaRecord>> as a map of table_name → records array.
+struct TablesRef<'a>(&'a HashMap<String, Vec<DeltaRecord>>);
+
+impl Serialize for TablesRef<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (table_name, records) in self.0 {
+            let refs: Vec<RecordRef> = records.iter().map(RecordRef).collect();
+            map.serialize_entry(table_name, &refs)?;
+        }
         map.end()
     }
 }
@@ -381,7 +394,7 @@ mod tests {
                 number: 1000,
                 hash: "0xdef".into(),
             }),
-            records: vec![DeltaRecord {
+            tables: HashMap::from([("swaps".into(), vec![DeltaRecord {
                 table: "swaps".into(),
                 operation: DeltaOperation::Insert,
                 key: HashMap::from([("block_number".into(), Value::UInt64(1000))]),
@@ -390,7 +403,7 @@ mod tests {
                     ("amount".into(), Value::Float64(100.5)),
                 ]),
                 prev_values: None,
-            }],
+            }])]),
         };
 
         let buf = encode_batch_to_msgpack(&batch);
@@ -401,13 +414,13 @@ mod tests {
         assert_eq!(decoded["finalizedHead"]["number"], 900);
         assert_eq!(decoded["finalizedHead"]["hash"], "0xabc");
         assert_eq!(decoded["latestHead"]["number"], 1000);
-        assert_eq!(decoded["records"][0]["table"], "swaps");
-        assert_eq!(decoded["records"][0]["operation"], "insert");
+        assert_eq!(decoded["tables"]["swaps"][0]["table"], "swaps");
+        assert_eq!(decoded["tables"]["swaps"][0]["operation"], "insert");
         // Values are plain (not tagged enums)
-        assert_eq!(decoded["records"][0]["values"]["amount"], 100.5);
-        assert_eq!(decoded["records"][0]["values"]["pool"], "ETH/USDC");
-        assert_eq!(decoded["records"][0]["key"]["block_number"], 1000);
-        assert!(decoded["records"][0]["prevValues"].is_null());
+        assert_eq!(decoded["tables"]["swaps"][0]["values"]["amount"], 100.5);
+        assert_eq!(decoded["tables"]["swaps"][0]["values"]["pool"], "ETH/USDC");
+        assert_eq!(decoded["tables"]["swaps"][0]["key"]["block_number"], 1000);
+        assert!(decoded["tables"]["swaps"][0]["prevValues"].is_null());
     }
 
     #[test]
@@ -418,20 +431,20 @@ mod tests {
             sequence: 2,
             finalized_head: None,
             latest_head: None,
-            records: vec![DeltaRecord {
+            tables: HashMap::from([("volume".into(), vec![DeltaRecord {
                 table: "volume".into(),
                 operation: DeltaOperation::Update,
                 key: HashMap::from([("pool".into(), Value::String("ETH".into()))]),
                 values: HashMap::from([("total".into(), Value::Float64(300.0))]),
                 prev_values: Some(HashMap::from([("total".into(), Value::Float64(200.0))])),
-            }],
+            }])]),
         };
 
         let buf = encode_batch_to_msgpack(&batch);
         let decoded: serde_json::Value = rmp_serde::from_slice(&buf).unwrap();
 
-        assert_eq!(decoded["records"][0]["operation"], "update");
-        assert_eq!(decoded["records"][0]["prevValues"]["total"], 200.0);
+        assert_eq!(decoded["tables"]["volume"][0]["operation"], "update");
+        assert_eq!(decoded["tables"]["volume"][0]["prevValues"]["total"], 200.0);
         assert!(decoded["finalizedHead"].is_null());
     }
 
@@ -441,11 +454,11 @@ mod tests {
             sequence: 0,
             finalized_head: None,
             latest_head: None,
-            records: vec![],
+            tables: HashMap::new(),
         };
 
         let buf = encode_batch_to_msgpack(&batch);
         let decoded: serde_json::Value = rmp_serde::from_slice(&buf).unwrap();
-        assert_eq!(decoded["records"].as_array().unwrap().len(), 0);
+        assert_eq!(decoded["tables"].as_object().unwrap().len(), 0);
     }
 }

@@ -10,7 +10,7 @@ use delta_db::db::{Config, DeltaDb};
 use delta_db::engine::reducer::ReducerEngine;
 use delta_db::schema::parser::parse_schema;
 use delta_db::storage::memory::MemoryBackend;
-use delta_db::types::{RowMap, Value};
+use delta_db::types::{ColumnRegistry, RowMap, Value};
 
 const RAW_ONLY_SCHEMA: &str = r#"
     CREATE TABLE events (
@@ -332,7 +332,10 @@ fn bench_reducer_event_rules_only() -> BenchResult {
     let schema = parse_schema(REDUCER_EVENT_RULES_SCHEMA).unwrap();
     let storage = Arc::new(MemoryBackend::new());
     let reducer_def = schema.reducers[0].clone();
-    let mut engine = ReducerEngine::new(reducer_def, storage);
+    let source_table = &schema.tables[0];
+    let source_names: Vec<String> = source_table.columns.iter().map(|c| c.name.clone()).collect();
+    let source_registry = ColumnRegistry::new(source_names);
+    let mut engine = ReducerEngine::new(reducer_def, storage, &source_registry);
 
     let rows: Vec<RowMap> = (0..total_rows)
         .map(|i| {
@@ -344,7 +347,7 @@ fn bench_reducer_event_rules_only() -> BenchResult {
 
     let start = Instant::now();
     for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        engine.process_block(block as u64, chunk).unwrap();
+        engine.process_block_maps(block as u64, chunk).unwrap();
     }
     let elapsed = start.elapsed();
 

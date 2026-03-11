@@ -68,19 +68,20 @@ impl DeltaBuffer {
             return None;
         }
 
-        // Merge records by (table, key_hash) in a single pass
-        let mut index: HashMap<(String, u64), usize> =
+        // Merge records by hash(table, key) in a single pass.
+        // Uses hash-only index (no table string clone). Collision probability
+        // for N records with 64-bit hash is ~N²/2^65, negligible in practice.
+        let mut index: HashMap<u64, usize> =
             HashMap::with_capacity(self.pending.len());
         let mut merged: Vec<DeltaRecord> = Vec::with_capacity(self.pending.len());
 
         for record in self.pending.drain(..) {
             let key_hash = hash_delta_key(&record.table, &record.key);
-            let lookup_key = (record.table.clone(), key_hash);
 
-            if let Some(&idx) = index.get(&lookup_key) {
-                if let Some(m) = merge_records(&merged[idx], &record) {
-                    merged[idx] = m;
-                } else {
+            if let Some(&idx) = index.get(&key_hash) {
+                // In-place merge: mutate existing record, move fields from incoming.
+                // Avoids cloning table, key, values, and prev_values HashMaps.
+                if !merge_in_place(&mut merged[idx], record) {
                     // Records cancel out — mark as cancelled
                     merged[idx].operation = DeltaOperation::Delete;
                     merged[idx].prev_values = None;
@@ -88,18 +89,23 @@ impl DeltaBuffer {
                 }
             } else {
                 let idx = merged.len();
-                index.insert(lookup_key, idx);
+                index.insert(key_hash, idx);
                 merged.push(record);
             }
         }
 
-        // Filter out cancelled records
-        let records: Vec<DeltaRecord> = merged
-            .into_iter()
-            .filter(|r| !is_cancelled(r))
-            .collect();
+        // Filter out cancelled records and group by table
+        let mut tables: HashMap<String, Vec<DeltaRecord>> = HashMap::new();
+        for record in merged.into_iter().filter(|r| !is_cancelled(r)) {
+            if let Some(vec) = tables.get_mut(&record.table) {
+                vec.push(record);
+            } else {
+                let table = record.table.clone();
+                tables.insert(table, vec![record]);
+            }
+        }
 
-        if records.is_empty() {
+        if tables.is_empty() {
             return None;
         }
 
@@ -110,7 +116,7 @@ impl DeltaBuffer {
             sequence: seq,
             finalized_head: self.finalized_head.clone(),
             latest_head: self.latest_head.clone(),
-            records,
+            tables,
         })
     }
 
@@ -121,51 +127,48 @@ impl DeltaBuffer {
     }
 }
 
-/// Merge two delta records for the same key.
-/// Returns the merged record, or None if they cancel out.
-fn merge_records(existing: &DeltaRecord, incoming: &DeltaRecord) -> Option<DeltaRecord> {
+/// Merge `incoming` into `existing` in place, moving fields instead of cloning.
+/// Returns `false` if the records cancel out (insert + delete = no-op).
+fn merge_in_place(existing: &mut DeltaRecord, incoming: DeltaRecord) -> bool {
     match (&existing.operation, &incoming.operation) {
         // Insert then Update: net Insert with latest values
-        (DeltaOperation::Insert, DeltaOperation::Update) => Some(DeltaRecord {
-            table: incoming.table.clone(),
-            operation: DeltaOperation::Insert,
-            key: incoming.key.clone(),
-            values: incoming.values.clone(),
-            prev_values: None,
-        }),
+        (DeltaOperation::Insert, DeltaOperation::Update) => {
+            existing.values = incoming.values;
+            // operation stays Insert, prev_values stays None
+            true
+        }
 
         // Insert then Delete: cancel out
-        (DeltaOperation::Insert, DeltaOperation::Delete) => None,
+        (DeltaOperation::Insert, DeltaOperation::Delete) => false,
 
         // Update then Update: keep original prev_values, latest values
-        (DeltaOperation::Update, DeltaOperation::Update) => Some(DeltaRecord {
-            table: incoming.table.clone(),
-            operation: DeltaOperation::Update,
-            key: incoming.key.clone(),
-            values: incoming.values.clone(),
-            prev_values: existing.prev_values.clone(),
-        }),
+        (DeltaOperation::Update, DeltaOperation::Update) => {
+            existing.values = incoming.values;
+            // operation stays Update, prev_values stays from first update
+            true
+        }
 
         // Update then Delete: net Delete with original prev_values
-        (DeltaOperation::Update, DeltaOperation::Delete) => Some(DeltaRecord {
-            table: incoming.table.clone(),
-            operation: DeltaOperation::Delete,
-            key: incoming.key.clone(),
-            values: incoming.values.clone(),
-            prev_values: existing.prev_values.clone(),
-        }),
+        (DeltaOperation::Update, DeltaOperation::Delete) => {
+            existing.operation = DeltaOperation::Delete;
+            existing.values = incoming.values;
+            // prev_values stays from first update
+            true
+        }
 
-        // Delete then Insert: net Update
-        (DeltaOperation::Delete, DeltaOperation::Insert) => Some(DeltaRecord {
-            table: incoming.table.clone(),
-            operation: DeltaOperation::Update,
-            key: incoming.key.clone(),
-            values: incoming.values.clone(),
-            prev_values: Some(existing.values.clone()),
-        }),
+        // Delete then Insert: net Update (prev = old delete values)
+        (DeltaOperation::Delete, DeltaOperation::Insert) => {
+            existing.prev_values = Some(std::mem::take(&mut existing.values));
+            existing.operation = DeltaOperation::Update;
+            existing.values = incoming.values;
+            true
+        }
 
-        // Same operation following same: just keep latest
-        _ => Some(incoming.clone()),
+        // Same operation following same: just replace in place
+        _ => {
+            *existing = incoming;
+            true
+        }
     }
 }
 
@@ -248,7 +251,7 @@ mod tests {
 
         let batch = buffer.flush().unwrap();
         assert_eq!(batch.sequence, 1);
-        assert_eq!(batch.records.len(), 1);
+        assert_eq!(batch.record_count(), 1);
         assert_eq!(batch.latest_head.as_ref().unwrap().number, 1000);
 
         // Second flush should be empty
@@ -276,14 +279,15 @@ mod tests {
         buffer.push(vec![make_update("t", "1", "b", "a")], cursor(0), cursor(1001));
 
         let batch = buffer.flush().unwrap();
-        assert_eq!(batch.records.len(), 1);
+        let records = batch.records_for("t");
+        assert_eq!(records.len(), 1);
         // Net effect: Insert with latest values
-        assert_eq!(batch.records[0].operation, DeltaOperation::Insert);
+        assert_eq!(records[0].operation, DeltaOperation::Insert);
         assert_eq!(
-            batch.records[0].values.get("data"),
+            records[0].values.get("data"),
             Some(&Value::String("b".into()))
         );
-        assert!(batch.records[0].prev_values.is_none());
+        assert!(records[0].prev_values.is_none());
     }
 
     #[test]
@@ -314,12 +318,13 @@ mod tests {
         buffer.push(vec![make_update("t", "1", "c", "b")], cursor(0), cursor(1001));
 
         let batch = buffer.flush().unwrap();
-        assert_eq!(batch.records.len(), 1);
-        assert_eq!(batch.records[0].operation, DeltaOperation::Update);
-        assert_eq!(batch.records[0].values.get("data"), Some(&Value::String("c".into())));
+        let records = batch.records_for("t");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].operation, DeltaOperation::Update);
+        assert_eq!(records[0].values.get("data"), Some(&Value::String("c".into())));
         // prev_values should be from the first update
         assert_eq!(
-            batch.records[0].prev_values.as_ref().unwrap().get("data"),
+            records[0].prev_values.as_ref().unwrap().get("data"),
             Some(&Value::String("a".into()))
         );
     }
@@ -331,10 +336,11 @@ mod tests {
         buffer.push(vec![make_insert("t", "1", "new")], cursor(0), cursor(1001));
 
         let batch = buffer.flush().unwrap();
-        assert_eq!(batch.records.len(), 1);
+        let records = batch.records_for("t");
+        assert_eq!(records.len(), 1);
         // Delete then Insert = Update
-        assert_eq!(batch.records[0].operation, DeltaOperation::Update);
-        assert_eq!(batch.records[0].values.get("data"), Some(&Value::String("new".into())));
+        assert_eq!(records[0].operation, DeltaOperation::Update);
+        assert_eq!(records[0].values.get("data"), Some(&Value::String("new".into())));
     }
 
     #[test]
@@ -347,7 +353,7 @@ mod tests {
         );
 
         let batch = buffer.flush().unwrap();
-        assert_eq!(batch.records.len(), 2);
+        assert_eq!(batch.record_count(), 2);
     }
 
     #[test]
@@ -360,7 +366,9 @@ mod tests {
         );
 
         let batch = buffer.flush().unwrap();
-        assert_eq!(batch.records.len(), 2);
+        assert_eq!(batch.record_count(), 2);
+        assert_eq!(batch.records_for("t1").len(), 1);
+        assert_eq!(batch.records_for("t2").len(), 1);
     }
 
     #[test]

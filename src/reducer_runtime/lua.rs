@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use mlua::{Lua, MultiValue, RegistryKey, Result as LuaResult, Value as LuaValue};
 
-use crate::types::{ColumnType, RowMap, Value};
+use crate::types::{ColumnType, Row, RowMap, Value};
 
 use super::ReducerRuntime;
 
@@ -15,6 +15,8 @@ use super::ReducerRuntime;
 /// - User script wrapped in a closure, called via pre-compiled wrapper
 /// - When state_fields are known, state is passed/returned as positional function
 ///   args/returns — eliminates per-field C API table.set/table.get calls (~1.3us/row savings)
+/// - Only row fields actually referenced in the Lua script are marshalled (skip unused columns)
+/// - Pre-computed column IDs enable direct Vec indexing into Row.values()
 pub struct LuaRuntime {
     lua: Lua,
     /// Pre-compiled wrapper: clears emit + _emits, calls user function, returns results
@@ -27,6 +29,10 @@ pub struct LuaRuntime {
     state_fields: Vec<String>,
     /// State field types — used to know which fields should be read back as JSON
     state_types: HashMap<String, ColumnType>,
+    /// Row field names actually referenced by the Lua script.
+    /// Used to filter row.iter() — only matching fields are marshalled to Lua.
+    /// Empty = no filtering (all non-null fields are set).
+    accessed_fields: HashSet<String>,
 }
 
 // Safety: Each LuaRuntime is owned by exactly one ReducerEngine.
@@ -38,17 +44,23 @@ unsafe impl Send for LuaRuntime {}
 unsafe impl Sync for LuaRuntime {}
 
 impl LuaRuntime {
-    /// Create a new LuaRuntime without state field optimization.
-    /// State is synced via per-field table.get/set calls.
+    /// Create a new LuaRuntime without state field or source column optimization.
+    /// State is synced via per-field table.get/set calls. All row fields are marshalled.
     pub fn new(script: &str) -> Self {
-        Self::with_state_fields(script, &[], &[])
+        Self::with_state_fields(script, &[], &[], &[])
     }
 
-    /// Create a LuaRuntime with known state field names and types.
+    /// Create a LuaRuntime with known state field names, types, and source columns.
     /// State values are passed as function arguments and returned as return values,
     /// eliminating per-field C API calls (~1.3us/row savings for 6-field state).
-    /// Types are needed so JSON fields can be read back from Lua tables.
-    pub fn with_state_fields(script: &str, state_fields: &[String], state_types: &[(String, ColumnType)]) -> Self {
+    /// Source columns enable selective row field marshalling — only fields referenced
+    /// in the Lua script are set on the row table, skipping unused columns.
+    pub fn with_state_fields(
+        script: &str,
+        state_fields: &[String],
+        state_types: &[(String, ColumnType)],
+        source_columns: &[String],
+    ) -> Self {
         let lua = Lua::new();
 
         // Sandbox: remove dangerous globals
@@ -149,6 +161,10 @@ impl LuaRuntime {
             .create_registry_value(call_func)
             .expect("failed to store call function in registry");
 
+        // Determine which row fields the script actually accesses.
+        // Only those fields will be marshalled to Lua per row.
+        let accessed_fields = compute_accessed_fields(script, source_columns);
+
         Self {
             lua,
             call_key,
@@ -156,21 +172,35 @@ impl LuaRuntime {
             row_key,
             state_fields: state_fields.to_vec(),
             state_types: state_types.iter().cloned().collect(),
+            accessed_fields,
         }
     }
 }
 
 impl ReducerRuntime for LuaRuntime {
-    fn process(&self, state: &mut HashMap<String, Value>, row: &RowMap) -> Vec<RowMap> {
-        // Update persistent row table in-place (no table allocation)
+    fn process(&self, state: &mut HashMap<String, Value>, row: &Row) -> Vec<RowMap> {
+        // Update persistent row table in-place (no table allocation).
+        // Only fields the script actually references are marshalled.
         let row_table: mlua::Table = self
             .lua
             .registry_value(&self.row_key)
             .expect("failed to get row table");
-        for (k, v) in row.iter() {
-            row_table
-                .set(k.as_str(), value_to_lua(&self.lua, v).unwrap())
-                .expect("failed to set row field");
+        if self.accessed_fields.is_empty() {
+            // No filtering: set all non-null fields
+            for (k, v) in row.iter() {
+                row_table
+                    .raw_set(k, value_to_lua(&self.lua, v).unwrap())
+                    .expect("failed to set row field");
+            }
+        } else {
+            // Optimized: iterate all fields but skip C API calls for unused ones
+            for (k, v) in row.iter() {
+                if self.accessed_fields.contains(k) {
+                    row_table
+                        .raw_set(k, value_to_lua(&self.lua, v).unwrap())
+                        .expect("failed to set row field");
+                }
+            }
         }
 
         let call: mlua::Function = self
@@ -186,7 +216,7 @@ impl ReducerRuntime for LuaRuntime {
                 .expect("failed to get state table");
             for (k, v) in state.iter() {
                 state_table
-                    .set(k.as_str(), value_to_lua(&self.lua, v).unwrap())
+                    .raw_set(k.as_str(), value_to_lua(&self.lua, v).unwrap())
                     .expect("failed to set state field");
             }
 
@@ -195,7 +225,7 @@ impl ReducerRuntime for LuaRuntime {
 
             for (k, v) in state.iter_mut() {
                 let lua_val: LuaValue = state_table
-                    .get(k.as_str())
+                    .raw_get(k.as_str())
                     .expect("failed to read state field");
                 *v = lua_to_value_typed(&lua_val, self.state_types.get(k));
             }
@@ -268,6 +298,68 @@ fn collect_emits(
             vec![emit_map]
         }
     }
+}
+
+/// Determine which row fields the Lua script accesses.
+/// Returns empty HashSet if source_columns is empty or all fields are accessed
+/// (no filtering needed). Otherwise returns just the accessed field names.
+fn compute_accessed_fields(script: &str, source_columns: &[String]) -> HashSet<String> {
+    if source_columns.is_empty() {
+        return HashSet::new();
+    }
+
+    match extract_row_field_refs(script) {
+        Some(accessed) if !accessed.is_empty() && accessed.len() + 1 < source_columns.len() => {
+            // Worthwhile to filter: script skips 2+ fields.
+            // Skipping only 1 field doesn't offset the HashSet lookup overhead.
+            accessed
+        }
+        _ => {
+            // Script uses dynamic access, no refs detected, or accesses all fields
+            HashSet::new()
+        }
+    }
+}
+
+/// Extract row field names referenced in a Lua script via `row.field` patterns.
+/// Returns None if the script uses dynamic row iteration (pairs/next/ipairs).
+fn extract_row_field_refs(script: &str) -> Option<HashSet<String>> {
+    // Dynamic iteration over row — can't determine fields statically
+    if script.contains("pairs(row)")
+        || script.contains("next(row")
+        || script.contains("ipairs(row)")
+    {
+        return None;
+    }
+
+    let mut fields = HashSet::new();
+    let bytes = script.as_bytes();
+    let mut i = 0;
+
+    while i + 4 < bytes.len() {
+        // Match "row." where preceding char is not alphanumeric/_
+        if bytes[i] == b'r'
+            && bytes[i + 1] == b'o'
+            && bytes[i + 2] == b'w'
+            && bytes[i + 3] == b'.'
+            && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+        {
+            i += 4;
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            if i > start {
+                fields.insert(
+                    String::from_utf8_lossy(&bytes[start..i]).to_string(),
+                );
+            }
+            continue;
+        }
+        i += 1;
+    }
+
+    Some(fields)
 }
 
 fn sandbox(lua: &Lua) -> LuaResult<()> {
@@ -470,12 +562,12 @@ fn is_lua_array(table: &mlua::Table) -> bool {
 mod tests {
     use super::*;
 
-    fn make_trade(side: &str, amount: f64, price: f64) -> RowMap {
-        HashMap::from([
+    fn make_trade(side: &str, amount: f64, price: f64) -> Row {
+        Row::from(HashMap::from([
             ("side".to_string(), Value::String(side.to_string())),
             ("amount".to_string(), Value::Float64(amount)),
             ("price".to_string(), Value::Float64(price)),
-        ])
+        ]))
     }
 
     #[test]
@@ -488,7 +580,7 @@ mod tests {
         );
 
         let mut state = HashMap::from([("count".to_string(), Value::Float64(0.0))]);
-        let row: RowMap = RowMap::new();
+        let row = Row::from(RowMap::new());
 
         let out1 = runtime
             .process(&mut state, &row)
@@ -514,7 +606,7 @@ mod tests {
         );
 
         let mut state = HashMap::new();
-        let row: RowMap = HashMap::from([("amount".to_string(), Value::Float64(5.0))]);
+        let row = Row::from(HashMap::from([("amount".to_string(), Value::Float64(5.0))]));
 
         let out = runtime
             .process(&mut state, &row)
@@ -645,7 +737,7 @@ mod tests {
     fn lua_empty_emit_returns_none() {
         let runtime = LuaRuntime::new("-- do nothing");
         let mut state = HashMap::new();
-        let row: RowMap = RowMap::new();
+        let row = Row::from(RowMap::new());
         assert!(runtime.process(&mut state, &row).is_empty());
     }
 
@@ -659,7 +751,7 @@ mod tests {
             "#,
         );
         let mut state = HashMap::new();
-        let row: RowMap = RowMap::new();
+        let row = Row::from(RowMap::new());
         let out = runtime
             .process(&mut state, &row)
             .into_iter()
@@ -680,7 +772,7 @@ mod tests {
             "#,
         );
         let mut state = HashMap::new();
-        let row: RowMap = HashMap::from([("side".to_string(), Value::String("buy".to_string()))]);
+        let row = Row::from(HashMap::from([("side".to_string(), Value::String("buy".to_string()))]));
         let out = runtime
             .process(&mut state, &row)
             .into_iter()
@@ -701,13 +793,13 @@ mod tests {
         );
 
         let mut state = HashMap::new();
-        let row: RowMap = HashMap::from([(
+        let row = Row::from(HashMap::from([(
             "items".to_string(),
             Value::String(
                 r#"[{"name":"a","value":1},{"name":"b","value":2},{"name":"c","value":3}]"#
                     .to_string(),
             ),
-        )]);
+        )]));
 
         let results = runtime.process(&mut state, &row);
         assert_eq!(results.len(), 3);
@@ -730,7 +822,7 @@ mod tests {
         );
 
         let mut state = HashMap::new();
-        let row: RowMap = RowMap::new();
+        let row = Row::from(RowMap::new());
 
         let results = runtime.process(&mut state, &row);
         assert_eq!(results.len(), 2);
@@ -744,7 +836,7 @@ mod tests {
         let runtime = LuaRuntime::new("-- no emit calls");
 
         let mut state = HashMap::new();
-        let row: RowMap = RowMap::new();
+        let row = Row::from(RowMap::new());
 
         let results = runtime.process(&mut state, &row);
         assert!(results.is_empty());
@@ -779,6 +871,7 @@ mod tests {
             "#,
             &state_fields,
             &state_types,
+            &["token".to_string(), "volume".to_string()],
         );
 
         // Initialize state with JSON default (empty object)
@@ -788,10 +881,10 @@ mod tests {
         ]);
 
         // Row 1: token A, volume 100
-        let row1: RowMap = HashMap::from([
+        let row1 = Row::from(HashMap::from([
             ("token".to_string(), Value::String("A".into())),
             ("volume".to_string(), Value::Float64(100.0)),
-        ]);
+        ]));
         let out1 = runtime.process(&mut state, &row1);
         assert_eq!(out1.len(), 1);
         assert_eq!(out1[0].get("token"), Some(&Value::String("A".into())));
@@ -808,19 +901,19 @@ mod tests {
         }
 
         // Row 2: token A again
-        let row2: RowMap = HashMap::from([
+        let row2 = Row::from(HashMap::from([
             ("token".to_string(), Value::String("A".into())),
             ("volume".to_string(), Value::Float64(50.0)),
-        ]);
+        ]));
         let out2 = runtime.process(&mut state, &row2);
         assert_eq!(out2[0].get("total_volume"), Some(&Value::Float64(150.0)));
         assert_eq!(out2[0].get("total_trades").unwrap().as_f64(), Some(2.0));
 
         // Row 3: different token B
-        let row3: RowMap = HashMap::from([
+        let row3 = Row::from(HashMap::from([
             ("token".to_string(), Value::String("B".into())),
             ("volume".to_string(), Value::Float64(200.0)),
-        ]);
+        ]));
         let out3 = runtime.process(&mut state, &row3);
         assert_eq!(out3[0].get("total_volume"), Some(&Value::Float64(200.0)));
 
@@ -862,6 +955,7 @@ mod tests {
             "#,
             &state_fields,
             &state_types,
+            &["side".to_string(), "amount".to_string(), "price".to_string()],
         );
 
         let mut state: HashMap<String, Value> = HashMap::from([
@@ -891,5 +985,46 @@ mod tests {
             }
             other => panic!("expected Value::JSON, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn extract_row_field_refs_basic() {
+        let refs = extract_row_field_refs("row.side == 0 and row.usdc > 100").unwrap();
+        assert!(refs.contains("side"));
+        assert!(refs.contains("usdc"));
+        assert_eq!(refs.len(), 2);
+    }
+
+    #[test]
+    fn extract_row_field_refs_skips_non_row() {
+        let refs = extract_row_field_refs("local myrow = 1\nrow.amount + state.quantity").unwrap();
+        assert!(refs.contains("amount"));
+        assert!(!refs.contains("quantity")); // state.quantity, not row.quantity
+        assert_eq!(refs.len(), 1);
+    }
+
+    #[test]
+    fn extract_row_field_refs_dynamic_access_returns_none() {
+        assert!(extract_row_field_refs("for k, v in pairs(row) do end").is_none());
+    }
+
+    #[test]
+    fn compute_accessed_fields_filters_correctly() {
+        let cols = vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()];
+        let script = "row.a + row.c";
+        let accessed = compute_accessed_fields(script, &cols);
+        // Skips 3 fields (b, d, e) — filtering is active
+        assert!(accessed.contains("a"));
+        assert!(accessed.contains("c"));
+        assert_eq!(accessed.len(), 2);
+    }
+
+    #[test]
+    fn compute_accessed_fields_no_filter_when_skip_one() {
+        let cols = vec!["a".into(), "b".into(), "c".into()];
+        let script = "row.a + row.b"; // accesses 2 of 3 → skips only 1
+        let accessed = compute_accessed_fields(script, &cols);
+        // Only skipping 1 field — not worth filtering
+        assert!(accessed.is_empty());
     }
 }

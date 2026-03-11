@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -389,7 +390,11 @@ impl fmt::Display for Value {
 }
 
 /// A composite key used for GROUP BY lookups.
-pub type GroupKey = Vec<Value>;
+/// SmallVec avoids heap allocation for the common case of 1-2 group-by columns.
+/// N=2 not 4: Value is ~32 bytes, so [Value; 4] = ~144 bytes per FxHashMap key,
+/// which hurts cache locality. [Value; 2] = ~80 bytes covers most schemas while
+/// keeping hash maps compact.
+pub type GroupKey = SmallVec<[Value; 2]>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeltaOperation {
@@ -412,7 +417,24 @@ pub struct DeltaBatch {
     pub sequence: u64,
     pub finalized_head: Option<BlockCursor>,
     pub latest_head: Option<BlockCursor>,
-    pub records: Vec<DeltaRecord>,
+    pub tables: HashMap<String, Vec<DeltaRecord>>,
+}
+
+impl DeltaBatch {
+    /// Iterate all records across all tables.
+    pub fn all_records(&self) -> impl Iterator<Item = &DeltaRecord> {
+        self.tables.values().flat_map(|v| v.iter())
+    }
+
+    /// Get records for a specific table.
+    pub fn records_for(&self, table: &str) -> &[DeltaRecord] {
+        self.tables.get(table).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Total number of records across all tables.
+    pub fn record_count(&self) -> usize {
+        self.tables.values().map(|v| v.len()).sum()
+    }
 }
 
 #[cfg(test)]
@@ -573,7 +595,7 @@ mod tests {
             sequence: 1,
             finalized_head: Some(BlockCursor { number: 900, hash: "0xabc".into() }),
             latest_head: Some(BlockCursor { number: 1000, hash: "0xdef".into() }),
-            records: vec![],
+            tables: HashMap::new(),
         };
 
         let json = serde_json::to_string(&batch).unwrap();
