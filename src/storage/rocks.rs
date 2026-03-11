@@ -450,6 +450,10 @@ impl StorageBackend for RocksDbBackend {
         let mut wb = WriteBatch::default();
         for op in &batch.ops {
             match op {
+                BatchOp::PutRawRows { table, block, data } => {
+                    let cf = self.db.cf_handle(CF_RAW).expect("raw CF");
+                    wb.put_cf(cf, raw_key(table, *block), data);
+                }
                 BatchOp::SetReducerFinalized { reducer, group_key, state } => {
                     let cf = self.db.cf_handle(CF_REDUCER_FIN).expect("reducer_fin CF");
                     wb.put_cf(cf, fin_key(reducer, group_key), state);

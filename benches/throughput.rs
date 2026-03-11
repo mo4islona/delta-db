@@ -125,8 +125,14 @@ fn make_raw_row(i: usize) -> RowMap {
         ("block_number".to_string(), Value::UInt64(i as u64 / 100)),
         ("tx_hash".to_string(), Value::String(format!("0x{i:064x}"))),
         ("log_index".to_string(), Value::UInt64(i as u64 % 100)),
-        ("from_addr".to_string(), Value::String(format!("0xuser{}", i % 1000))),
-        ("to_addr".to_string(), Value::String(format!("0xrecv{}", i % 500))),
+        (
+            "from_addr".to_string(),
+            Value::String(format!("0xuser{}", i % 1000)),
+        ),
+        (
+            "to_addr".to_string(),
+            Value::String(format!("0xrecv{}", i % 500)),
+        ),
         ("value".to_string(), Value::Float64(i as f64 * 0.001)),
     ])
 }
@@ -134,8 +140,14 @@ fn make_raw_row(i: usize) -> RowMap {
 fn make_raw_row_for_mv(i: usize) -> RowMap {
     HashMap::from([
         ("block_number".to_string(), Value::UInt64(i as u64 / 100)),
-        ("from_addr".to_string(), Value::String(format!("0xuser{}", i % 1000))),
-        ("to_addr".to_string(), Value::String(format!("0xrecv{}", i % 500))),
+        (
+            "from_addr".to_string(),
+            Value::String(format!("0xuser{}", i % 1000)),
+        ),
+        (
+            "to_addr".to_string(),
+            Value::String(format!("0xrecv{}", i % 500)),
+        ),
         ("value".to_string(), Value::Float64(i as f64 * 0.001)),
     ])
 }
@@ -212,7 +224,8 @@ fn bench_raw_ingestion(backend: Backend) -> BenchResult {
 
     let start = Instant::now();
     for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        db.process_batch("events", block as u64, chunk.to_vec()).unwrap();
+        db.process_batch("events", block as u64, chunk.to_vec())
+            .unwrap();
     }
     db.flush();
     let elapsed = start.elapsed();
@@ -239,7 +252,8 @@ fn bench_raw_with_mv(backend: Backend) -> BenchResult {
 
     let start = Instant::now();
     for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        db.process_batch("events", block as u64, chunk.to_vec()).unwrap();
+        db.process_batch("events", block as u64, chunk.to_vec())
+            .unwrap();
     }
     db.flush();
     let elapsed = start.elapsed();
@@ -266,14 +280,26 @@ fn bench_full_pipeline_event_rules(backend: Backend) -> BenchResult {
     let rows: Vec<RowMap> = (0..total_rows)
         .map(|i| {
             let user = format!("user{}", i % num_users);
-            let side = if i / num_users < 5 { "buy" } else if i % 3 == 0 { "sell" } else { "buy" };
-            make_trade(&user, side, 1.0 + (i as f64 * 0.01), 2000.0 + (i as f64 * 0.1))
+            let side = if i / num_users < 5 {
+                "buy"
+            } else if i % 3 == 0 {
+                "sell"
+            } else {
+                "buy"
+            };
+            make_trade(
+                &user,
+                side,
+                1.0 + (i as f64 * 0.01),
+                2000.0 + (i as f64 * 0.1),
+            )
         })
         .collect();
 
     let start = Instant::now();
     for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        db.process_batch("trades", block as u64, chunk.to_vec()).unwrap();
+        db.process_batch("trades", block as u64, chunk.to_vec())
+            .unwrap();
     }
     db.flush();
     let elapsed = start.elapsed();
@@ -300,14 +326,26 @@ fn bench_full_pipeline_lua(backend: Backend) -> BenchResult {
     let rows: Vec<RowMap> = (0..total_rows)
         .map(|i| {
             let user = format!("user{}", i % num_users);
-            let side = if i / num_users < 5 { "buy" } else if i % 3 == 0 { "sell" } else { "buy" };
-            make_trade(&user, side, 1.0 + (i as f64 * 0.01), 2000.0 + (i as f64 * 0.1))
+            let side = if i / num_users < 5 {
+                "buy"
+            } else if i % 3 == 0 {
+                "sell"
+            } else {
+                "buy"
+            };
+            make_trade(
+                &user,
+                side,
+                1.0 + (i as f64 * 0.01),
+                2000.0 + (i as f64 * 0.1),
+            )
         })
         .collect();
 
     let start = Instant::now();
     for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        db.process_batch("trades", block as u64, chunk.to_vec()).unwrap();
+        db.process_batch("trades", block as u64, chunk.to_vec())
+            .unwrap();
     }
     db.flush();
     let elapsed = start.elapsed();
@@ -333,15 +371,30 @@ fn bench_reducer_event_rules_only() -> BenchResult {
     let storage = Arc::new(MemoryBackend::new());
     let reducer_def = schema.reducers[0].clone();
     let source_table = &schema.tables[0];
-    let source_names: Vec<String> = source_table.columns.iter().map(|c| c.name.clone()).collect();
+    let source_names: Vec<String> = source_table
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
     let source_registry = ColumnRegistry::new(source_names);
     let mut engine = ReducerEngine::new(reducer_def, storage, &source_registry);
 
     let rows: Vec<RowMap> = (0..total_rows)
         .map(|i| {
             let user = format!("user{}", i % num_users);
-            let side = if i / num_users < 5 { "buy" } else if i % 3 == 0 { "sell" } else { "buy" };
-            make_trade(&user, side, 1.0 + (i as f64 * 0.01), 2000.0 + (i as f64 * 0.1))
+            let side = if i / num_users < 5 {
+                "buy"
+            } else if i % 3 == 0 {
+                "sell"
+            } else {
+                "buy"
+            };
+            make_trade(
+                &user,
+                side,
+                1.0 + (i as f64 * 0.01),
+                2000.0 + (i as f64 * 0.1),
+            )
         })
         .collect();
 
@@ -402,7 +455,7 @@ fn bench_rollback(backend: Backend) -> BenchResult {
 
 fn bench_ingest(backend: Backend) -> BenchResult {
     let total_rows = 100_000;
-    let batch_size = 100;
+    let batch_size = 5_000;
     let (cfg, _dir) = make_config(RAW_WITH_MV_SCHEMA, backend);
     let mut db = DeltaDb::open(cfg).unwrap();
 
@@ -489,8 +542,7 @@ fn bench_many_group_keys(backend: Backend) -> BenchResult {
 
 // ─── Polymarket schemas ───────────────────────────────────────────
 
-const POLYMARKET_FULL_SCHEMA: &str =
-    include_str!("../tests/polymarket/schema.sql");
+const POLYMARKET_FULL_SCHEMA: &str = include_str!("../tests/polymarket/schema.sql");
 
 const POLYMARKET_MARKET_STATS_ONLY: &str = r#"
 CREATE VIRTUAL TABLE orders (
@@ -711,7 +763,8 @@ fn bench_polymarket_market_stats(backend: Backend) -> BenchResult {
 
     let start = Instant::now();
     for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        db.process_batch("orders", block as u64, chunk.to_vec()).unwrap();
+        db.process_batch("orders", block as u64, chunk.to_vec())
+            .unwrap();
     }
     db.flush();
     let elapsed = start.elapsed();
@@ -742,7 +795,8 @@ fn bench_polymarket_insider_detect(backend: Backend) -> BenchResult {
 
     let start = Instant::now();
     for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        db.process_batch("orders", block as u64, chunk.to_vec()).unwrap();
+        db.process_batch("orders", block as u64, chunk.to_vec())
+            .unwrap();
     }
     db.flush();
     let elapsed = start.elapsed();
@@ -773,7 +827,8 @@ fn bench_polymarket_full_pipeline(backend: Backend) -> BenchResult {
 
     let start = Instant::now();
     for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        db.process_batch("orders", block as u64, chunk.to_vec()).unwrap();
+        db.process_batch("orders", block as u64, chunk.to_vec())
+            .unwrap();
     }
     db.flush();
     let elapsed = start.elapsed();
@@ -804,7 +859,8 @@ fn bench_polymarket_high_cardinality(backend: Backend) -> BenchResult {
 
     let start = Instant::now();
     for (block, chunk) in rows.chunks(batch_size).enumerate() {
-        db.process_batch("orders", block as u64, chunk.to_vec()).unwrap();
+        db.process_batch("orders", block as u64, chunk.to_vec())
+            .unwrap();
     }
     db.flush();
     let elapsed = start.elapsed();
@@ -821,38 +877,63 @@ fn bench_polymarket_high_cardinality(backend: Backend) -> BenchResult {
     }
 }
 
+fn run_backend_benchmarks(backend: Backend) -> Vec<BenchResult> {
+    let mut results = Vec::new();
+
+    println!("  Core:");
+    let r = bench_raw_ingestion(backend);
+    r.print();
+    results.push(r);
+    let r = bench_raw_with_mv(backend);
+    r.print();
+    results.push(r);
+    let r = bench_full_pipeline_event_rules(backend);
+    r.print();
+    results.push(r);
+    let r = bench_full_pipeline_lua(backend);
+    r.print();
+    results.push(r);
+    let r = bench_rollback(backend);
+    r.print();
+    results.push(r);
+    let r = bench_ingest(backend);
+    r.print();
+    results.push(r);
+    let r = bench_many_group_keys(backend);
+    r.print();
+    results.push(r);
+
+    println!("\n  Polymarket:");
+    let r = bench_polymarket_market_stats(backend);
+    r.print();
+    results.push(r);
+    let r = bench_polymarket_insider_detect(backend);
+    r.print();
+    results.push(r);
+    let r = bench_polymarket_full_pipeline(backend);
+    r.print();
+    results.push(r);
+    let r = bench_polymarket_high_cardinality(backend);
+    r.print();
+    results.push(r);
+
+    results
+}
+
 fn main() {
     println!("=== Delta DB Benchmarks ===\n");
 
-    let backends = [Backend::Memory, Backend::RocksDb];
-
     let mut results: Vec<BenchResult> = Vec::new();
 
-    for &backend in &backends {
-        println!("--- {} ---", backend);
-        let r = bench_raw_ingestion(backend); r.print(); results.push(r);
-        let r = bench_raw_with_mv(backend); r.print(); results.push(r);
-        let r = bench_full_pipeline_event_rules(backend); r.print(); results.push(r);
-        let r = bench_full_pipeline_lua(backend); r.print(); results.push(r);
-        let r = bench_rollback(backend); r.print(); results.push(r);
-        let r = bench_ingest(backend); r.print(); results.push(r);
-        let r = bench_many_group_keys(backend); r.print(); results.push(r);
-        println!();
-    }
+    println!("--- Memory ---");
+    results.extend(run_backend_benchmarks(Backend::Memory));
+    println!("\n  Isolated:");
+    let r = bench_reducer_event_rules_only();
+    r.print();
+    results.push(r);
 
-    // Reducer-only (memory only, no storage)
-    println!("--- Isolated ---");
-    let r = bench_reducer_event_rules_only(); r.print(); results.push(r);
-
-    // Polymarket-specific benchmarks
-    println!("\n--- Polymarket ---");
-    for &backend in &backends {
-        let r = bench_polymarket_market_stats(backend); r.print(); results.push(r);
-        let r = bench_polymarket_insider_detect(backend); r.print(); results.push(r);
-        let r = bench_polymarket_full_pipeline(backend); r.print(); results.push(r);
-        let r = bench_polymarket_high_cardinality(backend); r.print(); results.push(r);
-        println!();
-    }
+    println!("\n--- RocksDB ---");
+    results.extend(run_backend_benchmarks(Backend::RocksDb));
 
     println!("\n=== Summary ===\n");
 
@@ -863,7 +944,10 @@ fn main() {
         let failed: Vec<_> = results.iter().filter(|r| !r.pass).collect();
         println!("{} benchmark(s) FAILED:", failed.len());
         for r in &failed {
-            println!("  - {}: {:.0} rows/s (target: {})", r.name, r.rows_per_sec, r.target);
+            println!(
+                "  - {}: {:.0} rows/s (target: {})",
+                r.name, r.rows_per_sec, r.target
+            );
         }
     }
 }

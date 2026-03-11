@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::schema::ast::TableDef;
-use crate::storage::{self, StorageBackend};
+use crate::storage::{self, StorageBackend, StorageWriteBatch};
 use crate::types::{BlockNumber, ColumnRegistry, DeltaOperation, DeltaRecord, Row, RowMap, Value};
 
 /// Manages ingestion, storage, and rollback for a single raw table.
@@ -74,6 +74,47 @@ impl RawTableEngine {
         let encoded = storage::encode_rows_from_maps(row_maps, &self.registry);
         self.storage.put_raw_rows(&self.def.name, block, &encoded)?;
         Ok(())
+    }
+
+    /// Ingest rows, deferring the storage write to a WriteBatch.
+    /// Returns delta records (one Insert per row) or none for virtual tables.
+    pub fn ingest_to_batch(
+        &self,
+        block: BlockNumber,
+        row_maps: &[RowMap],
+        batch: &mut StorageWriteBatch,
+        virtual_table: bool,
+    ) -> Result<Vec<DeltaRecord>> {
+        if row_maps.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let encoded = storage::encode_rows_from_maps(row_maps, &self.registry);
+        batch.put_raw_rows(&self.def.name, block, encoded);
+
+        if virtual_table {
+            return Ok(Vec::new());
+        }
+
+        let deltas = row_maps
+            .iter()
+            .enumerate()
+            .map(|(idx, values)| {
+                let mut key = HashMap::new();
+                key.insert("block_number".to_string(), Value::UInt64(block));
+                key.insert("_row_index".to_string(), Value::UInt64(idx as u64));
+
+                DeltaRecord {
+                    table: self.def.name.clone(),
+                    operation: DeltaOperation::Insert,
+                    key,
+                    values: values.clone(),
+                    prev_values: None,
+                }
+            })
+            .collect();
+
+        Ok(deltas)
     }
 
     /// Roll back all rows where block_number > fork_point.
