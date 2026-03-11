@@ -2,7 +2,7 @@ pub mod memory;
 pub mod rocks;
 
 use crate::error::Result;
-use crate::types::{BlockNumber, ColumnRegistry, Row, RowMap, Value};
+use crate::types::{BlockNumber, ColumnRegistry, GroupKey, Row, RowMap, Value};
 use std::sync::Arc;
 
 /// An operation to be committed atomically as part of a WriteBatch.
@@ -71,7 +71,7 @@ pub fn encode_group_key(key: &[Value]) -> GroupKeyBytes {
 }
 
 /// Decode a group key from storage bytes.
-pub fn decode_group_key(bytes: &[u8]) -> Vec<Value> {
+pub fn decode_group_key(bytes: &[u8]) -> GroupKey {
     rmp_serde::from_slice(bytes).expect("group key deserialization should not fail")
 }
 

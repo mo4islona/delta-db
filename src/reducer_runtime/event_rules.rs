@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::schema::ast::{AlwaysEmit, BinaryOp, Expr, ReducerBody, WhenBlock};
-use crate::types::{RowMap, Value};
+use crate::types::{Row, RowMap, Value};
 
 use super::ReducerRuntime;
 
@@ -27,7 +27,7 @@ impl EventRulesRuntime {
 }
 
 impl ReducerRuntime for EventRulesRuntime {
-    fn process(&self, state: &mut HashMap<String, Value>, row: &RowMap) -> Vec<RowMap> {
+    fn process(&self, state: &mut HashMap<String, Value>, row: &Row) -> Vec<RowMap> {
         let mut output = HashMap::new();
         let mut matched = false;
 
@@ -101,7 +101,7 @@ impl ReducerRuntime for EventRulesRuntime {
 
 struct EvalContext<'a> {
     state: &'a HashMap<String, Value>,
-    row: &'a RowMap,
+    row: &'a Row,
     locals: &'a HashMap<String, Value>,
 }
 
@@ -331,12 +331,12 @@ mod tests {
         }
     }
 
-    fn make_trade(side: &str, amount: f64, price: f64) -> RowMap {
-        HashMap::from([
+    fn make_trade(side: &str, amount: f64, price: f64) -> Row {
+        Row::from(HashMap::from([
             ("side".to_string(), Value::String(side.to_string())),
             ("amount".to_string(), Value::Float64(amount)),
             ("price".to_string(), Value::Float64(price)),
-        ])
+        ]))
     }
 
     #[test]
@@ -423,7 +423,7 @@ mod tests {
         };
         let runtime = EventRulesRuntime::new(&body);
         let mut state = HashMap::new();
-        let row = HashMap::from([("x".to_string(), Value::Float64(1.0))]);
+        let row = Row::from(HashMap::from([("x".to_string(), Value::Float64(1.0))]));
         let out = runtime
             .process(&mut state, &row)
             .into_iter()
@@ -449,7 +449,7 @@ mod tests {
         };
         let runtime = EventRulesRuntime::new(&body);
         let mut state = HashMap::new();
-        let row = HashMap::from([("x".to_string(), Value::Float64(1.0))]);
+        let row = Row::from(HashMap::from([("x".to_string(), Value::Float64(1.0))]));
         assert!(runtime.process(&mut state, &row).is_empty());
     }
 
@@ -472,7 +472,7 @@ mod tests {
         };
         let runtime = EventRulesRuntime::new(&body);
         let mut state = HashMap::new();
-        let row = HashMap::from([("x".to_string(), Value::Float64(1.0))]);
+        let row = Row::from(HashMap::from([("x".to_string(), Value::Float64(1.0))]));
         let out = runtime
             .process(&mut state, &row)
             .into_iter()
@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn expression_evaluator_arithmetic() {
-        let row: RowMap = HashMap::from([("a".to_string(), Value::Float64(10.0))]);
+        let row = Row::from(HashMap::from([("a".to_string(), Value::Float64(10.0))]));
         let ctx = EvalContext {
             state: &HashMap::new(),
             row: &row,
@@ -509,7 +509,7 @@ mod tests {
 
     #[test]
     fn expression_evaluator_division_by_zero() {
-        let row: RowMap = RowMap::new();
+        let row = Row::from(RowMap::new());
         let ctx = EvalContext {
             state: &HashMap::new(),
             row: &row,
@@ -525,7 +525,7 @@ mod tests {
 
     #[test]
     fn expression_evaluator_if() {
-        let row: RowMap = RowMap::new();
+        let row = Row::from(RowMap::new());
         let ctx = EvalContext {
             state: &HashMap::from([("qty".to_string(), Value::Float64(5.0))]),
             row: &row,

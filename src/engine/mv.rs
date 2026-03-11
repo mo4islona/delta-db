@@ -26,6 +26,12 @@ struct AggFeedInfo {
     agg_index: usize,
 }
 
+/// Pre-computed group key extraction — avoids per-row pattern matching on OutputColumn.
+enum GroupKeyExtractor {
+    Column(String),
+    Window(String, u64),
+}
+
 /// Manages a single materialized view: GROUP BY routing, aggregation, rollback, deltas.
 pub struct MVEngine {
     def: MVDef,
@@ -37,6 +43,8 @@ pub struct MVEngine {
     agg_count: usize,
     /// Pre-computed list of agg columns for fast row feeding (avoids per-row pattern matching).
     agg_feeds: Vec<AggFeedInfo>,
+    /// Pre-computed group key extractors (avoids per-row pattern matching on OutputColumn).
+    group_key_extractors: Vec<GroupKeyExtractor>,
     /// group_key -> aggregation state (one AggregationFunc per agg column).
     groups: FxHashMap<GroupKey, Vec<Box<dyn AggregationFunc>>>,
     /// Tracks which blocks have been ingested (for rollback).
@@ -104,6 +112,20 @@ impl MVEngine {
             })
             .collect();
 
+        // Pre-compute group key extractors for fast group key computation
+        let group_key_extractors: Vec<GroupKeyExtractor> = output_columns
+            .iter()
+            .filter_map(|col| match col {
+                OutputColumn::GroupBy { source_col, .. } => {
+                    Some(GroupKeyExtractor::Column(source_col.clone()))
+                }
+                OutputColumn::Window { source_col, interval_seconds, .. } => {
+                    Some(GroupKeyExtractor::Window(source_col.clone(), *interval_seconds))
+                }
+                OutputColumn::Agg { .. } => None,
+            })
+            .collect();
+
         // Restore finalized MV state from storage
         let mut groups: FxHashMap<GroupKey, Vec<Box<dyn AggregationFunc>>> = FxHashMap::default();
         let mut prev_output: FxHashMap<GroupKey, HashMap<String, Value>> = FxHashMap::default();
@@ -130,6 +152,7 @@ impl MVEngine {
             agg_funcs,
             agg_count,
             agg_feeds,
+            group_key_extractors,
             groups,
             block_groups: BTreeMap::new(),
             prev_output,
@@ -252,23 +275,20 @@ impl MVEngine {
     }
 
     fn compute_group_key(&self, row: &RowMap) -> GroupKey {
-        let mut key = Vec::new();
-        for col in &self.output_columns {
-            match col {
-                OutputColumn::GroupBy { source_col, .. } => {
-                    let v = row.get(source_col).cloned().unwrap_or(Value::Null);
+        let mut key = GroupKey::new();
+        for ext in &self.group_key_extractors {
+            match ext {
+                GroupKeyExtractor::Column(source_col) => {
+                    let v = row.get(source_col.as_str()).cloned().unwrap_or(Value::Null);
                     key.push(v);
                 }
-                OutputColumn::Window { source_col, interval_seconds, .. } => {
+                GroupKeyExtractor::Window(source_col, interval_seconds) => {
                     let ts = row
-                        .get(source_col)
+                        .get(source_col.as_str())
                         .and_then(|v| v.as_i64())
                         .unwrap_or(0);
                     let window_start = to_start_of_interval(ts, *interval_seconds);
                     key.push(Value::DateTime(window_start));
-                }
-                OutputColumn::Agg { .. } => {
-                    // Agg columns are not part of the group key
                 }
             }
         }

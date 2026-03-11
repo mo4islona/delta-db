@@ -9,7 +9,7 @@ use delta_db::db::{Config, DeltaDb};
 use delta_db::engine::reducer::ReducerEngine;
 use delta_db::schema::parser::parse_schema;
 use delta_db::storage::memory::MemoryBackend;
-use delta_db::types::{RowMap, Value};
+use delta_db::types::{ColumnRegistry, Row, RowMap, Value};
 
 const FULL_SCHEMA: &str = include_str!("../tests/polymarket/schema.sql");
 
@@ -90,10 +90,19 @@ fn main() {
         let schema = parse_schema(MARKET_STATS_ONLY).unwrap();
         let storage = Arc::new(MemoryBackend::new());
         let reducer_def = schema.reducers[0].clone();
-        let mut engine = ReducerEngine::new(reducer_def, storage);
+        let source_registry = ColumnRegistry::new(
+            schema.tables[0].columns.iter().map(|c| c.name.clone()).collect()
+        );
+        let mut engine = ReducerEngine::new(reducer_def, storage, &source_registry);
+
+        // Convert RowMaps to Rows for reducer input
+        let registry = Arc::new(source_registry);
+        let typed_rows: Vec<Row> = rows.iter()
+            .map(|m| Row::from_map(registry.clone(), m))
+            .collect();
 
         let start = Instant::now();
-        for (block, chunk) in rows.chunks(batch).enumerate() {
+        for (block, chunk) in typed_rows.chunks(batch).enumerate() {
             engine.process_block(block as u64, chunk).unwrap();
         }
         let elapsed = start.elapsed();

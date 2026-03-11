@@ -31,19 +31,19 @@ fn make_swap(pool: &str, amount: f64) -> RowMap {
     ])
 }
 
-fn find_records<'a>(records: &'a [DeltaRecord], table: &str) -> Vec<&'a DeltaRecord> {
-    records.iter().filter(|r| r.table == table).collect()
+fn find_records<'a>(batch: &'a DeltaBatch, table: &str) -> Vec<&'a DeltaRecord> {
+    batch.records_for(table).iter().collect()
 }
 
 fn find_record_by_key<'a>(
-    records: &'a [DeltaRecord],
+    batch: &'a DeltaBatch,
     table: &str,
     key_col: &str,
     key_val: &Value,
 ) -> Option<&'a DeltaRecord> {
-    records
+    batch
+        .records_for(table)
         .iter()
-        .filter(|r| r.table == table)
         .find(|r| r.key.get(key_col) == Some(key_val))
 }
 
@@ -62,7 +62,7 @@ impl MockTarget {
     }
 
     fn total_records(&self) -> usize {
-        self.batches.iter().map(|b| b.records.len()).sum()
+        self.batches.iter().map(|b| b.record_count()).sum()
     }
 }
 
@@ -108,9 +108,8 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
 
     // Flush phase 1
     let batch1 = db.flush().unwrap();
-    assert!(batch1.records.len() > 0);
-    // No block hashes set in this test, so latest_head is None
-    assert!(batch1.latest_head.is_none());
+    assert!(batch1.record_count() > 0);
+    assert!(batch1.latest_head.is_some());
     target.apply(batch1);
 
     // Verify MV state after 100 blocks
@@ -118,7 +117,7 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
     let batch = &target.batches[0];
     for user in &users {
         let user_val = Value::String(user.to_string());
-        let rec = find_record_by_key(&batch.records, "position_summary", "user", &user_val);
+        let rec = find_record_by_key(&batch, "position_summary", "user", &user_val);
         assert!(rec.is_some(), "missing position_summary for {user}");
         let rec = rec.unwrap();
         assert_eq!(
@@ -131,7 +130,7 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
     // Both pools should have volume
     for pool in &pools {
         let pool_val = Value::String(pool.to_string());
-        let rec = find_record_by_key(&batch.records, "volume_by_pool", "pool", &pool_val);
+        let rec = find_record_by_key(&batch, "volume_by_pool", "pool", &pool_val);
         assert!(rec.is_some(), "missing volume_by_pool for {pool}");
         let rec = rec.unwrap();
         assert_eq!(
@@ -152,14 +151,14 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
     assert_eq!(db.latest_block(), 75);
 
     let rollback_batch = db.flush().unwrap();
-    assert!(rollback_batch.records.len() > 0);
+    assert!(rollback_batch.record_count() > 0);
     target.apply(rollback_batch);
 
     // After rollback, position_summary should reflect 75 trades per user
     let rb = &target.batches[1];
     for user in &users {
         let user_val = Value::String(user.to_string());
-        let rec = find_record_by_key(&rb.records, "position_summary", "user", &user_val);
+        let rec = find_record_by_key(&rb, "position_summary", "user", &user_val);
         assert!(rec.is_some(), "missing rollback position_summary for {user}");
         let rec = rec.unwrap();
         assert_eq!(
@@ -172,7 +171,7 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
     // Volume MV should also be rolled back
     for pool in &pools {
         let pool_val = Value::String(pool.to_string());
-        let rec = find_record_by_key(&rb.records, "volume_by_pool", "pool", &pool_val);
+        let rec = find_record_by_key(&rb, "volume_by_pool", "pool", &pool_val);
         assert!(rec.is_some(), "missing rollback volume for {pool}");
         let rec = rec.unwrap();
         assert_eq!(
@@ -217,7 +216,7 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
     assert_eq!(db.latest_block(), 100);
 
     let reingest_batch = db.flush().unwrap();
-    assert!(reingest_batch.records.len() > 0);
+    assert!(reingest_batch.record_count() > 0);
     target.apply(reingest_batch);
 
     // Phase 4: Verify final state
@@ -226,7 +225,7 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
     // Each user should have 100 total trades (75 original + 25 re-ingested)
     for user in &users {
         let user_val = Value::String(user.to_string());
-        let rec = find_record_by_key(&final_batch.records, "position_summary", "user", &user_val);
+        let rec = find_record_by_key(&final_batch, "position_summary", "user", &user_val);
         assert!(
             rec.is_some(),
             "missing final position_summary for {user}"
@@ -242,7 +241,7 @@ fn full_dex_pipeline_100_blocks_with_rollback() {
     // Volume should be sum of blocks 1-75 (original) + 76-100 (re-ingested with doubled amounts)
     for pool in &pools {
         let pool_val = Value::String(pool.to_string());
-        let rec = find_record_by_key(&final_batch.records, "volume_by_pool", "pool", &pool_val);
+        let rec = find_record_by_key(&final_batch, "volume_by_pool", "pool", &pool_val);
         assert!(rec.is_some(), "missing final volume for {pool}");
         let rec = rec.unwrap();
         assert_eq!(
@@ -299,7 +298,7 @@ fn rollback_to_finalized_boundary() {
     assert_eq!(db.latest_block(), 30);
 
     let batch = db.flush().unwrap();
-    let pos = find_records(&batch.records, "position_summary");
+    let pos = find_records(&batch, "position_summary");
     assert_eq!(pos.len(), 1);
     assert_eq!(
         pos[0].values.get("trade_count"),
@@ -327,7 +326,7 @@ fn multi_user_pnl_correctness() {
     let batch = db.flush().unwrap();
 
     let alice_rec = find_record_by_key(
-        &batch.records,
+        &batch,
         "position_summary",
         "user",
         &Value::String("alice".into()),
@@ -349,7 +348,7 @@ fn multi_user_pnl_correctness() {
     );
 
     let bob_rec = find_record_by_key(
-        &batch.records,
+        &batch,
         "position_summary",
         "user",
         &Value::String("bob".into()),
@@ -375,7 +374,7 @@ fn delta_operations_are_correct() {
     db.process_batch("trades", 1, vec![make_trade("alice", "buy", 10.0, 2000.0)])
         .unwrap();
     let b1 = db.flush().unwrap();
-    let pos1 = find_records(&b1.records, "position_summary");
+    let pos1 = find_records(&b1, "position_summary");
     assert_eq!(pos1.len(), 1);
     assert_eq!(pos1[0].operation, DeltaOperation::Insert);
 
@@ -383,14 +382,14 @@ fn delta_operations_are_correct() {
     db.process_batch("trades", 2, vec![make_trade("alice", "buy", 5.0, 2100.0)])
         .unwrap();
     let b2 = db.flush().unwrap();
-    let pos2 = find_records(&b2.records, "position_summary");
+    let pos2 = find_records(&b2, "position_summary");
     assert_eq!(pos2.len(), 1);
     assert_eq!(pos2[0].operation, DeltaOperation::Update);
 
     // Rollback block 2 + block 1
     db.rollback(0).unwrap();
     let rb = db.flush().unwrap();
-    let pos_rb = find_records(&rb.records, "position_summary");
+    let pos_rb = find_records(&rb, "position_summary");
     assert_eq!(pos_rb.len(), 1);
     assert_eq!(pos_rb[0].operation, DeltaOperation::Delete);
 }

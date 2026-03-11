@@ -79,7 +79,7 @@ fn link_weth(t: i64, tx: &str, sender: &str, link: f64, weth: f64) -> RowMap {
 }
 
 fn find_records<'a>(batch: &'a DeltaBatch, table: &str) -> Vec<&'a DeltaRecord> {
-    batch.records.iter().filter(|r| r.table == table).collect()
+    batch.records_for(table).iter().collect()
 }
 
 fn find_by_key<'a>(
@@ -88,9 +88,9 @@ fn find_by_key<'a>(
     key_checks: &[(&str, &Value)],
 ) -> Option<&'a DeltaRecord> {
     batch
-        .records
+        .records_for(table)
         .iter()
-        .find(|r| r.table == table && key_checks.iter().all(|(k, v)| r.key.get(*k) == Some(*v)))
+        .find(|r| key_checks.iter().all(|(k, v)| r.key.get(*k) == Some(*v)))
 }
 
 fn get_val<'a>(record: &'a DeltaRecord, col: &str) -> &'a Value {
@@ -180,9 +180,9 @@ fn cross_price_via_eth() {
     // Find the UNI pool candle
     let pool_val = Value::String(POOL_UNI_WETH.to_string());
     let uni_candle = batch
-        .records
+        .records_for("candles_5m")
         .iter()
-        .find(|r| r.table == "candles_5m" && r.key.get("pool") == Some(&pool_val))
+        .find(|r| r.key.get("pool") == Some(&pool_val))
         .expect("missing UNI candle");
 
     // UNI price should be $10 (cross-calculated via ETH)
@@ -240,9 +240,9 @@ fn cross_price_both_directions() {
     let link_pool = Value::String(POOL_LINK_WETH.to_string());
 
     let uni_candle = batch
-        .records
+        .records_for("candles_5m")
         .iter()
-        .find(|r| r.table == "candles_5m" && r.key.get("pool") == Some(&uni_pool))
+        .find(|r| r.key.get("pool") == Some(&uni_pool))
         .expect("missing UNI candle");
     assert_approx(
         get_val(uni_candle, "open").as_f64().unwrap(),
@@ -251,9 +251,9 @@ fn cross_price_both_directions() {
     );
 
     let link_candle = batch
-        .records
+        .records_for("candles_5m")
         .iter()
-        .find(|r| r.table == "candles_5m" && r.key.get("pool") == Some(&link_pool))
+        .find(|r| r.key.get("pool") == Some(&link_pool))
         .expect("missing LINK candle");
     assert_approx(
         get_val(link_candle, "open").as_f64().unwrap(),
@@ -303,9 +303,9 @@ fn eth_price_update_propagation() {
     // high = $11, low = $10
     let uni_pool = Value::String(POOL_UNI_WETH.to_string());
     let uni_candle = batch
-        .records
+        .records_for("candles_5m")
         .iter()
-        .find(|r| r.table == "candles_5m" && r.key.get("pool") == Some(&uni_pool))
+        .find(|r| r.key.get("pool") == Some(&uni_pool))
         .expect("missing UNI candle");
 
     assert_approx(get_val(uni_candle, "open").as_f64().unwrap(), 10.0, "open");
@@ -361,9 +361,9 @@ fn ohlc_multiple_windows_cross_priced() {
     let batch = db.flush().unwrap();
     let uni_pool = Value::String(POOL_UNI_WETH.to_string());
     let uni_candles: Vec<_> = batch
-        .records
+        .records_for("candles_5m")
         .iter()
-        .filter(|r| r.table == "candles_5m" && r.key.get("pool") == Some(&uni_pool))
+        .filter(|r| r.key.get("pool") == Some(&uni_pool))
         .collect();
 
     assert_eq!(uni_candles.len(), 2, "should produce 2 time windows");
@@ -617,9 +617,9 @@ fn usdt_pricing() {
 
     let uni_pool = Value::String(POOL_UNI_WETH.to_string());
     let uni_candle = batch
-        .records
+        .records_for("candles_5m")
         .iter()
-        .find(|r| r.table == "candles_5m" && r.key.get("pool") == Some(&uni_pool))
+        .find(|r| r.key.get("pool") == Some(&uni_pool))
         .expect("missing UNI candle");
 
     assert_approx(
@@ -688,9 +688,9 @@ fn rollback_restores_cross_prices() {
 
     let uni_pool = Value::String(POOL_UNI_WETH.to_string());
     let uni_candle = batch
-        .records
+        .records_for("candles_5m")
         .iter()
-        .find(|r| r.table == "candles_5m" && r.key.get("pool") == Some(&uni_pool))
+        .find(|r| r.key.get("pool") == Some(&uni_pool))
         .expect("missing UNI candle after rollback");
 
     // After rollback: UNI trades at $10 (block 2) and $11 (block 4)
@@ -870,7 +870,7 @@ fn full_scenario_with_cross_pricing() {
     db.finalize(10).unwrap();
 
     let batch1 = db.flush().unwrap();
-    assert!(!batch1.records.is_empty());
+    assert!(batch1.record_count() > 0);
 
     // Verify candles exist for cross-priced pools
     let uni_pool = Value::String(POOL_UNI_WETH.to_string());
@@ -878,28 +878,28 @@ fn full_scenario_with_cross_pricing() {
 
     assert!(
         batch1
-            .records
+            .records_for("candles_5m")
             .iter()
-            .any(|r| r.table == "candles_5m" && r.key.get("pool") == Some(&uni_pool)),
+            .any(|r| r.key.get("pool") == Some(&uni_pool)),
         "missing UNI candle"
     );
     assert!(
         batch1
-            .records
+            .records_for("candles_5m")
             .iter()
-            .any(|r| r.table == "candles_5m" && r.key.get("pool") == Some(&link_pool)),
+            .any(|r| r.key.get("pool") == Some(&link_pool)),
         "missing LINK candle"
     );
 
     // Verify wallet summaries exist
     assert!(
-        batch1.records.iter().any(|r| r.table == "wallet_summary"
-            && r.key.get("sender") == Some(&Value::String("alice".into()))),
+        batch1.records_for("wallet_summary").iter().any(|r|
+            r.key.get("sender") == Some(&Value::String("alice".into()))),
         "missing alice summary"
     );
     assert!(
-        batch1.records.iter().any(|r| r.table == "wallet_summary"
-            && r.key.get("sender") == Some(&Value::String("bob".into()))),
+        batch1.records_for("wallet_summary").iter().any(|r|
+            r.key.get("sender") == Some(&Value::String("bob".into()))),
         "missing bob summary"
     );
 
@@ -909,7 +909,7 @@ fn full_scenario_with_cross_pricing() {
 
     let rollback_batch = db.flush().unwrap();
     assert!(
-        !rollback_batch.records.is_empty(),
+        rollback_batch.record_count() > 0,
         "rollback should produce deltas"
     );
 
@@ -951,22 +951,22 @@ fn full_scenario_with_cross_pricing() {
     assert_eq!(db.latest_block(), 24);
 
     let final_batch = db.flush().unwrap();
-    assert!(!final_batch.records.is_empty());
+    assert!(final_batch.record_count() > 0);
 
     // Verify final state has both pools
     let has_uni = final_batch
-        .records
+        .records_for("candles_5m")
         .iter()
-        .any(|r| r.table == "candles_5m" && r.key.get("pool") == Some(&uni_pool));
+        .any(|r| r.key.get("pool") == Some(&uni_pool));
     let has_link = final_batch
-        .records
+        .records_for("candles_5m")
         .iter()
-        .any(|r| r.table == "candles_5m" && r.key.get("pool") == Some(&link_pool));
+        .any(|r| r.key.get("pool") == Some(&link_pool));
     assert!(has_uni || has_link, "should have candles after re-ingest");
 
     println!(
         "Full cross-pricing scenario passed: {} records in final batch",
-        final_batch.records.len(),
+        final_batch.record_count(),
     );
 }
 

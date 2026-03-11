@@ -410,13 +410,12 @@ mod tests {
 
         let batch = db.flush().unwrap();
         assert_eq!(batch.sequence, 1);
-        assert_eq!(batch.latest_head.map(|c| c.number), None); // no hashes set
+        assert_eq!(batch.latest_head.as_ref().map(|c| c.number), Some(1000));
 
         // 2 raw inserts + 1 MV insert = 3 records
-        assert_eq!(batch.records.len(), 3);
+        assert_eq!(batch.record_count(), 3);
 
-        let mv_records: Vec<_> = batch.records.iter()
-            .filter(|r| r.table == "pool_volume")
+        let mv_records: Vec<_> = batch.records_for("pool_volume").iter()
             .collect();
         assert_eq!(mv_records.len(), 1);
         assert_eq!(mv_records[0].operation, DeltaOperation::Insert);
@@ -433,8 +432,7 @@ mod tests {
         let batch = db.flush().unwrap();
 
         // MV records should be merged: Insert + Update -> Insert with latest values
-        let mv_records: Vec<_> = batch.records.iter()
-            .filter(|r| r.table == "pool_volume")
+        let mv_records: Vec<_> = batch.records_for("pool_volume").iter()
             .collect();
         assert_eq!(mv_records.len(), 1);
         assert_eq!(mv_records[0].operation, DeltaOperation::Insert);
@@ -457,8 +455,7 @@ mod tests {
         let batch = db.flush().unwrap();
 
         // Should have MV update (back to 100) and raw delete
-        let mv_records: Vec<_> = batch.records.iter()
-            .filter(|r| r.table == "pool_volume")
+        let mv_records: Vec<_> = batch.records_for("pool_volume").iter()
             .collect();
         assert_eq!(mv_records.len(), 1);
         assert_eq!(mv_records[0].operation, DeltaOperation::Update);
@@ -484,8 +481,7 @@ mod tests {
         db.rollback(1001).unwrap();
 
         let batch = db.flush().unwrap();
-        let mv_records: Vec<_> = batch.records.iter()
-            .filter(|r| r.table == "pool_volume")
+        let mv_records: Vec<_> = batch.records_for("pool_volume").iter()
             .collect();
         assert_eq!(mv_records.len(), 1);
         // total should be 100 + 200 = 300
@@ -508,8 +504,7 @@ mod tests {
 
         let batch = db.flush().unwrap();
 
-        let mv_records: Vec<_> = batch.records.iter()
-            .filter(|r| r.table == "position_summary")
+        let mv_records: Vec<_> = batch.records_for("position_summary").iter()
             .collect();
         assert_eq!(mv_records.len(), 1);
 
@@ -540,8 +535,7 @@ mod tests {
         db.process_batch("trades", 1002, vec![make_trade("alice", "sell", 3.0, 2300.0)]).unwrap();
 
         let batch = db.flush().unwrap();
-        let mv_records: Vec<_> = batch.records.iter()
-            .filter(|r| r.table == "position_summary")
+        let mv_records: Vec<_> = batch.records_for("position_summary").iter()
             .collect();
         assert_eq!(mv_records.len(), 1);
         assert_eq!(mv_records[0].values.get("trade_count"), Some(&Value::UInt64(3)));
@@ -629,8 +623,8 @@ mod tests {
         let batch = db.flush().unwrap();
 
         // Verify Insert was emitted for alice's MV group
-        let mv_inserts: Vec<_> = batch.records.iter()
-            .filter(|r| r.table == "wallet_volume" && r.operation == DeltaOperation::Insert)
+        let mv_inserts: Vec<_> = batch.records_for("wallet_volume").iter()
+            .filter(|r| r.operation == DeltaOperation::Insert)
             .collect();
         assert_eq!(mv_inserts.len(), 1);
         assert_eq!(mv_inserts[0].values.get("total_volume"), Some(&Value::Float64(500.0)));
@@ -641,8 +635,8 @@ mod tests {
         let batch = db.flush().unwrap();
 
         // The MV group for alice should be deleted since she has no data left
-        let mv_deletes: Vec<_> = batch.records.iter()
-            .filter(|r| r.table == "wallet_volume" && r.operation == DeltaOperation::Delete)
+        let mv_deletes: Vec<_> = batch.records_for("wallet_volume").iter()
+            .filter(|r| r.operation == DeltaOperation::Delete)
             .collect();
         assert_eq!(mv_deletes.len(), 1, "expected Delete delta for fully rolled-back MV group");
         assert_eq!(
@@ -679,7 +673,7 @@ mod tests {
         }).unwrap();
 
         let batch = batch.unwrap();
-        assert_eq!(batch.records.len(), 3); // 2 raw inserts + 1 MV insert
+        assert_eq!(batch.record_count(), 3); // 2 raw inserts + 1 MV insert
         assert_eq!(db.latest_block(), 1001);
         assert_eq!(db.finalized_block(), 999);
     }
@@ -854,8 +848,7 @@ mod tests {
 
         let batch = db.flush().unwrap();
 
-        let mv_records: Vec<_> = batch.records.iter()
-            .filter(|r| r.table == "wallet_volume")
+        let mv_records: Vec<_> = batch.records_for("wallet_volume").iter()
             .collect();
         assert_eq!(mv_records.len(), 1);
         assert_eq!(mv_records[0].operation, DeltaOperation::Update);
@@ -933,8 +926,7 @@ mod tests {
 
             let batch = db.flush().unwrap();
 
-            let mv_records: Vec<_> = batch.records.iter()
-                .filter(|r| r.table == "position_summary")
+            let mv_records: Vec<_> = batch.records_for("position_summary").iter()
                 .collect();
             assert_eq!(mv_records.len(), 1);
 

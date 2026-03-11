@@ -9,7 +9,7 @@ use crate::reducer_runtime::lua::LuaRuntime;
 use crate::reducer_runtime::ReducerRuntime;
 use crate::schema::ast::{ReducerBody, ReducerDef};
 use crate::storage::{self, StorageBackend, StorageWriteBatch};
-use crate::types::{BlockNumber, RowMap, Value};
+use crate::types::{BlockNumber, ColumnId, ColumnRegistry, GroupKey, Row, RowMap, Value};
 
 type State = HashMap<String, Value>;
 
@@ -31,10 +31,19 @@ pub struct ReducerEngine {
     /// Tracks which blocks have been processed and which group keys were touched.
     /// BTreeMap for O(log N) range queries during rollback/finalize.
     block_groups: BTreeMap<BlockNumber, HashSet<Vec<u8>>>,
+    /// Pre-computed column IDs for group-by columns (resolved against source registry).
+    /// Enables direct Vec indexing instead of HashMap lookups.
+    group_by_ids: Vec<Option<ColumnId>>,
+    /// Source table's column registry, used for inline RowMap→Row conversion.
+    source_registry: Arc<ColumnRegistry>,
 }
 
 impl ReducerEngine {
-    pub fn new(def: ReducerDef, storage: Arc<dyn StorageBackend>) -> Self {
+    pub fn new(
+        def: ReducerDef,
+        storage: Arc<dyn StorageBackend>,
+        source_registry: &crate::types::ColumnRegistry,
+    ) -> Self {
         let runtime: Box<dyn ReducerRuntime> = match &def.body {
             ReducerBody::EventRules { .. } => Box::new(EventRulesRuntime::new(&def.body)),
             ReducerBody::Lua { script } => {
@@ -42,9 +51,23 @@ impl ReducerEngine {
                     def.state.iter().map(|f| f.name.clone()).collect();
                 let state_types: Vec<(String, crate::types::ColumnType)> =
                     def.state.iter().map(|f| (f.name.clone(), f.column_type.clone())).collect();
-                Box::new(LuaRuntime::with_state_fields(script, &state_fields, &state_types))
+                Box::new(LuaRuntime::with_state_fields(
+                    script,
+                    &state_fields,
+                    &state_types,
+                    source_registry.names(),
+                ))
             }
         };
+
+        // Pre-compute column IDs for group-by columns
+        let group_by_ids: Vec<Option<ColumnId>> = def
+            .group_by
+            .iter()
+            .map(|col| source_registry.get_id(col))
+            .collect();
+
+        let source_registry = Arc::new(source_registry.clone());
 
         Self {
             def,
@@ -53,6 +76,8 @@ impl ReducerEngine {
             state_cache: FxHashMap::default(),
             block_snapshots: FxHashMap::default(),
             block_groups: BTreeMap::new(),
+            group_by_ids,
+            source_registry,
         }
     }
 
@@ -73,7 +98,7 @@ impl ReducerEngine {
     pub fn process_block(
         &mut self,
         block: BlockNumber,
-        rows: &[RowMap],
+        rows: &[Row],
     ) -> Result<Vec<RowMap>> {
         let mut output_maps: Vec<RowMap> = Vec::new();
         let mut touched_keys: HashSet<Vec<u8>> = HashSet::new();
@@ -118,6 +143,20 @@ impl ReducerEngine {
         }
 
         Ok(output_maps)
+    }
+
+    /// Process a batch of RowMaps for a given block (normal ingestion path).
+    /// Converts each RowMap to Row inline using the stored source registry.
+    pub fn process_block_maps(
+        &mut self,
+        block: BlockNumber,
+        rows: &[RowMap],
+    ) -> Result<Vec<RowMap>> {
+        let typed_rows: Vec<Row> = rows
+            .iter()
+            .map(|m| Row::from_map(self.source_registry.clone(), m))
+            .collect();
+        self.process_block(block, &typed_rows)
     }
 
     /// Roll back all blocks after fork_point.
@@ -229,22 +268,30 @@ impl ReducerEngine {
             })
     }
 
-    fn compute_group_key_bytes(&self, row: &RowMap) -> Vec<u8> {
-        if self.def.group_by.is_empty() {
+    fn compute_group_key_bytes(&self, row: &Row) -> Vec<u8> {
+        if self.group_by_ids.is_empty() {
             return Vec::new();
         }
+        let values = row.values();
         // Fast path: single string group key — use raw bytes instead of MessagePack
-        if self.def.group_by.len() == 1 {
-            if let Some(Value::String(s)) = row.get(self.def.group_by[0].as_str()) {
-                return s.as_bytes().to_vec();
+        if self.group_by_ids.len() == 1 {
+            if let Some(id) = self.group_by_ids[0] {
+                if let Value::String(s) = &values[id as usize] {
+                    return s.as_bytes().to_vec();
+                }
             }
         }
-        // General path: MessagePack-encoded composite key
-        let key: Vec<Value> = self
-            .def
-            .group_by
+        // General path: direct Vec indexing with pre-computed column IDs
+        let key: GroupKey = self
+            .group_by_ids
             .iter()
-            .map(|col| row.get(col.as_str()).cloned().unwrap_or(Value::Null))
+            .map(|id| {
+                id.map(|i| {
+                    let v = &values[i as usize];
+                    if v.is_null() { Value::Null } else { v.clone() }
+                })
+                .unwrap_or(Value::Null)
+            })
             .collect();
         storage::encode_group_key(&key)
     }
@@ -301,6 +348,7 @@ mod tests {
     use super::*;
     use crate::schema::ast::*;
     use crate::storage::memory::MemoryBackend;
+    use crate::types::ColumnRegistry;
 
     fn pnl_reducer_def() -> ReducerDef {
         ReducerDef {
@@ -399,19 +447,28 @@ mod tests {
         }
     }
 
-    fn make_trade(user: &str, side: &str, amount: f64, price: f64) -> RowMap {
-        HashMap::from([
+    fn trade_registry() -> Arc<ColumnRegistry> {
+        Arc::new(ColumnRegistry::new(vec![
+            "amount".to_string(),
+            "price".to_string(),
+            "side".to_string(),
+            "user".to_string(),
+        ]))
+    }
+
+    fn make_trade(user: &str, side: &str, amount: f64, price: f64) -> Row {
+        Row::from_map(trade_registry(), &HashMap::from([
             ("user".to_string(), Value::String(user.to_string())),
             ("side".to_string(), Value::String(side.to_string())),
             ("amount".to_string(), Value::Float64(amount)),
             ("price".to_string(), Value::Float64(price)),
-        ])
+        ]))
     }
 
     #[test]
     fn reducer_processes_rows_and_emits_output() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage);
+        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage, &trade_registry());
 
         let rows = vec![
             make_trade("alice", "buy", 10.0, 2000.0),
@@ -433,7 +490,7 @@ mod tests {
     #[test]
     fn reducer_state_persists_across_blocks() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage);
+        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage, &trade_registry());
 
         // Block 1: buy
         engine.process_block(1000, &[make_trade("alice", "buy", 10.0, 2000.0)]).unwrap();
@@ -450,7 +507,7 @@ mod tests {
     #[test]
     fn reducer_rollback_restores_state() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage);
+        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage, &trade_registry());
 
         // Block 1: buy 10 @ 2000
         engine.process_block(1000, &[make_trade("alice", "buy", 10.0, 2000.0)]).unwrap();
@@ -474,7 +531,7 @@ mod tests {
     #[test]
     fn reducer_multiple_groups() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage);
+        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage, &trade_registry());
 
         let rows = vec![
             make_trade("alice", "buy", 10.0, 2000.0),
@@ -496,7 +553,7 @@ mod tests {
     #[test]
     fn reducer_finalize_then_rollback() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage.clone());
+        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage.clone(), &trade_registry());
 
         // Block 1000: buy 10
         engine.process_block(1000, &[make_trade("alice", "buy", 10.0, 2000.0)]).unwrap();
@@ -543,11 +600,13 @@ mod tests {
         };
 
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = ReducerEngine::new(def, storage);
+        let events_registry = ColumnRegistry::new(vec!["value".to_string()]);
+        let mut engine = ReducerEngine::new(def, storage, &events_registry);
 
-        let rows: Vec<RowMap> = vec![
-            HashMap::from([("value".to_string(), Value::Float64(10.0))]),
-            HashMap::from([("value".to_string(), Value::Float64(20.0))]),
+        let reg = Arc::new(events_registry);
+        let rows: Vec<Row> = vec![
+            Row::from_map(reg.clone(), &HashMap::from([("value".to_string(), Value::Float64(10.0))])),
+            Row::from_map(reg.clone(), &HashMap::from([("value".to_string(), Value::Float64(20.0))])),
         ];
         let output = engine.process_block(1000, &rows).unwrap();
         assert_eq!(output.len(), 2);

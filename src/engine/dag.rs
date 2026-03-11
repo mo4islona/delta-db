@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::schema::ast::Schema;
 use crate::storage::StorageBackend;
 use crate::storage::StorageWriteBatch;
-use crate::types::{BlockCursor, BlockNumber, DeltaBatch, DeltaRecord, RowMap};
+use crate::types::{BlockCursor, BlockNumber, DeltaBatch, DeltaRecord, Row, RowMap};
 
 use super::mv::MVEngine;
 use super::raw_table::RawTableEngine;
@@ -46,7 +46,7 @@ pub struct DeltaEngine {
     /// Sequence number for delta batches.
     sequence: u64,
     /// Latest processed block number (for ordering/rollback logic).
-    latest_block: BlockNumber,
+    latest_block: Option<BlockNumber>,
     /// Finalized block number (for finalization logic).
     finalized_block: BlockNumber,
     /// Block number → hash for all known blocks.
@@ -69,9 +69,13 @@ impl DeltaEngine {
         }
 
         for reducer_def in &schema.reducers {
+            let source_registry = raw_tables
+                .get(&reducer_def.source)
+                .expect("reducer source table must exist")
+                .registry();
             reducers.insert(
                 reducer_def.name.clone(),
-                ReducerEngine::new(reducer_def.clone(), storage.clone()),
+                ReducerEngine::new(reducer_def.clone(), storage.clone(), source_registry),
             );
         }
 
@@ -122,7 +126,7 @@ impl DeltaEngine {
             direct_mvs,
             branches,
             sequence: 0,
-            latest_block: 0,
+            latest_block: None,
             finalized_block: 0,
             block_hashes: BTreeMap::new(),
         }
@@ -146,31 +150,26 @@ impl DeltaEngine {
 
         let mut all_deltas = Vec::new();
 
-        // Accumulated output rows per source name, to be consumed by downstream nodes.
+        // Phase 1: Raw table ingest (uses original RowMaps for storage + DeltaRecord creation)
+        let raw_eng = self.raw_tables.get(table).unwrap();
+        if self.virtual_tables.contains(table) {
+            raw_eng.ingest_no_deltas(block, &row_maps)?;
+        } else {
+            let deltas = raw_eng.ingest(block, &row_maps)?;
+            all_deltas.extend(deltas);
+        }
+
+        // Output rows for downstream consumption (reducers + MVs)
         let mut output_rows: HashMap<String, Vec<RowMap>> = HashMap::new();
         output_rows.insert(table.to_string(), row_maps);
-
-        // Phase 1: Process raw tables
-        for node in &self.pipeline {
-            if let PipelineNode::RawTable(name) = node {
-                if let Some(maps) = output_rows.get(name) {
-                    let raw_eng = self.raw_tables.get(name).unwrap();
-                    if self.virtual_tables.contains(name) {
-                        raw_eng.ingest_no_deltas(block, maps)?;
-                    } else {
-                        let deltas = raw_eng.ingest(block, maps)?;
-                        all_deltas.extend(deltas);
-                    }
-                }
-            }
-        }
 
         // Check if parallel branch execution is possible:
         // - 2+ branches, and all reducers source from raw tables (not from each other)
         let can_parallelize = self.branches.len() >= 2
-            && self.branches.iter().all(|b| {
-                self.raw_tables.contains_key(b.reducer.source())
-            });
+            && self
+                .branches
+                .iter()
+                .all(|b| self.raw_tables.contains_key(b.reducer.source()));
 
         if can_parallelize {
             // Phase 2a: Process MVs that source directly from raw tables
@@ -184,10 +183,7 @@ impl DeltaEngine {
             }
 
             // Phase 2b: Process reducer branches in parallel.
-            // Engines are stored inline in PipelineBranch — no HashMap extraction needed.
             if self.branches.len() == 2 {
-                // Fast path: exactly 2 branches — rayon::join with split_at_mut.
-                // First closure runs on current thread; put the heavier branch first.
                 let (first, second) = self.branches.split_at_mut(1);
                 let branch_0 = &mut first[0];
                 let branch_1 = &mut second[0];
@@ -197,7 +193,7 @@ impl DeltaEngine {
                         let source = branch_0.reducer.source();
                         let mut deltas = Vec::new();
                         if let Some(rows) = output_rows.get(source) {
-                            let enriched = branch_0.reducer.process_block(block, rows)?;
+                            let enriched = branch_0.reducer.process_block_maps(block, rows)?;
                             if !enriched.is_empty() {
                                 for (_, mv) in branch_0.mv_entries.iter_mut() {
                                     deltas.extend(mv.process_block(block, &enriched));
@@ -210,7 +206,7 @@ impl DeltaEngine {
                         let source = branch_1.reducer.source();
                         let mut deltas = Vec::new();
                         if let Some(rows) = output_rows.get(source) {
-                            let enriched = branch_1.reducer.process_block(block, rows)?;
+                            let enriched = branch_1.reducer.process_block_maps(block, rows)?;
                             if !enriched.is_empty() {
                                 for (_, mv) in branch_1.mv_entries.iter_mut() {
                                     deltas.extend(mv.process_block(block, &enriched));
@@ -232,7 +228,7 @@ impl DeltaEngine {
                         let source = branch.reducer.source();
                         let mut deltas = Vec::new();
                         if let Some(rows) = output_rows.get(source) {
-                            let enriched = branch.reducer.process_block(block, rows)?;
+                            let enriched = branch.reducer.process_block_maps(block, rows)?;
                             if !enriched.is_empty() {
                                 for (_, mv) in branch.mv_entries.iter_mut() {
                                     deltas.extend(mv.process_block(block, &enriched));
@@ -253,35 +249,34 @@ impl DeltaEngine {
                 match node {
                     PipelineNode::RawTable(_) => {} // Already processed in Phase 1
                     PipelineNode::Reducer(name) => {
-                        // Check branches first, then fallback to HashMap
-                        let (source, enriched) =
-                            if let Some(branch) = self.branches.iter_mut().find(|b| b.reducer_name == *name) {
-                                let source = branch.reducer.source().to_string();
-                                let enriched = if let Some(source_rows) = output_rows.get(&source) {
-                                    branch.reducer.process_block(block, source_rows)?
-                                } else {
-                                    Vec::new()
-                                };
-                                (source, enriched)
+                        let enriched = if let Some(branch) =
+                            self.branches.iter_mut().find(|b| b.reducer_name == *name)
+                        {
+                            let source = branch.reducer.source().to_string();
+                            if let Some(source_rows) = output_rows.get(&source) {
+                                branch.reducer.process_block_maps(block, source_rows)?
                             } else {
-                                let reducer = self.reducers.get_mut(name).unwrap();
-                                let source = reducer.source().to_string();
-                                let enriched = if let Some(source_rows) = output_rows.get(&source) {
-                                    reducer.process_block(block, source_rows)?
-                                } else {
-                                    Vec::new()
-                                };
-                                (source, enriched)
-                            };
-                        let _ = source;
+                                Vec::new()
+                            }
+                        } else {
+                            let reducer = self.reducers.get_mut(name).unwrap();
+                            let source = reducer.source().to_string();
+                            if let Some(source_rows) = output_rows.get(&source) {
+                                reducer.process_block_maps(block, source_rows)?
+                            } else {
+                                Vec::new()
+                            }
+                        };
                         if !enriched.is_empty() {
                             output_rows.insert(name.clone(), enriched);
                         }
                     }
                     PipelineNode::MV(name) => {
-                        // Check branch MVs first, then fallback to HashMap
+                        // MVs consume RowMaps from output_rows
                         let found_in_branch = self.branches.iter_mut().any(|branch| {
-                            if let Some((_, mv)) = branch.mv_entries.iter_mut().find(|(n, _)| n == name) {
+                            if let Some((_, mv)) =
+                                branch.mv_entries.iter_mut().find(|(n, _)| n == name)
+                            {
                                 let source = mv.source().to_string();
                                 if let Some(source_rows) = output_rows.get(&source) {
                                     let deltas = mv.process_block(block, source_rows);
@@ -305,8 +300,8 @@ impl DeltaEngine {
             }
         }
 
-        if block > self.latest_block {
-            self.latest_block = block;
+        if self.latest_block.is_none_or(|b| block > b) {
+            self.latest_block = Some(block);
         }
 
         Ok(all_deltas)
@@ -325,25 +320,29 @@ impl DeltaEngine {
             return Ok(());
         }
 
-        // Collect all (table_name, block, row_maps) across all raw tables
-        let mut all_blocks: BTreeMap<BlockNumber, HashMap<String, Vec<RowMap>>> = BTreeMap::new();
+        // Collect all (table_name, block, rows) across all raw tables.
+        // Rows are stored as Vec<Row> — no to_map() conversion needed!
+        let mut all_blocks: BTreeMap<BlockNumber, HashMap<String, Vec<Row>>> = BTreeMap::new();
 
         for (table_name, raw_eng) in &self.raw_tables {
             let rows_by_block = raw_eng.get_rows(from_block, to_block)?;
             for (block, rows) in rows_by_block {
-                let maps: Vec<RowMap> = rows.into_iter().map(|r| r.to_map()).collect();
                 all_blocks
                     .entry(block)
                     .or_default()
-                    .insert(table_name.clone(), maps);
+                    .insert(table_name.clone(), rows);
             }
         }
 
         // Replay each block in order through reducers and MVs only
         for (block, tables) in all_blocks {
-            for (table_name, row_maps) in tables {
+            for (table_name, rows) in tables {
+                // Row cache for reducer input (indexed access)
+                let mut row_cache: HashMap<String, Vec<Row>> = HashMap::new();
+                row_cache.insert(table_name, rows);
+
+                // Output from reducers (RowMaps for MV consumption)
                 let mut output_rows: HashMap<String, Vec<RowMap>> = HashMap::new();
-                output_rows.insert(table_name, row_maps);
 
                 for node in &self.pipeline {
                     match node {
@@ -351,29 +350,34 @@ impl DeltaEngine {
                             // Skip — rows already in storage
                         }
                         PipelineNode::Reducer(name) => {
-                            if let Some(branch) = self.branches.iter_mut().find(|b| b.reducer_name == *name) {
+                            let enriched = if let Some(branch) =
+                                self.branches.iter_mut().find(|b| b.reducer_name == *name)
+                            {
                                 let source = branch.reducer.source().to_string();
-                                if let Some(source_rows) = output_rows.get(&source) {
-                                    let enriched = branch.reducer.process_block(block, source_rows)?;
-                                    if !enriched.is_empty() {
-                                        output_rows.insert(name.clone(), enriched);
-                                    }
+                                if let Some(source_rows) = row_cache.get(&source) {
+                                    branch.reducer.process_block(block, source_rows)?
+                                } else {
+                                    Vec::new()
                                 }
                             } else {
                                 let reducer = self.reducers.get_mut(name).unwrap();
                                 let source = reducer.source().to_string();
-                                if let Some(source_rows) = output_rows.get(&source) {
-                                    let enriched = reducer.process_block(block, source_rows)?;
-                                    if !enriched.is_empty() {
-                                        output_rows.insert(name.clone(), enriched);
-                                    }
+                                if let Some(source_rows) = row_cache.get(&source) {
+                                    reducer.process_block(block, source_rows)?
+                                } else {
+                                    Vec::new()
                                 }
+                            };
+                            if !enriched.is_empty() {
+                                output_rows.insert(name.clone(), enriched);
                             }
                         }
                         PipelineNode::MV(name) => {
                             let mut found = false;
                             for branch in &mut self.branches {
-                                if let Some((_, mv)) = branch.mv_entries.iter_mut().find(|(n, _)| n == name) {
+                                if let Some((_, mv)) =
+                                    branch.mv_entries.iter_mut().find(|(n, _)| n == name)
+                                {
                                     let source = mv.source().to_string();
                                     if let Some(source_rows) = output_rows.get(&source) {
                                         mv.process_block(block, source_rows);
@@ -409,7 +413,8 @@ impl DeltaEngine {
                     // Check branch MVs first, then HashMap
                     let mut found = false;
                     for branch in &mut self.branches {
-                        if let Some((_, mv)) = branch.mv_entries.iter_mut().find(|(n, _)| n == name) {
+                        if let Some((_, mv)) = branch.mv_entries.iter_mut().find(|(n, _)| n == name)
+                        {
                             all_deltas.extend(mv.rollback(fork_point));
                             found = true;
                             break;
@@ -422,7 +427,8 @@ impl DeltaEngine {
                 }
                 PipelineNode::Reducer(name) => {
                     // Check branches first, then HashMap
-                    if let Some(branch) = self.branches.iter_mut().find(|b| b.reducer_name == *name) {
+                    if let Some(branch) = self.branches.iter_mut().find(|b| b.reducer_name == *name)
+                    {
                         branch.reducer.rollback(fork_point)?;
                     } else {
                         let reducer = self.reducers.get_mut(name).unwrap();
@@ -439,7 +445,7 @@ impl DeltaEngine {
             }
         }
 
-        self.latest_block = fork_point;
+        self.latest_block = Some(fork_point);
         // Remove hashes for rolled-back blocks
         let after = self.block_hashes.split_off(&(fork_point + 1));
         drop(after);
@@ -453,7 +459,8 @@ impl DeltaEngine {
         for node in &self.pipeline {
             match node {
                 PipelineNode::Reducer(name) => {
-                    if let Some(branch) = self.branches.iter_mut().find(|b| b.reducer_name == *name) {
+                    if let Some(branch) = self.branches.iter_mut().find(|b| b.reducer_name == *name)
+                    {
                         branch.reducer.finalize(block, batch);
                     } else {
                         let reducer = self.reducers.get_mut(name).unwrap();
@@ -463,7 +470,8 @@ impl DeltaEngine {
                 PipelineNode::MV(name) => {
                     let mut found = false;
                     for branch in &mut self.branches {
-                        if let Some((_, mv)) = branch.mv_entries.iter_mut().find(|(n, _)| n == name) {
+                        if let Some((_, mv)) = branch.mv_entries.iter_mut().find(|(n, _)| n == name)
+                        {
                             mv.finalize(block, batch);
                             found = true;
                             break;
@@ -490,22 +498,33 @@ impl DeltaEngine {
     /// Create a DeltaBatch from a set of delta records.
     pub fn make_batch(&mut self, records: Vec<DeltaRecord>) -> DeltaBatch {
         self.sequence += 1;
+        // Group records by table name
+        let mut tables: HashMap<String, Vec<DeltaRecord>> = HashMap::new();
+        for record in records {
+            tables.entry(record.table.clone()).or_default().push(record);
+        }
         DeltaBatch {
             sequence: self.sequence,
             finalized_head: self.finalized_cursor(),
             latest_head: self.latest_cursor(),
-            records,
+            tables,
         }
     }
 
     pub fn latest_block(&self) -> BlockNumber {
-        self.latest_block
+        self.latest_block.unwrap_or(0)
     }
 
     pub fn latest_cursor(&self) -> Option<BlockCursor> {
-        self.block_hashes.get(&self.latest_block).map(|hash| BlockCursor {
-            number: self.latest_block,
-            hash: hash.clone(),
+        let block = self.latest_block?;
+        let hash = self
+            .block_hashes
+            .get(&block)
+            .cloned()
+            .unwrap_or_default();
+        Some(BlockCursor {
+            number: block,
+            hash,
         })
     }
 
@@ -514,14 +533,16 @@ impl DeltaEngine {
     }
 
     pub fn finalized_cursor(&self) -> Option<BlockCursor> {
-        self.block_hashes.get(&self.finalized_block).map(|hash| BlockCursor {
-            number: self.finalized_block,
-            hash: hash.clone(),
-        })
+        self.block_hashes
+            .get(&self.finalized_block)
+            .map(|hash| BlockCursor {
+                number: self.finalized_block,
+                hash: hash.clone(),
+            })
     }
 
     pub fn set_latest_block(&mut self, block: BlockNumber) {
-        self.latest_block = block;
+        self.latest_block = Some(block);
     }
 
     pub fn set_finalized_block(&mut self, block: BlockNumber) {
@@ -670,11 +691,26 @@ mod tests {
             tables: vec![TableDef {
                 name: "trades".to_string(),
                 columns: vec![
-                    ColumnDef { name: "block_number".to_string(), column_type: ColumnType::UInt64 },
-                    ColumnDef { name: "user".to_string(), column_type: ColumnType::String },
-                    ColumnDef { name: "side".to_string(), column_type: ColumnType::String },
-                    ColumnDef { name: "amount".to_string(), column_type: ColumnType::Float64 },
-                    ColumnDef { name: "price".to_string(), column_type: ColumnType::Float64 },
+                    ColumnDef {
+                        name: "block_number".to_string(),
+                        column_type: ColumnType::UInt64,
+                    },
+                    ColumnDef {
+                        name: "user".to_string(),
+                        column_type: ColumnType::String,
+                    },
+                    ColumnDef {
+                        name: "side".to_string(),
+                        column_type: ColumnType::String,
+                    },
+                    ColumnDef {
+                        name: "amount".to_string(),
+                        column_type: ColumnType::Float64,
+                    },
+                    ColumnDef {
+                        name: "price".to_string(),
+                        column_type: ColumnType::Float64,
+                    },
                 ],
                 virtual_table: false,
             }],
@@ -704,24 +740,28 @@ mod tests {
                             },
                             lets: vec![],
                             sets: vec![
-                                ("quantity".into(), Expr::BinaryOp {
-                                    left: Box::new(Expr::StateRef("quantity".into())),
-                                    op: BinaryOp::Add,
-                                    right: Box::new(Expr::RowRef("amount".into())),
-                                }),
-                                ("cost_basis".into(), Expr::BinaryOp {
-                                    left: Box::new(Expr::StateRef("cost_basis".into())),
-                                    op: BinaryOp::Add,
-                                    right: Box::new(Expr::BinaryOp {
-                                        left: Box::new(Expr::RowRef("amount".into())),
-                                        op: BinaryOp::Mul,
-                                        right: Box::new(Expr::RowRef("price".into())),
-                                    }),
-                                }),
+                                (
+                                    "quantity".into(),
+                                    Expr::BinaryOp {
+                                        left: Box::new(Expr::StateRef("quantity".into())),
+                                        op: BinaryOp::Add,
+                                        right: Box::new(Expr::RowRef("amount".into())),
+                                    },
+                                ),
+                                (
+                                    "cost_basis".into(),
+                                    Expr::BinaryOp {
+                                        left: Box::new(Expr::StateRef("cost_basis".into())),
+                                        op: BinaryOp::Add,
+                                        right: Box::new(Expr::BinaryOp {
+                                            left: Box::new(Expr::RowRef("amount".into())),
+                                            op: BinaryOp::Mul,
+                                            right: Box::new(Expr::RowRef("price".into())),
+                                        }),
+                                    },
+                                ),
                             ],
-                            emits: vec![
-                                ("trade_pnl".into(), Expr::Int(0)),
-                            ],
+                            emits: vec![("trade_pnl".into(), Expr::Int(0))],
                         },
                         WhenBlock {
                             condition: Expr::BinaryOp {
@@ -729,31 +769,39 @@ mod tests {
                                 op: BinaryOp::Eq,
                                 right: Box::new(Expr::Literal("sell".into())),
                             },
-                            lets: vec![
-                                ("avg_cost".into(), Expr::BinaryOp {
+                            lets: vec![(
+                                "avg_cost".into(),
+                                Expr::BinaryOp {
                                     left: Box::new(Expr::StateRef("cost_basis".into())),
                                     op: BinaryOp::Div,
                                     right: Box::new(Expr::StateRef("quantity".into())),
-                                }),
-                            ],
+                                },
+                            )],
                             sets: vec![
-                                ("quantity".into(), Expr::BinaryOp {
-                                    left: Box::new(Expr::StateRef("quantity".into())),
-                                    op: BinaryOp::Sub,
-                                    right: Box::new(Expr::RowRef("amount".into())),
-                                }),
-                                ("cost_basis".into(), Expr::BinaryOp {
-                                    left: Box::new(Expr::StateRef("cost_basis".into())),
-                                    op: BinaryOp::Sub,
-                                    right: Box::new(Expr::BinaryOp {
-                                        left: Box::new(Expr::RowRef("amount".into())),
-                                        op: BinaryOp::Mul,
-                                        right: Box::new(Expr::ColumnRef("avg_cost".into())),
-                                    }),
-                                }),
+                                (
+                                    "quantity".into(),
+                                    Expr::BinaryOp {
+                                        left: Box::new(Expr::StateRef("quantity".into())),
+                                        op: BinaryOp::Sub,
+                                        right: Box::new(Expr::RowRef("amount".into())),
+                                    },
+                                ),
+                                (
+                                    "cost_basis".into(),
+                                    Expr::BinaryOp {
+                                        left: Box::new(Expr::StateRef("cost_basis".into())),
+                                        op: BinaryOp::Sub,
+                                        right: Box::new(Expr::BinaryOp {
+                                            left: Box::new(Expr::RowRef("amount".into())),
+                                            op: BinaryOp::Mul,
+                                            right: Box::new(Expr::ColumnRef("avg_cost".into())),
+                                        }),
+                                    },
+                                ),
                             ],
-                            emits: vec![
-                                ("trade_pnl".into(), Expr::BinaryOp {
+                            emits: vec![(
+                                "trade_pnl".into(),
+                                Expr::BinaryOp {
                                     left: Box::new(Expr::RowRef("amount".into())),
                                     op: BinaryOp::Mul,
                                     right: Box::new(Expr::BinaryOp {
@@ -761,14 +809,12 @@ mod tests {
                                         op: BinaryOp::Sub,
                                         right: Box::new(Expr::ColumnRef("avg_cost".into())),
                                     }),
-                                }),
-                            ],
+                                },
+                            )],
                         },
                     ],
                     always_emit: Some(AlwaysEmit {
-                        emits: vec![
-                            ("position_size".into(), Expr::StateRef("quantity".into())),
-                        ],
+                        emits: vec![("position_size".into(), Expr::StateRef("quantity".into()))],
                     }),
                 },
             }],
@@ -776,7 +822,10 @@ mod tests {
                 name: "position_summary".to_string(),
                 source: "pnl".to_string(),
                 select: vec![
-                    SelectItem { expr: SelectExpr::Column("user".into()), alias: None },
+                    SelectItem {
+                        expr: SelectExpr::Column("user".into()),
+                        alias: None,
+                    },
                     SelectItem {
                         expr: SelectExpr::Agg(AggFunc::Sum, Some("trade_pnl".into())),
                         alias: Some("total_pnl".into()),
@@ -800,8 +849,14 @@ mod tests {
             tables: vec![TableDef {
                 name: "swaps".to_string(),
                 columns: vec![
-                    ColumnDef { name: "pool".to_string(), column_type: ColumnType::String },
-                    ColumnDef { name: "amount".to_string(), column_type: ColumnType::Float64 },
+                    ColumnDef {
+                        name: "pool".to_string(),
+                        column_type: ColumnType::String,
+                    },
+                    ColumnDef {
+                        name: "amount".to_string(),
+                        column_type: ColumnType::Float64,
+                    },
                 ],
                 virtual_table: false,
             }],
@@ -810,7 +865,10 @@ mod tests {
                 name: "pool_volume".to_string(),
                 source: "swaps".to_string(),
                 select: vec![
-                    SelectItem { expr: SelectExpr::Column("pool".into()), alias: None },
+                    SelectItem {
+                        expr: SelectExpr::Column("pool".into()),
+                        alias: None,
+                    },
                     SelectItem {
                         expr: SelectExpr::Agg(AggFunc::Sum, Some("amount".into())),
                         alias: Some("total".into()),
@@ -855,7 +913,10 @@ mod tests {
         assert_eq!(raw_deltas.len(), 2);
         assert_eq!(mv_deltas.len(), 1);
         assert_eq!(mv_deltas[0].operation, DeltaOperation::Insert);
-        assert_eq!(mv_deltas[0].values.get("total"), Some(&Value::Float64(300.0)));
+        assert_eq!(
+            mv_deltas[0].values.get("total"),
+            Some(&Value::Float64(300.0))
+        );
     }
 
     #[test]
@@ -865,14 +926,24 @@ mod tests {
 
         // Block 1000: alice buys 10 @ 2000
         let deltas = engine
-            .process_batch("trades", 1000, vec![make_trade("alice", "buy", 10.0, 2000.0)])
+            .process_batch(
+                "trades",
+                1000,
+                vec![make_trade("alice", "buy", 10.0, 2000.0)],
+            )
             .unwrap();
 
         // Raw insert + MV insert (position_summary)
-        let mv_deltas: Vec<_> = deltas.iter().filter(|d| d.table == "position_summary").collect();
+        let mv_deltas: Vec<_> = deltas
+            .iter()
+            .filter(|d| d.table == "position_summary")
+            .collect();
         assert_eq!(mv_deltas.len(), 1);
         assert_eq!(mv_deltas[0].operation, DeltaOperation::Insert);
-        assert_eq!(mv_deltas[0].values.get("trade_count"), Some(&Value::UInt64(1)));
+        assert_eq!(
+            mv_deltas[0].values.get("trade_count"),
+            Some(&Value::UInt64(1))
+        );
     }
 
     #[test]
@@ -881,20 +952,28 @@ mod tests {
         let mut engine = DeltaEngine::new(&simple_mv_only_schema(), storage);
 
         // Block 1000
-        engine.process_batch("swaps", 1000, vec![
-            HashMap::from([
-                ("pool".to_string(), Value::String("ETH/USDC".into())),
-                ("amount".to_string(), Value::Float64(100.0)),
-            ]),
-        ]).unwrap();
+        engine
+            .process_batch(
+                "swaps",
+                1000,
+                vec![HashMap::from([
+                    ("pool".to_string(), Value::String("ETH/USDC".into())),
+                    ("amount".to_string(), Value::Float64(100.0)),
+                ])],
+            )
+            .unwrap();
 
         // Block 1001
-        engine.process_batch("swaps", 1001, vec![
-            HashMap::from([
-                ("pool".to_string(), Value::String("ETH/USDC".into())),
-                ("amount".to_string(), Value::Float64(200.0)),
-            ]),
-        ]).unwrap();
+        engine
+            .process_batch(
+                "swaps",
+                1001,
+                vec![HashMap::from([
+                    ("pool".to_string(), Value::String("ETH/USDC".into())),
+                    ("amount".to_string(), Value::Float64(200.0)),
+                ])],
+            )
+            .unwrap();
 
         // Rollback block 1001
         let deltas = engine.rollback(1000).unwrap();
@@ -903,7 +982,10 @@ mod tests {
         let mv_deltas: Vec<_> = deltas.iter().filter(|d| d.table == "pool_volume").collect();
         assert_eq!(mv_deltas.len(), 1);
         assert_eq!(mv_deltas[0].operation, DeltaOperation::Update);
-        assert_eq!(mv_deltas[0].values.get("total"), Some(&Value::Float64(100.0)));
+        assert_eq!(
+            mv_deltas[0].values.get("total"),
+            Some(&Value::Float64(100.0))
+        );
 
         // Raw table should emit delete delta
         let raw_deltas: Vec<_> = deltas.iter().filter(|d| d.table == "swaps").collect();
@@ -916,19 +998,27 @@ mod tests {
         let storage = Arc::new(MemoryBackend::new());
         let mut engine = DeltaEngine::new(&simple_mv_only_schema(), storage);
 
-        engine.process_batch("swaps", 1000, vec![
-            HashMap::from([
-                ("pool".to_string(), Value::String("ETH/USDC".into())),
-                ("amount".to_string(), Value::Float64(100.0)),
-            ]),
-        ]).unwrap();
+        engine
+            .process_batch(
+                "swaps",
+                1000,
+                vec![HashMap::from([
+                    ("pool".to_string(), Value::String("ETH/USDC".into())),
+                    ("amount".to_string(), Value::Float64(100.0)),
+                ])],
+            )
+            .unwrap();
 
-        engine.process_batch("swaps", 1001, vec![
-            HashMap::from([
-                ("pool".to_string(), Value::String("ETH/USDC".into())),
-                ("amount".to_string(), Value::Float64(200.0)),
-            ]),
-        ]).unwrap();
+        engine
+            .process_batch(
+                "swaps",
+                1001,
+                vec![HashMap::from([
+                    ("pool".to_string(), Value::String("ETH/USDC".into())),
+                    ("amount".to_string(), Value::Float64(200.0)),
+                ])],
+            )
+            .unwrap();
 
         let mut batch = StorageWriteBatch::new();
         engine.finalize(1000, &mut batch);
@@ -939,7 +1029,10 @@ mod tests {
         let mv_deltas: Vec<_> = deltas.iter().filter(|d| d.table == "pool_volume").collect();
         assert_eq!(mv_deltas.len(), 1);
         // After finalize(1000) + rollback(1001→1000): total should be 100
-        assert_eq!(mv_deltas[0].values.get("total"), Some(&Value::Float64(100.0)));
+        assert_eq!(
+            mv_deltas[0].values.get("total"),
+            Some(&Value::Float64(100.0))
+        );
     }
 
     #[test]
@@ -948,25 +1041,55 @@ mod tests {
         let mut engine = DeltaEngine::new(&dex_schema(), storage);
 
         // Block 1000: alice buys 10 @ 2000
-        engine.process_batch("trades", 1000, vec![make_trade("alice", "buy", 10.0, 2000.0)]).unwrap();
+        engine
+            .process_batch(
+                "trades",
+                1000,
+                vec![make_trade("alice", "buy", 10.0, 2000.0)],
+            )
+            .unwrap();
 
         // Block 1001: alice buys 5 @ 2100
-        engine.process_batch("trades", 1001, vec![make_trade("alice", "buy", 5.0, 2100.0)]).unwrap();
+        engine
+            .process_batch(
+                "trades",
+                1001,
+                vec![make_trade("alice", "buy", 5.0, 2100.0)],
+            )
+            .unwrap();
 
         // Block 1002: alice sells 8 @ 2200 (will be rolled back)
-        engine.process_batch("trades", 1002, vec![make_trade("alice", "sell", 8.0, 2200.0)]).unwrap();
+        engine
+            .process_batch(
+                "trades",
+                1002,
+                vec![make_trade("alice", "sell", 8.0, 2200.0)],
+            )
+            .unwrap();
 
         // Rollback block 1002
         engine.rollback(1001).unwrap();
 
         // Re-ingest block 1002 with different trade
-        let deltas = engine.process_batch("trades", 1002, vec![make_trade("alice", "sell", 3.0, 2300.0)]).unwrap();
+        let deltas = engine
+            .process_batch(
+                "trades",
+                1002,
+                vec![make_trade("alice", "sell", 3.0, 2300.0)],
+            )
+            .unwrap();
 
         // MV should get updated with new trade data
-        let mv_deltas: Vec<_> = deltas.iter().filter(|d| d.table == "position_summary").collect();
+        let mv_deltas: Vec<_> = deltas
+            .iter()
+            .filter(|d| d.table == "position_summary")
+            .collect();
         assert_eq!(mv_deltas.len(), 1);
         assert_eq!(mv_deltas[0].operation, DeltaOperation::Update);
-        assert_eq!(mv_deltas[0].values.get("trade_count"), Some(&Value::UInt64(3)));
+        assert_eq!(
+            mv_deltas[0].values.get("trade_count"),
+            Some(&Value::UInt64(3))
+        );
     }
 
     #[test]
