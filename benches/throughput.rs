@@ -377,7 +377,7 @@ fn bench_reducer_event_rules_only() -> BenchResult {
         .map(|c| c.name.clone())
         .collect();
     let source_registry = ColumnRegistry::new(source_names);
-    let mut engine = ReducerEngine::new(reducer_def, storage, &source_registry);
+    let mut engine = ReducerEngine::new(reducer_def, storage, &source_registry, &[]);
 
     let rows: Vec<RowMap> = (0..total_rows)
         .map(|i| {

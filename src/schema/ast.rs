@@ -125,11 +125,19 @@ pub struct ReducerDef {
     pub group_by: Vec<String>,
     pub state: Vec<StateField>,
     pub body: ReducerBody,
+    pub requires: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModuleDef {
+    pub name: String,
+    pub script: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct Schema {
     pub tables: Vec<TableDef>,
+    pub modules: Vec<ModuleDef>,
     pub reducers: Vec<ReducerDef>,
     pub materialized_views: Vec<MVDef>,
 }

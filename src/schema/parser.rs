@@ -8,8 +8,11 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 pub fn parse_schema(input: &str) -> Result<Schema, Error> {
+    // Split out CREATE MODULE blocks before sqlparser sees them
+    let (input_part, modules) = extract_modules(input)?;
+
     // Split out CREATE REDUCER blocks before sqlparser sees them
-    let (sql_part, reducers) = extract_reducers(input)?;
+    let (sql_part, reducers) = extract_reducers(&input_part)?;
 
     // Preprocess: replace "CREATE VIRTUAL TABLE" with "CREATE TABLE"
     // and track which table names are virtual.
@@ -40,7 +43,7 @@ pub fn parse_schema(input: &str) -> Result<Schema, Error> {
         }
     }
 
-    let schema = Schema { tables, reducers, materialized_views };
+    let schema = Schema { tables, modules, reducers, materialized_views };
     validate_schema(&schema)?;
     Ok(schema)
 }
@@ -334,6 +337,85 @@ fn expr_to_column_name(expr: &sql::Expr) -> Result<String, Error> {
     }
 }
 
+// --- Module parser (hand-written, custom syntax) ---
+
+fn extract_modules(input: &str) -> Result<(String, Vec<ModuleDef>), Error> {
+    let mut sql_parts = String::new();
+    let mut modules = Vec::new();
+    let mut rest = input;
+
+    while let Some(pos) = find_create_module(rest) {
+        sql_parts.push_str(&rest[..pos]);
+        let after = &rest[pos..];
+        let (module, consumed) = parse_module_block(after)?;
+        modules.push(module);
+        rest = &after[consumed..];
+    }
+    sql_parts.push_str(rest);
+
+    Ok((sql_parts, modules))
+}
+
+fn find_create_module(input: &str) -> Option<usize> {
+    let upper = input.to_uppercase();
+    let mut search_from = 0;
+    while let Some(pos) = upper[search_from..].find("CREATE MODULE") {
+        let abs_pos = search_from + pos;
+        if abs_pos == 0
+            || input.as_bytes()[abs_pos - 1].is_ascii_whitespace()
+            || input.as_bytes()[abs_pos - 1] == b';'
+        {
+            return Some(abs_pos);
+        }
+        search_from = abs_pos + 1;
+    }
+    None
+}
+
+fn parse_module_block(input: &str) -> Result<(ModuleDef, usize), Error> {
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut pos = 0;
+
+    // Skip "CREATE MODULE"
+    pos = skip_keyword(input, pos, "CREATE")?;
+    pos = skip_ws(input, pos);
+    pos = skip_keyword(input, pos, "MODULE")?;
+    pos = skip_ws(input, pos);
+
+    // Name
+    let (name, new_pos) = read_identifier(input, pos)?;
+    pos = skip_ws(input, new_pos);
+
+    // Optional "LANGUAGE LUA" (only Lua is supported)
+    let upper_here = input[pos..].to_uppercase();
+    if upper_here.starts_with("LANGUAGE") {
+        pos = skip_keyword(input, pos, "LANGUAGE")?;
+        pos = skip_ws(input, pos);
+        pos = skip_keyword(input, pos, "LUA")?;
+        pos = skip_ws(input, pos);
+    }
+
+    // Optional "AS"
+    let upper_here = input[pos..].to_uppercase();
+    if upper_here.starts_with("AS") {
+        pos = skip_keyword(input, pos, "AS")?;
+        pos = skip_ws(input, pos);
+    }
+
+    // Read $$...$$ block
+    let (script, new_pos) = read_dollar_quoted(input, pos)?;
+    pos = new_pos;
+
+    // Skip optional trailing semicolon
+    pos = skip_ws(input, pos);
+    if pos < len && bytes[pos] == b';' {
+        pos += 1;
+    }
+
+    Ok((ModuleDef { name, script }, pos))
+}
+
 // --- Reducer parser (hand-written, custom syntax) ---
 
 fn extract_reducers(input: &str) -> Result<(String, Vec<ReducerDef>), Error> {
@@ -402,6 +484,17 @@ fn parse_reducer_block(input: &str) -> Result<(ReducerDef, usize), Error> {
     let (state, new_pos) = parse_state_block(input, pos)?;
     pos = skip_ws(input, new_pos);
 
+    // Optional REQUIRE clause (before body)
+    let mut requires = Vec::new();
+    let upper_here = input[pos..].to_uppercase();
+    if upper_here.starts_with("REQUIRE") {
+        pos = skip_keyword(input, pos, "REQUIRE")?;
+        pos = skip_ws(input, pos);
+        let (req_list, new_pos) = read_identifier_list(input, pos)?;
+        requires = req_list;
+        pos = skip_ws(input, new_pos);
+    }
+
     // Body: either LANGUAGE lua PROCESS $$...$$ or WHEN blocks
     let (body, new_pos) = parse_reducer_body(input, pos)?;
     pos = new_pos;
@@ -417,7 +510,7 @@ fn parse_reducer_block(input: &str) -> Result<(ReducerDef, usize), Error> {
         pos += 1;
     }
 
-    Ok((ReducerDef { name, source, group_by, state, body }, pos))
+    Ok((ReducerDef { name, source, group_by, state, requires, body }, pos))
 }
 
 fn parse_state_block(input: &str, start: usize) -> Result<(Vec<StateField>, usize), Error> {
@@ -1258,9 +1351,29 @@ fn is_balanced_parens(input: &str) -> bool {
 fn validate_schema(schema: &Schema) -> Result<(), Error> {
     let table_names: Vec<&str> = schema.tables.iter().map(|t| t.name.as_str()).collect();
     let reducer_names: Vec<&str> = schema.reducers.iter().map(|r| r.name.as_str()).collect();
+    let module_names: Vec<&str> = schema.modules.iter().map(|m| m.name.as_str()).collect();
+
+    // Validate module name uniqueness
+    {
+        let mut seen = std::collections::HashSet::new();
+        for name in &module_names {
+            if !seen.insert(name) {
+                return Err(Error::Schema(format!("duplicate module name: '{name}'")));
+            }
+        }
+    }
 
     // Validate reducers
     for reducer in &schema.reducers {
+        // Validate REQUIRE references
+        for req in &reducer.requires {
+            if !module_names.contains(&req.as_str()) {
+                return Err(Error::Schema(format!(
+                    "reducer '{}': REQUIRE references unknown module '{}'",
+                    reducer.name, req
+                )));
+            }
+        }
         if !table_names.contains(&reducer.source.as_str()) {
             return Err(Error::Schema(format!(
                 "reducer '{}': source table '{}' does not exist",
@@ -1733,5 +1846,80 @@ mod tests {
         let r = &schema.reducers[0];
         assert_eq!(r.state[0].name, "total_received");
         assert_eq!(r.state[0].column_type, ColumnType::Uint256);
+    }
+
+    #[test]
+    fn parse_create_module() {
+        let sql = r#"
+            CREATE MODULE pricing LANGUAGE LUA AS $$
+                local M = {}
+                function M.to_usd(amount, decimals)
+                    return amount / (10 ^ decimals)
+                end
+                return M
+            $$;
+
+            CREATE TABLE swaps (
+                block_number UInt64,
+                token        String,
+                amount       Float64
+            );
+
+            CREATE REDUCER token_stats
+              SOURCE swaps
+              GROUP BY token
+              STATE (
+                volume Float64 DEFAULT 0
+              )
+              REQUIRE pricing
+              LANGUAGE lua
+              PROCESS $$
+                local usd = pricing.to_usd(row.amount, 6)
+                state.volume = state.volume + usd
+                emit.token = row.token
+                emit.volume = state.volume
+              $$;
+        "#;
+        let schema = parse_schema(sql).unwrap();
+        assert_eq!(schema.modules.len(), 1);
+        assert_eq!(schema.modules[0].name, "pricing");
+        assert!(schema.modules[0].script.contains("function M.to_usd"));
+
+        assert_eq!(schema.reducers.len(), 1);
+        assert_eq!(schema.reducers[0].requires, vec!["pricing".to_string()]);
+    }
+
+    #[test]
+    fn parse_module_validation_unknown_require() {
+        let sql = r#"
+            CREATE TABLE events (
+                block_number UInt64,
+                value        Float64
+            );
+
+            CREATE REDUCER counter
+              SOURCE events
+              GROUP BY value
+              STATE (count Float64 DEFAULT 0)
+              REQUIRE nonexistent
+              LANGUAGE lua
+              PROCESS $$
+                state.count = state.count + 1
+              $$;
+        "#;
+        let err = parse_schema(sql).unwrap_err();
+        assert!(err.to_string().contains("nonexistent"));
+    }
+
+    #[test]
+    fn parse_module_duplicate_name() {
+        let sql = r#"
+            CREATE MODULE utils LANGUAGE LUA AS $$ return {} $$;
+            CREATE MODULE utils LANGUAGE LUA AS $$ return {} $$;
+
+            CREATE TABLE t (x UInt64);
+        "#;
+        let err = parse_schema(sql).unwrap_err();
+        assert!(err.to_string().contains("duplicate module"));
     }
 }

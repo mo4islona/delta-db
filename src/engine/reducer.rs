@@ -43,10 +43,22 @@ impl ReducerEngine {
         def: ReducerDef,
         storage: Arc<dyn StorageBackend>,
         source_registry: &crate::types::ColumnRegistry,
+        modules: &[(String, String)],
     ) -> Self {
         let runtime: Box<dyn ReducerRuntime> = match &def.body {
             ReducerBody::EventRules { .. } => Box::new(EventRulesRuntime::new(&def.body)),
             ReducerBody::Lua { script } => {
+                // Filter modules to only those required by this reducer
+                let required_modules: Vec<(String, String)> = def
+                    .requires
+                    .iter()
+                    .filter_map(|name| {
+                        modules
+                            .iter()
+                            .find(|(n, _)| n == name)
+                            .cloned()
+                    })
+                    .collect();
                 let state_fields: Vec<String> =
                     def.state.iter().map(|f| f.name.clone()).collect();
                 let state_types: Vec<(String, crate::types::ColumnType)> =
@@ -56,6 +68,7 @@ impl ReducerEngine {
                     &state_fields,
                     &state_types,
                     source_registry.names(),
+                    &required_modules,
                 ))
             }
         };
@@ -367,6 +380,7 @@ mod tests {
                     default: "0".to_string(),
                 },
             ],
+            requires: vec![],
             body: ReducerBody::EventRules {
                 when_blocks: vec![
                     WhenBlock {
@@ -468,7 +482,7 @@ mod tests {
     #[test]
     fn reducer_processes_rows_and_emits_output() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage, &trade_registry());
+        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage, &trade_registry(), &[]);
 
         let rows = vec![
             make_trade("alice", "buy", 10.0, 2000.0),
@@ -490,7 +504,7 @@ mod tests {
     #[test]
     fn reducer_state_persists_across_blocks() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage, &trade_registry());
+        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage, &trade_registry(), &[]);
 
         // Block 1: buy
         engine.process_block(1000, &[make_trade("alice", "buy", 10.0, 2000.0)]).unwrap();
@@ -507,7 +521,7 @@ mod tests {
     #[test]
     fn reducer_rollback_restores_state() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage, &trade_registry());
+        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage, &trade_registry(), &[]);
 
         // Block 1: buy 10 @ 2000
         engine.process_block(1000, &[make_trade("alice", "buy", 10.0, 2000.0)]).unwrap();
@@ -531,7 +545,7 @@ mod tests {
     #[test]
     fn reducer_multiple_groups() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage, &trade_registry());
+        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage, &trade_registry(), &[]);
 
         let rows = vec![
             make_trade("alice", "buy", 10.0, 2000.0),
@@ -553,7 +567,7 @@ mod tests {
     #[test]
     fn reducer_finalize_then_rollback() {
         let storage = Arc::new(MemoryBackend::new());
-        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage.clone(), &trade_registry());
+        let mut engine = ReducerEngine::new(pnl_reducer_def(), storage.clone(), &trade_registry(), &[]);
 
         // Block 1000: buy 10
         engine.process_block(1000, &[make_trade("alice", "buy", 10.0, 2000.0)]).unwrap();
@@ -591,6 +605,7 @@ mod tests {
                     default: "0".to_string(),
                 },
             ],
+            requires: vec![],
             body: ReducerBody::Lua {
                 script: r#"
                     state.count = state.count + row.value
@@ -601,7 +616,7 @@ mod tests {
 
         let storage = Arc::new(MemoryBackend::new());
         let events_registry = ColumnRegistry::new(vec!["value".to_string()]);
-        let mut engine = ReducerEngine::new(def, storage, &events_registry);
+        let mut engine = ReducerEngine::new(def, storage, &events_registry, &[]);
 
         let reg = Arc::new(events_registry);
         let rows: Vec<Row> = vec![

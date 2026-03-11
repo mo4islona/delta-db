@@ -47,19 +47,22 @@ impl LuaRuntime {
     /// Create a new LuaRuntime without state field or source column optimization.
     /// State is synced via per-field table.get/set calls. All row fields are marshalled.
     pub fn new(script: &str) -> Self {
-        Self::with_state_fields(script, &[], &[], &[])
+        Self::with_state_fields(script, &[], &[], &[], &[])
     }
 
-    /// Create a LuaRuntime with known state field names, types, and source columns.
+    /// Create a LuaRuntime with known state field names, types, source columns, and modules.
     /// State values are passed as function arguments and returned as return values,
     /// eliminating per-field C API calls (~1.3us/row savings for 6-field state).
     /// Source columns enable selective row field marshalling — only fields referenced
     /// in the Lua script are set on the row table, skipping unused columns.
+    /// Modules are loaded before the user script, each executed once with its return
+    /// value stored as a global with the module name.
     pub fn with_state_fields(
         script: &str,
         state_fields: &[String],
         state_types: &[(String, ColumnType)],
         source_columns: &[String],
+        modules: &[(String, String)],
     ) -> Self {
         let lua = Lua::new();
 
@@ -68,6 +71,17 @@ impl LuaRuntime {
 
         // Provide json module
         register_json_module(&lua).expect("failed to register json module");
+
+        // Load required modules: execute each script once, store return value as global
+        for (name, code) in modules {
+            let result: LuaValue = lua
+                .load(code.as_str())
+                .eval()
+                .unwrap_or_else(|e| panic!("failed to load module '{name}': {e}"));
+            lua.globals()
+                .set(name.as_str(), result)
+                .unwrap_or_else(|e| panic!("failed to set module global '{name}': {e}"));
+        }
 
         // Create persistent state and row tables as globals
         let state_table = lua.create_table().expect("failed to create state table");
@@ -872,6 +886,7 @@ mod tests {
             &state_fields,
             &state_types,
             &["token".to_string(), "volume".to_string()],
+            &[],
         );
 
         // Initialize state with JSON default (empty object)
@@ -956,6 +971,7 @@ mod tests {
             &state_fields,
             &state_types,
             &["side".to_string(), "amount".to_string(), "price".to_string()],
+            &[],
         );
 
         let mut state: HashMap<String, Value> = HashMap::from([
@@ -1026,5 +1042,42 @@ mod tests {
         let accessed = compute_accessed_fields(script, &cols);
         // Only skipping 1 field — not worth filtering
         assert!(accessed.is_empty());
+    }
+
+    #[test]
+    fn lua_module_loading() {
+        let modules = vec![(
+            "utils".to_string(),
+            r#"
+            local M = {}
+            function M.double(x) return x * 2 end
+            function M.add(a, b) return a + b end
+            return M
+            "#
+            .to_string(),
+        )];
+
+        let runtime = LuaRuntime::with_state_fields(
+            r#"
+            local doubled = utils.double(row.value)
+            state.total = utils.add(state.total, doubled)
+            emit.result = state.total
+            "#,
+            &["total".to_string()],
+            &[("total".to_string(), ColumnType::Float64)],
+            &["value".to_string()],
+            &modules,
+        );
+
+        let mut state = HashMap::from([("total".to_string(), Value::Float64(0.0))]);
+        let row = Row::from(HashMap::from([("value".to_string(), Value::Float64(5.0))]));
+
+        let out = runtime.process(&mut state, &row);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].get("result"), Some(&Value::Float64(10.0)));
+
+        let row2 = Row::from(HashMap::from([("value".to_string(), Value::Float64(3.0))]));
+        let out2 = runtime.process(&mut state, &row2);
+        assert_eq!(out2[0].get("result"), Some(&Value::Float64(16.0)));
     }
 }
