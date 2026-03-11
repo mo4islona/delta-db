@@ -12,87 +12,72 @@ CREATE TABLE swaps (
     amount1      Float64
 );
 
--- Shared pricing logic: stablecoin constants and USD price resolution.
--- Used by both swap_prices and wallet_pnl reducers.
-CREATE MODULE pricing LANGUAGE LUA AS $$
-    local M = {}
-
-    M.USDT = "0xdac17f958d2ee523a2206206994597c13d831ec7"
-    M.USDC = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
-    M.WETH = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
-
-    function M.is_stablecoin(addr)
-        return addr == M.USDT or addr == M.USDC
-    end
-
-    -- Resolve USD pricing from a swap.
-    -- Returns { target, price_usd, vol_usd, eth_usd, base_delta } or nil.
-    function M.resolve(token0, token1, amount0, amount1, eth_usd)
-        if amount0 == 0 then return nil end
-
-        local ratio = math.abs(amount1 / amount0)
-        local t0 = string.lower(token0)
-        local t1 = string.lower(token1)
-        local r = { eth_usd = eth_usd }
-
-        if M.is_stablecoin(t1) then
-            r.target = t0
-            r.price_usd = ratio
-            r.vol_usd = math.abs(amount1)
-            r.base_delta = amount0
-            if t0 == M.WETH then r.eth_usd = ratio end
-
-        elseif M.is_stablecoin(t0) then
-            r.target = t1
-            r.price_usd = ratio > 0 and (1 / ratio) or 0
-            r.vol_usd = math.abs(amount0)
-            r.base_delta = amount1
-            if t1 == M.WETH then r.eth_usd = r.price_usd end
-
-        elseif t1 == M.WETH then
-            r.target = t0
-            r.price_usd = ratio * eth_usd
-            r.vol_usd = math.abs(amount1) * eth_usd
-            r.base_delta = amount0
-
-        elseif t0 == M.WETH then
-            r.target = t1
-            r.price_usd = ratio > 0 and (eth_usd / ratio) or 0
-            r.vol_usd = math.abs(amount0) * eth_usd
-            r.base_delta = amount1
-
-        else
-            return nil
-        end
-
-        if r.price_usd <= 0 then return nil end
-        return r
-    end
-
-    return M
-$$;
-
 -- Price oracle: computes USD price for each swap.
 -- Groups by network (constant) to maintain a global ETH/USD reference.
 -- Cross-prices tokens via ETH when no direct stablecoin pair exists.
+-- Passes through sender and base_delta for downstream wallet_pnl reducer.
 CREATE REDUCER swap_prices
 SOURCE swaps
 GROUP BY network
 STATE (
     eth_usd Float64 DEFAULT 0
 )
-REQUIRE pricing
 LANGUAGE lua
 PROCESS $$
-    local p = pricing.resolve(row.token0, row.token1, row.amount0, row.amount1, state.eth_usd)
-    if not p then return end
+    local USDT = "0xdac17f958d2ee523a2206206994597c13d831ec7"
+    local USDC = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+    local WETH = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
 
-    state.eth_usd = p.eth_usd
-    emit.pool = row.pool
-    emit.token = p.target
-    emit.block_time = row.block_time
-    emit.price_usd = p.price_usd
-    emit.volume_usd = p.vol_usd
+    if row.amount0 == 0 then return end
+
+    local ratio = math.abs(row.amount1 / row.amount0)
+    local t0 = string.lower(row.token0)
+    local t1 = string.lower(row.token1)
+    local price_usd = 0
+    local target = ""
+    local vol_usd = 0
+    local base_delta = 0
+
+    -- Case 1: token1 is stablecoin -> direct pricing
+    if t1 == USDT or t1 == USDC then
+        price_usd = ratio
+        target = t0
+        base_delta = row.amount0
+        if t0 == WETH then state.eth_usd = price_usd end
+        vol_usd = math.abs(row.amount1)
+
+    -- Case 2: token0 is stablecoin -> inverse pricing
+    elseif t0 == USDT or t0 == USDC then
+        if ratio > 0 then price_usd = 1 / ratio end
+        target = t1
+        base_delta = row.amount1
+        if t1 == WETH then state.eth_usd = price_usd end
+        vol_usd = math.abs(row.amount0)
+
+    -- Case 3: token1 is WETH -> cross via ETH
+    elseif t1 == WETH then
+        price_usd = ratio * state.eth_usd
+        target = t0
+        base_delta = row.amount0
+        vol_usd = math.abs(row.amount1) * state.eth_usd
+
+    -- Case 4: token0 is WETH -> cross via ETH (inverted)
+    elseif t0 == WETH then
+        if ratio > 0 then price_usd = state.eth_usd / ratio end
+        target = t1
+        base_delta = row.amount1
+        vol_usd = math.abs(row.amount0) * state.eth_usd
+    end
+
+    if price_usd > 0 then
+        emit.pool = row.pool
+        emit.token = target
+        emit.block_time = row.block_time
+        emit.price_usd = price_usd
+        emit.volume_usd = vol_usd
+        emit.sender = row.sender
+        emit.base_delta = base_delta
+    end
 $$;
 
 -- OHLC 5-minute candles per pool, in USD
@@ -109,38 +94,31 @@ SELECT
 FROM swap_prices
 GROUP BY pool, window_start;
 
--- Wallet PnL tracker: USD-denominated position tracking.
--- Groups by network (constant) to maintain global price + position state.
+-- Wallet PnL tracker: sources from swap_prices (chained reducer).
+-- Price resolution is already done; this reducer only tracks positions.
+-- Groups by sender so each wallet has its own small positions state.
 CREATE REDUCER wallet_pnl
-SOURCE swaps
-GROUP BY network
+SOURCE swap_prices
+GROUP BY sender
 STATE (
-    eth_usd       Float64 DEFAULT 0,
-    positions    JSON    DEFAULT '{}'
+    positions JSON DEFAULT '{}'
 )
-REQUIRE pricing
 LANGUAGE lua
 PROCESS $$
-    local p = pricing.resolve(row.token0, row.token1, row.amount0, row.amount1, state.eth_usd)
-    if not p then return end
-
-    state.eth_usd = p.eth_usd
-
-    -- Track position and realized PnL (cost-basis accounting)
-    local pos_key = row.sender .. ":" .. p.target
+    local pos_key = row.token
     local pos = state.positions[pos_key]
     if not pos then pos = { balance = 0, cost_usd = 0 } end
 
     local pnl = 0
-    if p.base_delta > 0 then
+    if row.base_delta > 0 then
         -- Buy: accumulate cost basis
-        pos.balance = pos.balance + p.base_delta
-        pos.cost_usd = pos.cost_usd + p.base_delta * p.price_usd
-    elseif p.base_delta < 0 and pos.balance > 0 then
+        pos.balance = pos.balance + row.base_delta
+        pos.cost_usd = pos.cost_usd + row.base_delta * row.price_usd
+    elseif row.base_delta < 0 and pos.balance > 0 then
         -- Sell: realize PnL vs average cost
-        local sold = math.abs(p.base_delta)
+        local sold = math.abs(row.base_delta)
         local avg_cost = pos.cost_usd / pos.balance
-        pnl = sold * (p.price_usd - avg_cost)
+        pnl = sold * (row.price_usd - avg_cost)
         pos.balance = pos.balance - sold
         pos.cost_usd = pos.cost_usd - sold * avg_cost
     end
