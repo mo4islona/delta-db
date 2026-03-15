@@ -116,6 +116,11 @@ pub enum ReducerBody {
     Lua {
         script: String,
     },
+    /// Reducer logic provided by the host language (e.g., TypeScript via napi).
+    /// The `id` ties this definition to a registered callback.
+    External {
+        id: String,
+    },
 }
 
 #[derive(Debug, Clone)]

@@ -495,9 +495,16 @@ fn parse_reducer_block(input: &str) -> Result<(ReducerDef, usize), Error> {
         pos = skip_ws(input, new_pos);
     }
 
-    // Body: either LANGUAGE lua PROCESS $$...$$ or WHEN blocks
-    let (body, new_pos) = parse_reducer_body(input, pos)?;
+    // Body: either LANGUAGE lua PROCESS $$...$$ or LANGUAGE EXTERNAL or WHEN blocks
+    let (mut body, new_pos) = parse_reducer_body(input, pos)?;
     pos = new_pos;
+
+    // Fill in External id with reducer name if empty
+    if let ReducerBody::External { ref mut id } = body {
+        if id.is_empty() {
+            *id = name.clone();
+        }
+    }
 
     // Skip optional END keyword and trailing semicolon
     pos = skip_ws(input, pos);
@@ -557,15 +564,32 @@ fn parse_state_block(input: &str, start: usize) -> Result<(Vec<StateField>, usiz
 fn parse_reducer_body(input: &str, start: usize) -> Result<(ReducerBody, usize), Error> {
     let upper = input[start..].to_uppercase();
     if upper.starts_with("LANGUAGE") {
-        parse_lua_body(input, start)
+        // Check for LANGUAGE EXTERNAL vs LANGUAGE LUA
+        let after_lang = upper["LANGUAGE".len()..].trim_start();
+        if after_lang.starts_with("EXTERNAL") {
+            parse_external_body(input, start)
+        } else {
+            parse_lua_body(input, start)
+        }
     } else if upper.starts_with("WHEN") || upper.starts_with("ALWAYS") {
         parse_event_rules_body(input, start)
     } else {
         Err(Error::Schema(format!(
-            "expected WHEN or LANGUAGE after STATE, got: '{}'",
+            "expected WHEN, LANGUAGE, or LANGUAGE EXTERNAL after STATE, got: '{}'",
             &input[start..std::cmp::min(start + 30, input.len())]
         )))
     }
+}
+
+fn parse_external_body(input: &str, start: usize) -> Result<(ReducerBody, usize), Error> {
+    let mut pos = start;
+    pos = skip_keyword(input, pos, "LANGUAGE")?;
+    pos = skip_ws(input, pos);
+    pos = skip_keyword(input, pos, "EXTERNAL")?;
+    pos = skip_ws(input, pos);
+
+    // The id defaults to empty — filled with the reducer name post-parse
+    Ok((ReducerBody::External { id: String::new() }, pos))
 }
 
 fn parse_lua_body(input: &str, start: usize) -> Result<(ReducerBody, usize), Error> {

@@ -134,6 +134,23 @@ impl DeltaDb {
         })
     }
 
+    /// Replace the runtime for a named reducer (for External/FnReducer injection).
+    pub fn set_reducer_runtime(&mut self, name: &str, runtime: Box<dyn crate::reducer_runtime::ReducerRuntime>) {
+        self.engine.set_reducer_runtime(name, runtime);
+    }
+
+    /// Register an external reducer definition.
+    /// The reducer is added to the engine's pipeline.
+    /// Must be called before any data processing.
+    pub fn register_reducer(&mut self, def: crate::schema::ast::ReducerDef) -> Result<()> {
+        self.engine.add_reducer(def, self.storage.clone())
+    }
+
+    /// Check if a reducer with the given name already exists in the engine.
+    pub fn has_reducer(&self, name: &str) -> bool {
+        self.engine.has_reducer(name)
+    }
+
     /// Process a batch of rows for a raw table at the given block number.
     /// Delta records are buffered internally.
     /// Returns true if backpressure should be applied (buffer is full).
@@ -944,5 +961,194 @@ mod tests {
             let total_pnl = mv_records[0].values.get("total_pnl").unwrap().as_f64().unwrap();
             assert!((total_pnl - 1194.44).abs() < 1.0);
         }
+    }
+
+    // ─── External (FnReducer) integration tests ─────────────────
+
+    const EXTERNAL_PNL_SCHEMA: &str = r#"
+        CREATE TABLE trades (
+            block_number UInt64,
+            user String,
+            side String,
+            amount Float64,
+            price Float64
+        );
+
+        CREATE REDUCER pnl
+        SOURCE trades
+        GROUP BY user
+        STATE (
+            quantity Float64 DEFAULT 0,
+            cost_basis Float64 DEFAULT 0
+        )
+        LANGUAGE EXTERNAL;
+
+        CREATE MATERIALIZED VIEW position_summary AS
+        SELECT
+            user,
+            sum(trade_pnl) AS total_pnl,
+            last(position_size) AS current_position,
+            count() AS trade_count
+        FROM pnl
+        GROUP BY user;
+    "#;
+
+    fn pnl_fn_runtime() -> crate::reducer_runtime::fn_reducer::FnReducerRuntime {
+        crate::reducer_runtime::fn_reducer::FnReducerRuntime::new(|state, row| {
+            let side = row.get("side").and_then(|v| v.as_str()).unwrap_or("");
+            let amount = row.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let price = row.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let qty = state.get("quantity").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let cost = state.get("cost_basis").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+            let mut emit = HashMap::new();
+            if side == "buy" {
+                state.insert("quantity".into(), Value::Float64(qty + amount));
+                state.insert("cost_basis".into(), Value::Float64(cost + amount * price));
+                emit.insert("trade_pnl".into(), Value::Float64(0.0));
+            } else {
+                let avg_cost = if qty > 0.0 { cost / qty } else { 0.0 };
+                emit.insert("trade_pnl".into(), Value::Float64(amount * (price - avg_cost)));
+                state.insert("quantity".into(), Value::Float64(qty - amount));
+                state.insert("cost_basis".into(), Value::Float64(cost - amount * avg_cost));
+            }
+            let new_qty = state.get("quantity").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            emit.insert("position_size".into(), Value::Float64(new_qty));
+            vec![emit]
+        })
+    }
+
+    fn open_with_fn_reducer() -> DeltaDb {
+        let mut db = DeltaDb::open(Config::new(EXTERNAL_PNL_SCHEMA)).unwrap();
+        db.set_reducer_runtime("pnl", Box::new(pnl_fn_runtime()));
+        db
+    }
+
+    #[test]
+    fn external_reducer_full_pipeline() {
+        let mut db = open_with_fn_reducer();
+
+        db.process_batch("trades", 1000, vec![
+            make_trade("alice", "buy", 10.0, 2000.0),
+        ]).unwrap();
+        db.process_batch("trades", 1001, vec![
+            make_trade("alice", "sell", 5.0, 2200.0),
+        ]).unwrap();
+
+        let batch = db.flush().unwrap();
+        let mv = batch.records_for("position_summary");
+        assert_eq!(mv.len(), 1);
+        assert_eq!(mv[0].values.get("trade_count"), Some(&Value::UInt64(2)));
+        assert_eq!(mv[0].values.get("current_position"), Some(&Value::Float64(5.0)));
+
+        let pnl = mv[0].values.get("total_pnl").unwrap().as_f64().unwrap();
+        assert!((pnl - 1000.0).abs() < 0.01); // 5*(2200-2000)
+    }
+
+    #[test]
+    fn external_reducer_rollback() {
+        let mut db = open_with_fn_reducer();
+
+        db.process_batch("trades", 1000, vec![
+            make_trade("alice", "buy", 10.0, 2000.0),
+        ]).unwrap();
+        db.process_batch("trades", 1001, vec![
+            make_trade("alice", "buy", 5.0, 2100.0),
+        ]).unwrap();
+        db.flush();
+
+        db.rollback(1000).unwrap();
+
+        // Re-ingest different trade
+        db.process_batch("trades", 1001, vec![
+            make_trade("alice", "sell", 3.0, 2200.0),
+        ]).unwrap();
+
+        let batch = db.flush().unwrap();
+        let mv = batch.records_for("position_summary");
+        assert_eq!(mv.len(), 1);
+        assert_eq!(mv[0].values.get("trade_count"), Some(&Value::UInt64(2)));
+        assert_eq!(mv[0].values.get("current_position"), Some(&Value::Float64(7.0)));
+    }
+
+    #[test]
+    fn external_reducer_matches_event_rules() {
+        // Run same workload through EventRules and FnReducer, compare MV output
+        let mut er_db = DeltaDb::open(Config::new(DEX_SCHEMA)).unwrap();
+        let mut fn_db = open_with_fn_reducer();
+
+        let trades = vec![
+            make_trade("alice", "buy", 10.0, 2000.0),
+            make_trade("bob", "buy", 20.0, 1500.0),
+            make_trade("alice", "buy", 5.0, 2100.0),
+        ];
+        let trades2 = vec![
+            make_trade("alice", "sell", 8.0, 2200.0),
+            make_trade("bob", "sell", 10.0, 1600.0),
+        ];
+
+        er_db.process_batch("trades", 1000, trades.clone()).unwrap();
+        er_db.process_batch("trades", 1001, trades2.clone()).unwrap();
+        let er_batch = er_db.flush().unwrap();
+
+        fn_db.process_batch("trades", 1000, trades).unwrap();
+        fn_db.process_batch("trades", 1001, trades2).unwrap();
+        let fn_batch = fn_db.flush().unwrap();
+
+        let er_mv = er_batch.records_for("position_summary");
+        let fn_mv = fn_batch.records_for("position_summary");
+        assert_eq!(er_mv.len(), fn_mv.len());
+
+        for er_rec in er_mv.iter() {
+            let key = er_rec.key.get("user").unwrap();
+            let fn_rec = fn_mv.iter().find(|r| r.key.get("user") == Some(key)).unwrap();
+
+            let er_pnl = er_rec.values.get("total_pnl").unwrap().as_f64().unwrap();
+            let fn_pnl = fn_rec.values.get("total_pnl").unwrap().as_f64().unwrap();
+            assert!((er_pnl - fn_pnl).abs() < 0.01,
+                "PnL mismatch for {key:?}: EventRules={er_pnl}, FnReducer={fn_pnl}");
+
+            assert_eq!(
+                er_rec.values.get("current_position"),
+                fn_rec.values.get("current_position"),
+                "position mismatch for {key:?}"
+            );
+            assert_eq!(
+                er_rec.values.get("trade_count"),
+                fn_rec.values.get("trade_count"),
+                "trade_count mismatch for {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_reducer_multi_group_rollback() {
+        let mut db = open_with_fn_reducer();
+
+        db.process_batch("trades", 1000, vec![
+            make_trade("alice", "buy", 10.0, 2000.0),
+            make_trade("bob", "buy", 5.0, 3000.0),
+        ]).unwrap();
+        db.process_batch("trades", 1001, vec![
+            make_trade("alice", "sell", 5.0, 2200.0),
+            make_trade("bob", "sell", 3.0, 3100.0),
+        ]).unwrap();
+        db.flush();
+
+        // Rollback block 1001
+        db.rollback(1000).unwrap();
+        let batch = db.flush().unwrap();
+
+        let mv = batch.records_for("position_summary");
+        assert_eq!(mv.len(), 2);
+
+        let alice = mv.iter().find(|r| r.key.get("user") == Some(&Value::String("alice".into()))).unwrap();
+        let bob = mv.iter().find(|r| r.key.get("user") == Some(&Value::String("bob".into()))).unwrap();
+
+        // After rollback: only block 1000 data remains
+        assert_eq!(alice.values.get("current_position"), Some(&Value::Float64(10.0)));
+        assert_eq!(bob.values.get("current_position"), Some(&Value::Float64(5.0)));
+        assert_eq!(alice.values.get("trade_count"), Some(&Value::UInt64(1)));
+        assert_eq!(bob.values.get("trade_count"), Some(&Value::UInt64(1)));
     }
 }

@@ -6,7 +6,7 @@ use rustc_hash::FxHashMap;
 use crate::error::Result;
 use crate::reducer_runtime::event_rules::EventRulesRuntime;
 use crate::reducer_runtime::lua::LuaRuntime;
-use crate::reducer_runtime::ReducerRuntime;
+use crate::reducer_runtime::{GroupBatch, ReducerRuntime};
 use crate::schema::ast::{ReducerBody, ReducerDef};
 use crate::storage::{self, StorageBackend, StorageWriteBatch};
 use crate::types::{BlockNumber, ColumnId, ColumnRegistry, GroupKey, Row, RowMap, Value};
@@ -48,33 +48,9 @@ impl ReducerEngine {
         source_registry: &crate::types::ColumnRegistry,
         modules: &[(String, String)],
     ) -> Self {
-        let runtime: Box<dyn ReducerRuntime> = match &def.body {
-            ReducerBody::EventRules { .. } => Box::new(EventRulesRuntime::new(&def.body)),
-            ReducerBody::Lua { script } => {
-                // Filter modules to only those required by this reducer
-                let required_modules: Vec<(String, String)> = def
-                    .requires
-                    .iter()
-                    .filter_map(|name| {
-                        modules
-                            .iter()
-                            .find(|(n, _)| n == name)
-                            .cloned()
-                    })
-                    .collect();
-                let state_fields: Vec<String> =
-                    def.state.iter().map(|f| f.name.clone()).collect();
-                let state_types: Vec<(String, crate::types::ColumnType)> =
-                    def.state.iter().map(|f| (f.name.clone(), f.column_type.clone())).collect();
-                Box::new(LuaRuntime::with_state_fields(
-                    script,
-                    &state_fields,
-                    &state_types,
-                    source_registry.names(),
-                    &required_modules,
-                ))
-            }
-        };
+        let runtime: Box<dyn ReducerRuntime> = Self::make_runtime(
+            &def, source_registry, modules,
+        );
 
         // Pre-compute column IDs for group-by columns
         let group_by_ids: Vec<Option<ColumnId>> = def
@@ -98,6 +74,46 @@ impl ReducerEngine {
         }
     }
 
+    /// Build a runtime for the given reducer definition.
+    fn make_runtime(
+        def: &ReducerDef,
+        source_registry: &ColumnRegistry,
+        modules: &[(String, String)],
+    ) -> Box<dyn ReducerRuntime> {
+        match &def.body {
+            ReducerBody::EventRules { .. } => Box::new(EventRulesRuntime::new(&def.body)),
+            ReducerBody::Lua { script } => {
+                let required_modules: Vec<(String, String)> = def
+                    .requires
+                    .iter()
+                    .filter_map(|name| {
+                        modules
+                            .iter()
+                            .find(|(n, _)| n == name)
+                            .cloned()
+                    })
+                    .collect();
+                let state_fields: Vec<String> =
+                    def.state.iter().map(|f| f.name.clone()).collect();
+                let state_types: Vec<(String, crate::types::ColumnType)> =
+                    def.state.iter().map(|f| (f.name.clone(), f.column_type.clone())).collect();
+                Box::new(LuaRuntime::with_state_fields(
+                    script,
+                    &state_fields,
+                    &state_types,
+                    source_registry.names(),
+                    &required_modules,
+                ))
+            }
+            ReducerBody::External { id } => {
+                Box::new(crate::reducer_runtime::external::ExternalRuntime::new(id.clone()))
+            }
+        }
+    }
+
+    /// Create a ReducerEngine that sources from another reducer's output.
+    /// The source registry and group_by_ids are built dynamically per-batch
+    /// since the upstream reducer's output columns are not known at construction time.
     /// Create a ReducerEngine that sources from another reducer's output.
     /// The source registry and group_by_ids are built dynamically per-batch
     /// since the upstream reducer's output columns are not known at construction time.
@@ -106,30 +122,8 @@ impl ReducerEngine {
         storage: Arc<dyn StorageBackend>,
         modules: &[(String, String)],
     ) -> Self {
-        let runtime: Box<dyn ReducerRuntime> = match &def.body {
-            ReducerBody::EventRules { .. } => Box::new(EventRulesRuntime::new(&def.body)),
-            ReducerBody::Lua { script } => {
-                let required_modules: Vec<(String, String)> = def
-                    .requires
-                    .iter()
-                    .filter_map(|name| modules.iter().find(|(n, _)| n == name).cloned())
-                    .collect();
-                let state_fields: Vec<String> =
-                    def.state.iter().map(|f| f.name.clone()).collect();
-                let state_types: Vec<(String, crate::types::ColumnType)> =
-                    def.state.iter().map(|f| (f.name.clone(), f.column_type.clone())).collect();
-                // Empty source_columns — no accessed_fields optimization for chained reducers
-                Box::new(LuaRuntime::with_state_fields(
-                    script,
-                    &state_fields,
-                    &state_types,
-                    &[],
-                    &required_modules,
-                ))
-            }
-        };
-
-        let empty_registry = Arc::new(ColumnRegistry::new(vec![]));
+        let empty_registry = ColumnRegistry::new(vec![]);
+        let runtime = Self::make_runtime(&def, &empty_registry, modules);
 
         Self {
             def,
@@ -139,8 +133,35 @@ impl ReducerEngine {
             block_snapshots: FxHashMap::default(),
             block_groups: BTreeMap::new(),
             group_by_ids: vec![],
-            source_registry: empty_registry,
+            source_registry: Arc::new(empty_registry),
             chained: true,
+        }
+    }
+
+    /// Create a ReducerEngine with a custom runtime (for FnReducerRuntime / external).
+    pub fn with_runtime(
+        def: ReducerDef,
+        storage: Arc<dyn StorageBackend>,
+        source_registry: &ColumnRegistry,
+        runtime: Box<dyn ReducerRuntime>,
+    ) -> Self {
+        let group_by_ids: Vec<Option<ColumnId>> = def
+            .group_by
+            .iter()
+            .map(|col| source_registry.get_id(col))
+            .collect();
+        let source_registry = Arc::new(source_registry.clone());
+
+        Self {
+            def,
+            runtime,
+            storage,
+            state_cache: FxHashMap::default(),
+            block_snapshots: FxHashMap::default(),
+            block_groups: BTreeMap::new(),
+            group_by_ids,
+            source_registry,
+            chained: false,
         }
     }
 
@@ -152,13 +173,42 @@ impl ReducerEngine {
         &self.def.source
     }
 
+    /// Whether this reducer uses an external (host-language) runtime.
+    pub fn is_external(&self) -> bool {
+        matches!(self.def.body, ReducerBody::External { .. })
+    }
+
+    /// Replace the runtime (used to inject external/fn runtimes after construction).
+    pub fn set_runtime(&mut self, runtime: Box<dyn ReducerRuntime>) {
+        self.runtime = runtime;
+    }
+
     /// Process a batch of rows for a given block.
     /// Returns enriched output rows (one per input row that produced emit output).
     ///
     /// State is updated in memory only. A snapshot of each touched group key's
     /// state is saved in `block_snapshots` at the end of the block — no storage
     /// I/O or serialization happens here.
+    ///
+    /// Two code paths:
+    /// - **Per-row** (default): iterates rows in order, calls `process()` per row.
+    ///   No extra allocations. Used by Lua and EventRules.
+    /// - **Batched**: groups rows by key, calls `process_grouped()` once per block.
+    ///   Used by external (host-language) reducers to minimize FFI overhead.
     pub fn process_block(
+        &mut self,
+        block: BlockNumber,
+        rows: &[Row],
+    ) -> Result<Vec<RowMap>> {
+        if self.runtime.use_batched_processing() {
+            self.process_block_batched(block, rows)
+        } else {
+            self.process_block_per_row(block, rows)
+        }
+    }
+
+    /// Fast per-row path: no grouping overhead, no row cloning.
+    fn process_block_per_row(
         &mut self,
         block: BlockNumber,
         rows: &[Row],
@@ -203,6 +253,84 @@ impl ReducerEngine {
                 .or_default()
                 .insert(block, state.clone());
             block_keys.insert(group_key_bytes);
+        }
+
+        Ok(output_maps)
+    }
+
+    /// Batched path: groups rows by key, calls process_grouped() once.
+    /// Avoids per-row FFI overhead for external reducers.
+    fn process_block_batched(
+        &mut self,
+        block: BlockNumber,
+        rows: &[Row],
+    ) -> Result<Vec<RowMap>> {
+        // Phase 1: Group rows by key, load states
+        let mut key_order: Vec<Vec<u8>> = Vec::new();
+        let mut group_map: HashMap<Vec<u8>, (usize, Vec<usize>)> = HashMap::new();
+
+        for (row_idx, row) in rows.iter().enumerate() {
+            let key = self.compute_group_key_bytes(row);
+
+            if !self.state_cache.contains_key(&key) {
+                let state = self.load_state(&key)?;
+                self.state_cache.insert(key.clone(), state);
+            }
+
+            group_map
+                .entry(key.clone())
+                .or_insert_with(|| {
+                    let idx = key_order.len();
+                    key_order.push(key);
+                    (idx, Vec::new())
+                })
+                .1
+                .push(row_idx);
+        }
+
+        // Build GroupBatch array — take states out of cache for the batch call
+        let mut batches: Vec<GroupBatch> = key_order
+            .iter()
+            .map(|key| {
+                let (_, row_indices) = &group_map[key];
+                let state = self.state_cache.remove(key).unwrap();
+                GroupBatch {
+                    state,
+                    rows: row_indices.iter().map(|&i| rows[i].clone()).collect(),
+                    emits: Vec::new(),
+                }
+            })
+            .collect();
+
+        // Phase 2: Single batch call
+        self.runtime.process_grouped(&mut batches);
+
+        // Phase 3: Collect results — restore states, save snapshots, enrich emits
+        let mut output_maps: Vec<RowMap> = Vec::new();
+        let block_keys = self.block_groups.entry(block).or_default();
+
+        for (i, batch) in batches.into_iter().enumerate() {
+            let key = &key_order[i];
+            let (_, row_indices) = &group_map[key];
+
+            self.state_cache.insert(key.clone(), batch.state);
+
+            let state = self.state_cache.get(key).unwrap();
+            self.block_snapshots
+                .entry(key.clone())
+                .or_default()
+                .insert(block, state.clone());
+            block_keys.insert(key.clone());
+
+            let first_row = &rows[row_indices[0]];
+            for mut emit_row in batch.emits {
+                for col in &self.def.group_by {
+                    if let Some(v) = first_row.get(col.as_str()) {
+                        emit_row.entry(col.clone()).or_insert_with(|| v.clone());
+                    }
+                }
+                output_maps.push(emit_row);
+            }
         }
 
         Ok(output_maps)
@@ -697,5 +825,159 @@ mod tests {
         assert_eq!(output.len(), 2);
         assert_eq!(output[0].get("total"), Some(&Value::Float64(10.0)));
         assert_eq!(output[1].get("total"), Some(&Value::Float64(30.0)));
+    }
+
+    // ─── FnReducerRuntime tests ─────────────────────────────────
+
+    fn pnl_fn_runtime() -> crate::reducer_runtime::fn_reducer::FnReducerRuntime {
+        crate::reducer_runtime::fn_reducer::FnReducerRuntime::new(|state, row| {
+            let side = row.get("side").and_then(|v| v.as_str()).unwrap_or("");
+            let amount = row.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let price = row.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let qty = state.get("quantity").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let cost = state.get("cost_basis").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+            let mut emit = HashMap::new();
+            if side == "buy" {
+                state.insert("quantity".into(), Value::Float64(qty + amount));
+                state.insert("cost_basis".into(), Value::Float64(cost + amount * price));
+                emit.insert("trade_pnl".into(), Value::Float64(0.0));
+            } else {
+                let avg_cost = if qty > 0.0 { cost / qty } else { 0.0 };
+                emit.insert("trade_pnl".into(), Value::Float64(amount * (price - avg_cost)));
+                state.insert("quantity".into(), Value::Float64(qty - amount));
+                state.insert("cost_basis".into(), Value::Float64(cost - amount * avg_cost));
+            }
+            let new_qty = state.get("quantity").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            emit.insert("position_size".into(), Value::Float64(new_qty));
+            vec![emit]
+        })
+    }
+
+    fn pnl_external_def() -> ReducerDef {
+        ReducerDef {
+            name: "pnl".to_string(),
+            source: "trades".to_string(),
+            group_by: vec!["user".to_string()],
+            state: vec![
+                StateField {
+                    name: "quantity".to_string(),
+                    column_type: crate::types::ColumnType::Float64,
+                    default: "0".to_string(),
+                },
+                StateField {
+                    name: "cost_basis".to_string(),
+                    column_type: crate::types::ColumnType::Float64,
+                    default: "0".to_string(),
+                },
+            ],
+            requires: vec![],
+            body: ReducerBody::External { id: "pnl".to_string() },
+        }
+    }
+
+    #[test]
+    fn fn_reducer_produces_same_output_as_event_rules() {
+        let storage = Arc::new(MemoryBackend::new());
+        let mut fn_engine = ReducerEngine::with_runtime(
+            pnl_external_def(),
+            storage.clone(),
+            &trade_registry(),
+            Box::new(pnl_fn_runtime()),
+        );
+
+        let storage2 = Arc::new(MemoryBackend::new());
+        let mut er_engine = ReducerEngine::new(
+            pnl_reducer_def(),
+            storage2,
+            &trade_registry(),
+            &[],
+        );
+
+        let rows = vec![
+            make_trade("alice", "buy", 10.0, 2000.0),
+            make_trade("alice", "buy", 5.0, 2100.0),
+        ];
+
+        let fn_out = fn_engine.process_block(1000, &rows).unwrap();
+        let er_out = er_engine.process_block(1000, &rows).unwrap();
+
+        assert_eq!(fn_out.len(), er_out.len());
+        for (f, e) in fn_out.iter().zip(er_out.iter()) {
+            let f_pos = f.get("position_size").unwrap().as_f64().unwrap();
+            let e_pos = e.get("position_size").unwrap().as_f64().unwrap();
+            assert!((f_pos - e_pos).abs() < 0.001, "position_size mismatch: {} vs {}", f_pos, e_pos);
+        }
+    }
+
+    #[test]
+    fn fn_reducer_state_persists_across_blocks() {
+        let storage = Arc::new(MemoryBackend::new());
+        let mut engine = ReducerEngine::with_runtime(
+            pnl_external_def(),
+            storage,
+            &trade_registry(),
+            Box::new(pnl_fn_runtime()),
+        );
+
+        engine.process_block(1000, &[make_trade("alice", "buy", 10.0, 2000.0)]).unwrap();
+        let output = engine.process_block(1001, &[make_trade("alice", "sell", 5.0, 2200.0)]).unwrap();
+
+        let pnl = output[0].get("trade_pnl").unwrap().as_f64().unwrap();
+        assert!((pnl - 1000.0).abs() < 0.01); // 5 * (2200 - 2000)
+        assert_eq!(output[0].get("position_size"), Some(&Value::Float64(5.0)));
+    }
+
+    #[test]
+    fn fn_reducer_rollback_restores_state() {
+        let storage = Arc::new(MemoryBackend::new());
+        let mut engine = ReducerEngine::with_runtime(
+            pnl_external_def(),
+            storage,
+            &trade_registry(),
+            Box::new(pnl_fn_runtime()),
+        );
+
+        engine.process_block(1000, &[make_trade("alice", "buy", 10.0, 2000.0)]).unwrap();
+        engine.process_block(1001, &[make_trade("alice", "buy", 5.0, 2100.0)]).unwrap();
+
+        engine.rollback(1000).unwrap();
+
+        let output = engine.process_block(1001, &[make_trade("alice", "sell", 3.0, 2200.0)]).unwrap();
+        let pnl = output[0].get("trade_pnl").unwrap().as_f64().unwrap();
+        // After rollback: qty=10, cost=20000, avg=2000. sell 3@2200: pnl = 3*(2200-2000) = 600
+        assert!((pnl - 600.0).abs() < 0.01);
+        assert_eq!(output[0].get("position_size"), Some(&Value::Float64(7.0)));
+    }
+
+    #[test]
+    fn fn_reducer_multiple_groups() {
+        let storage = Arc::new(MemoryBackend::new());
+        let mut engine = ReducerEngine::with_runtime(
+            pnl_external_def(),
+            storage,
+            &trade_registry(),
+            Box::new(pnl_fn_runtime()),
+        );
+
+        let rows = vec![
+            make_trade("alice", "buy", 10.0, 2000.0),
+            make_trade("bob", "buy", 5.0, 3000.0),
+            make_trade("alice", "buy", 3.0, 2100.0),
+        ];
+
+        let output = engine.process_block(1000, &rows).unwrap();
+        assert_eq!(output.len(), 3);
+
+        let alice_positions: Vec<f64> = output.iter()
+            .filter(|r| r.get("user") == Some(&Value::String("alice".into())))
+            .map(|r| r.get("position_size").unwrap().as_f64().unwrap())
+            .collect();
+        assert_eq!(alice_positions, vec![10.0, 13.0]);
+
+        let bob_out: Vec<_> = output.iter()
+            .filter(|r| r.get("user") == Some(&Value::String("bob".into())))
+            .collect();
+        assert_eq!(bob_out[0].get("position_size"), Some(&Value::Float64(5.0)));
     }
 }

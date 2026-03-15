@@ -1,9 +1,15 @@
+use std::collections::HashMap;
+
 use napi::bindgen_prelude::*;
+use napi::sys;
+use napi::NapiRaw;
 use napi_derive::napi;
 
 use crate::db::{Config, DeltaDb as DeltaDbInner, IngestInput as IngestInputInner};
 use crate::msgpack_conv::{decode_data_from_msgpack, decode_rows_from_msgpack, encode_batch_to_msgpack};
-use crate::types::BlockCursor;
+use crate::reducer_runtime::external::install_context;
+use crate::schema::ast::{ReducerBody, ReducerDef, StateField};
+use crate::types::{BlockCursor, ColumnType};
 
 /// Configuration for opening a DeltaDb instance.
 #[napi(object)]
@@ -44,17 +50,41 @@ pub struct IngestInput {
     pub finalized_head: DeltaDbCursor,
 }
 
+/// State field definition for external reducers.
+#[napi(object)]
+pub struct ExternalStateField {
+    pub name: String,
+    /// Column type: "Float64", "UInt64", "Int64", "String", "Boolean", "Json"
+    pub column_type: String,
+    /// Default value as a string literal (e.g., "0", "'hello'", "{}")
+    pub default_value: String,
+}
+
+/// Configuration for registering an external reducer.
+#[napi(object)]
+pub struct ExternalReducerConfig {
+    pub name: String,
+    pub source: String,
+    pub group_by: Vec<String>,
+    pub state: Vec<ExternalStateField>,
+}
+
 /// Delta DB N-API wrapper.
 #[napi]
 pub struct DeltaDb {
     inner: DeltaDbInner,
+    /// Stored raw napi_ref handles for external reducer callbacks (prevent GC).
+    external_callbacks: HashMap<String, sys::napi_ref>,
+    /// Raw napi_env for cleanup on drop.
+    #[allow(dead_code)]
+    raw_env: sys::napi_env,
 }
 
 #[napi]
 impl DeltaDb {
     /// Open a new DeltaDb instance.
     #[napi(factory)]
-    pub fn open(config: DeltaDbConfig) -> Result<Self> {
+    pub fn open(env: Env, config: DeltaDbConfig) -> Result<Self> {
         let mut cfg = if let Some(dir) = config.data_dir {
             Config::with_data_dir(config.schema, dir)
         } else {
@@ -68,7 +98,72 @@ impl DeltaDb {
             Error::new(Status::GenericFailure, format!("{e}"))
         })?;
 
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            external_callbacks: HashMap::new(),
+            raw_env: env.raw(),
+        })
+    }
+
+    /// Register an external reducer with a JS batch callback.
+    ///
+    /// The callback receives an array of `{ state, rows }` groups and must
+    /// return an array of `{ state, emits }` results (same length, same order).
+    ///
+    /// Must be called before any `processBatch` or `ingest` calls.
+    #[napi]
+    pub fn register_reducer(
+        &mut self,
+        env: Env,
+        config: ExternalReducerConfig,
+        callback: JsFunction,
+    ) -> Result<()> {
+        // Create a raw napi_ref to prevent GC of the callback
+        let mut raw_ref: sys::napi_ref = std::ptr::null_mut();
+        let status = unsafe {
+            sys::napi_create_reference(env.raw(), callback.raw(), 1, &mut raw_ref)
+        };
+        if status != sys::Status::napi_ok {
+            return Err(Error::new(Status::GenericFailure, "failed to create callback reference"));
+        }
+        self.external_callbacks
+            .insert(config.name.clone(), raw_ref);
+
+        // If the reducer already exists in the engine (defined via SQL with
+        // LANGUAGE EXTERNAL), we only need to store the callback — the
+        // ExternalRuntime will pick it up from the thread-local context.
+        // Only add a new reducer if it doesn't already exist.
+        if !self.inner.has_reducer(&config.name) {
+            let state_fields: Vec<StateField> = config
+                .state
+                .into_iter()
+                .map(|f| {
+                    let column_type = parse_column_type(&f.column_type);
+                    StateField {
+                        name: f.name,
+                        column_type,
+                        default: f.default_value,
+                    }
+                })
+                .collect();
+
+            let def = ReducerDef {
+                name: config.name.clone(),
+                source: config.source,
+                group_by: config.group_by,
+                state: state_fields,
+                body: ReducerBody::External {
+                    id: config.name,
+                },
+                requires: vec![],
+            };
+
+            self.inner
+                .register_reducer(def)
+                .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;
+        }
+
+        Ok(())
     }
 
     /// Process a batch of rows for a raw table.
@@ -77,12 +172,20 @@ impl DeltaDb {
     #[napi]
     pub fn process_batch(
         &mut self,
+        env: Env,
         table: String,
         block: u32,
         rows: Buffer,
     ) -> Result<bool> {
         let rows = decode_rows_from_msgpack(&rows)
             .map_err(|e| Error::new(Status::InvalidArg, e))?;
+
+        // Install external callback context for the duration of this call
+        let _guard = if !self.external_callbacks.is_empty() {
+            Some(install_context(env, &self.external_callbacks))
+        } else {
+            None
+        };
 
         self.inner
             .process_batch(&table, block as u64, rows)
@@ -108,7 +211,7 @@ impl DeltaDb {
     /// Atomic ingest: process all tables, store rollback chain, finalize, flush.
     /// Returns a msgpack-encoded DeltaBatch buffer, or null if no records produced.
     #[napi]
-    pub fn ingest(&mut self, input: IngestInput) -> Result<Option<Buffer>> {
+    pub fn ingest(&mut self, env: Env, input: IngestInput) -> Result<Option<Buffer>> {
         let data = decode_data_from_msgpack(&input.data)
             .map_err(|e| Error::new(Status::InvalidArg, e))?;
 
@@ -129,6 +232,13 @@ impl DeltaDb {
                 number: input.finalized_head.number as u64,
                 hash: input.finalized_head.hash,
             },
+        };
+
+        // Install external callback context for the duration of this call
+        let _guard = if !self.external_callbacks.is_empty() {
+            Some(install_context(env, &self.external_callbacks))
+        } else {
+            None
         };
 
         let batch = self
@@ -185,5 +295,18 @@ impl DeltaDb {
     #[napi(getter)]
     pub fn cursor(&self) -> Option<DeltaDbCursor> {
         self.inner.latest_cursor().map(|c| c.into())
+    }
+}
+
+fn parse_column_type(s: &str) -> ColumnType {
+    match s.to_lowercase().as_str() {
+        "float64" => ColumnType::Float64,
+        "uint64" => ColumnType::UInt64,
+        "int64" => ColumnType::Int64,
+        "string" => ColumnType::String,
+        "boolean" => ColumnType::Boolean,
+        "json" => ColumnType::JSON,
+        "datetime" => ColumnType::DateTime,
+        _ => ColumnType::String,
     }
 }
