@@ -8,24 +8,24 @@
  *
  * Run with: npx tsx examples/polymarket-pipe.example.ts
  */
- 
-import {DeltaDb, DeltaBatch, DeltaRecord} from '../src/index.js'
+
+import { type DeltaBatch, DeltaDb } from '../src/index'
 
 // ── Types ──────────────────────────────────────────────────────────
 
 enum SIDE {
-    BUY = 0,
-    SELL = 1,
+  BUY = 0,
+  SELL = 1,
 }
 
 interface ParsedOrder {
-    blockNumber: number
-    trader: string
-    assetId: string
-    usdc: number
-    shares: number
-    side: SIDE
-    timestamp: number
+  blockNumber: number
+  trader: string
+  assetId: string
+  usdc: number
+  shares: number
+  side: SIDE
+  timestamp: number
 }
 
 // ── Schema ─────────────────────────────────────────────────────────
@@ -181,261 +181,256 @@ GROUP BY trader, asset_id;
 // ── Transform: ParsedOrder[] → schema rows ─────────────────────────
 
 function transformOrders(orders: ParsedOrder[]): Record<string, any>[] {
-    return orders.map((order) => ({
-        block_number: order.blockNumber,
-        timestamp: order.timestamp,
-        trader: order.trader,
-        asset_id: String(order.assetId),
-        usdc: order.usdc,
-        shares: order.shares,
-        side: order.side,
-    }))
+  return orders.map((order) => ({
+    block_number: order.blockNumber,
+    timestamp: order.timestamp,
+    trader: order.trader,
+    asset_id: String(order.assetId),
+    usdc: order.usdc,
+    shares: order.shares,
+    side: order.side,
+  }))
 }
 
 // ── Delta batch decoder ────────────────────────────────────────────
 
 interface TokenSummary {
-    assetId: string
-    totalVolume: number
-    tradeCount: number
-    lastPrice: number
-    meanPrice: number
-    stdDev: number
+  assetId: string
+  totalVolume: number
+  tradeCount: number
+  lastPrice: number
+  meanPrice: number
+  stdDev: number
 }
 
 interface InsiderPosition {
-    trader: string
-    assetId: string
-    totalVolume: number
-    tradeCount: number
-    avgPrice: number
-    firstSeen: number
-    lastSeen: number
-    detectedAt: number
+  trader: string
+  assetId: string
+  totalVolume: number
+  tradeCount: number
+  avgPrice: number
+  firstSeen: number
+  lastSeen: number
+  detectedAt: number
 }
 
 interface DecodedDeltas {
-    tokenSummaries: TokenSummary[]
-    insiderPositions: InsiderPosition[]
-    rawOrderCount: number
+  tokenSummaries: TokenSummary[]
+  insiderPositions: InsiderPosition[]
+  rawOrderCount: number
 }
 
 function decodeBatch(batch: DeltaBatch): DecodedDeltas {
-    const tokenSummaries: TokenSummary[] = []
-    const insiderPositions: InsiderPosition[] = []
-    let rawOrderCount = 0
+  const tokenSummaries: TokenSummary[] = []
+  const insiderPositions: InsiderPosition[] = []
+  let rawOrderCount = 0
 
-    for (const record of batch.tables['token_summary'] ?? []) {
-        if (record.operation === 'delete') continue
-        const row = {...record.key, ...record.values}
+  for (const record of batch.tables.token_summary ?? []) {
+    if (record.operation === 'delete') continue
+    const row = { ...record.key, ...record.values }
 
-        const tradeCount = row['trade_count'] as number
-        const sumPrice = row['sum_price'] as number
-        const sumPriceSq = row['sum_price_sq'] as number
-        const mean = tradeCount > 0 ? sumPrice / tradeCount : 0
-        const variance =
-            tradeCount > 0
-                ? sumPriceSq / tradeCount - mean * mean
-                : 0
+    const tradeCount = row.trade_count as number
+    const sumPrice = row.sum_price as number
+    const sumPriceSq = row.sum_price_sq as number
+    const mean = tradeCount > 0 ? sumPrice / tradeCount : 0
+    const variance = tradeCount > 0 ? sumPriceSq / tradeCount - mean * mean : 0
 
-        tokenSummaries.push({
-            assetId: row['asset_id'] as string,
-            totalVolume: row['total_volume'] as number,
-            tradeCount,
-            lastPrice: row['last_price'] as number,
-            meanPrice: mean,
-            stdDev: Math.sqrt(Math.max(0, variance)),
-        })
-    }
+    tokenSummaries.push({
+      assetId: row.asset_id as string,
+      totalVolume: row.total_volume as number,
+      tradeCount,
+      lastPrice: row.last_price as number,
+      meanPrice: mean,
+      stdDev: Math.sqrt(Math.max(0, variance)),
+    })
+  }
 
-    for (const record of batch.tables['insider_positions'] ?? []) {
-        if (record.operation === 'delete') continue
-        const row = {...record.key, ...record.values}
+  for (const record of batch.tables.insider_positions ?? []) {
+    if (record.operation === 'delete') continue
+    const row = { ...record.key, ...record.values }
 
-        const tc = row['trade_count'] as number
-        insiderPositions.push({
-            trader: row['trader'] as string,
-            assetId: row['asset_id'] as string,
-            totalVolume: row['total_volume'] as number,
-            tradeCount: tc,
-            avgPrice: tc > 0 ? (row['sum_price'] as number) / tc : 0,
-            firstSeen: row['first_seen'] as number,
-            lastSeen: row['last_seen'] as number,
-            detectedAt: row['detected_at'] as number,
-        })
-    }
+    const tc = row.trade_count as number
+    insiderPositions.push({
+      trader: row.trader as string,
+      assetId: row.asset_id as string,
+      totalVolume: row.total_volume as number,
+      tradeCount: tc,
+      avgPrice: tc > 0 ? (row.sum_price as number) / tc : 0,
+      firstSeen: row.first_seen as number,
+      lastSeen: row.last_seen as number,
+      detectedAt: row.detected_at as number,
+    })
+  }
 
-    rawOrderCount = (batch.tables['orders'] ?? []).length
+  rawOrderCount = (batch.tables.orders ?? []).length
 
-    return {tokenSummaries, insiderPositions, rawOrderCount}
+  return { tokenSummaries, insiderPositions, rawOrderCount }
 }
 
 // ── Sample data generator ──────────────────────────────────────────
 
-function generateOrders(
-    blockNumber: number,
-    timestamp: number,
-    count: number,
-): ParsedOrder[] {
-    const orders: ParsedOrder[] = []
-    for (let i = 0; i < count; i++) {
-        const traderIdx = (blockNumber * count + i) % 50
-        const tokenIdx = i % 5
-        const isBuy = i % 3 !== 2
-        // Low price (< 0.95) for insider detection eligibility
-        const priceBps = 3000 + (i % 6000)
-        const shares = 1_000_000_000
-        const usdc = Math.floor((shares * priceBps) / 10_000)
+function generateOrders(blockNumber: number, timestamp: number, count: number): ParsedOrder[] {
+  const orders: ParsedOrder[] = []
+  for (let i = 0; i < count; i++) {
+    const traderIdx = (blockNumber * count + i) % 50
+    const tokenIdx = i % 5
+    const isBuy = i % 3 !== 2
+    // Low price (< 0.95) for insider detection eligibility
+    const priceBps = 3000 + (i % 6000)
+    const shares = 1_000_000_000
+    const usdc = Math.floor((shares * priceBps) / 10_000)
 
-        orders.push({
-            blockNumber,
-            trader: `0xtrader_${traderIdx.toString(16).padStart(4, '0')}`,
-            assetId: `token_${tokenIdx.toString().padStart(4, '0')}`,
-            usdc,
-            shares,
-            side: isBuy ? SIDE.BUY : SIDE.SELL,
-            timestamp,
-        })
-    }
-    return orders
+    orders.push({
+      blockNumber,
+      trader: `0xtrader_${traderIdx.toString(16).padStart(4, '0')}`,
+      assetId: `token_${tokenIdx.toString().padStart(4, '0')}`,
+      usdc,
+      shares,
+      side: isBuy ? SIDE.BUY : SIDE.SELL,
+      timestamp,
+    })
+  }
+  return orders
 }
 
 // ── Main ───────────────────────────────────────────────────────────
 
 function main() {
-    // Open delta-db with in-memory storage (no dataDir = no persistence)
-    const db = DeltaDb.open({schema: SCHEMA})
+  // Open delta-db with in-memory storage (no dataDir = no persistence)
+  const db = DeltaDb.open({ schema: SCHEMA })
 
-    console.log('=== Polymarket Delta DB Example ===\n')
+  console.log('=== Polymarket Delta DB Example ===\n')
 
-    // Process 10 blocks, 20 orders each
-    const numBlocks = 10
-    const ordersPerBlock = 20
-    const allBatches: DeltaBatch[] = []
+  // Process 10 blocks, 20 orders each
+  const numBlocks = 10
+  const ordersPerBlock = 20
+  const allBatches: DeltaBatch[] = []
 
-    for (let i = 0; i < numBlocks; i++) {
-        const blockNumber = 1000 + i
-        const timestamp = 1_700_000_000 + i * 12 // ~12s per block
+  for (let i = 0; i < numBlocks; i++) {
+    const blockNumber = 1000 + i
+    const timestamp = 1_700_000_000 + i * 12 // ~12s per block
 
-        const orders = generateOrders(blockNumber, timestamp, ordersPerBlock)
-        const rows = transformOrders(orders)
+    const orders = generateOrders(blockNumber, timestamp, ordersPerBlock)
+    const rows = transformOrders(orders)
 
-        // Feed rows into delta-db
-        db.processBatch('orders', blockNumber, rows)
+    // Feed rows into delta-db
+    db.processBatch('orders', blockNumber, rows)
 
-        // Finalize older blocks (keep last 3 unfinalized for rollback)
-        if (blockNumber > 1002) {
-            db.finalize(blockNumber - 3)
-        }
+    // Finalize older blocks (keep last 3 unfinalized for rollback)
+    if (blockNumber > 1002) {
+      db.finalize(blockNumber - 3)
+    }
+  }
+
+  // Flush all pending deltas
+  const batch = db.flush()
+  if (batch) {
+    allBatches.push(batch)
+    db.ack(batch.sequence)
+  }
+
+  // Decode and display results
+  console.log(
+    `Processed ${numBlocks} blocks × ${ordersPerBlock} orders = ${numBlocks * ordersPerBlock} total orders\n`,
+  )
+
+  if (batch) {
+    const totalRecords = Object.values(batch.tables).reduce((s, r) => s + r.length, 0)
+    console.log(`Delta batch: sequence=${batch.sequence}, ${totalRecords} records`)
+
+    // Count records by table and operation
+    console.log('\nRecords by table:')
+    for (const [table, records] of Object.entries(batch.tables)) {
+      const counts: Record<string, number> = {}
+      for (const r of records) {
+        counts[r.operation] = (counts[r.operation] ?? 0) + 1
+      }
+      const parts = Object.entries(counts)
+        .map(([op, n]) => `${op}=${n}`)
+        .join(', ')
+      console.log(`  ${table}: ${parts}`)
     }
 
-    // Flush all pending deltas
-    const batch = db.flush()
-    if (batch) {
-        allBatches.push(batch)
-        db.ack(batch.sequence)
+    // Decode into typed structures
+    const decoded = decodeBatch(batch)
+
+    console.log(`\n--- Token Summaries (${decoded.tokenSummaries.length}) ---`)
+    for (const ts of decoded.tokenSummaries) {
+      console.log(
+        `  ${ts.assetId}: vol=${ts.totalVolume.toFixed(2)}, ` +
+          `trades=${ts.tradeCount}, last=${ts.lastPrice.toFixed(4)}, ` +
+          `mean=${ts.meanPrice.toFixed(4)}, std=${ts.stdDev.toFixed(4)}`,
+      )
     }
 
-    // Decode and display results
-    console.log(`Processed ${numBlocks} blocks × ${ordersPerBlock} orders = ${numBlocks * ordersPerBlock} total orders\n`)
-
-    if (batch) {
-        const totalRecords = Object.values(batch.tables).reduce((s, r) => s + r.length, 0)
-        console.log(`Delta batch: sequence=${batch.sequence}, ${totalRecords} records`)
-
-        // Count records by table and operation
-        console.log('\nRecords by table:')
-        for (const [table, records] of Object.entries(batch.tables)) {
-            const counts: Record<string, number> = {}
-            for (const r of records) {
-                counts[r.operation] = (counts[r.operation] ?? 0) + 1
-            }
-            const parts = Object.entries(counts)
-                .map(([op, n]) => `${op}=${n}`)
-                .join(', ')
-            console.log(`  ${table}: ${parts}`)
-        }
-
-        // Decode into typed structures
-        const decoded = decodeBatch(batch)
-
-        console.log(`\n--- Token Summaries (${decoded.tokenSummaries.length}) ---`)
-        for (const ts of decoded.tokenSummaries) {
-            console.log(
-                `  ${ts.assetId}: vol=${ts.totalVolume.toFixed(2)}, ` +
-                `trades=${ts.tradeCount}, last=${ts.lastPrice.toFixed(4)}, ` +
-                `mean=${ts.meanPrice.toFixed(4)}, std=${ts.stdDev.toFixed(4)}`,
-            )
-        }
-
-        if (decoded.insiderPositions.length > 0) {
-            console.log(`\n--- Insider Positions (${decoded.insiderPositions.length}) ---`)
-            for (const ip of decoded.insiderPositions) {
-                console.log(
-                    `  ${ip.trader} → ${ip.assetId}: vol=${ip.totalVolume.toFixed(2)}, ` +
-                    `trades=${ip.tradeCount}, avg_price=${ip.avgPrice.toFixed(4)}, ` +
-                    `detected_at=${ip.detectedAt}`,
-                )
-            }
-        } else {
-            console.log('\n--- No insiders detected ---')
-        }
-    }
-
-    // Demonstrate rollback
-    console.log('\n=== Rollback Demo ===\n')
-
-    // Process one more block
-    const extraOrders = generateOrders(1010, 1_700_000_120, 10)
-    db.processBatch('orders', 1010, transformOrders(extraOrders))
-
-    const beforeRollback = db.flush()
-    if (beforeRollback) {
-        const count = Object.values(beforeRollback.tables).reduce((s, r) => s + r.length, 0)
-        console.log(`Before rollback: ${count} new records`)
-        db.ack(beforeRollback.sequence)
-    }
-
-    // Rollback to block 1008 (undoes blocks 1009 and 1010)
-    db.rollback(1008)
-    const rollbackBatch = db.flush()
-    if (rollbackBatch) {
-        const allRecords = Object.values(rollbackBatch.tables).flat()
-        const deletes = allRecords.filter((r) => r.operation === 'delete')
-        const updates = allRecords.filter((r) => r.operation === 'update')
+    if (decoded.insiderPositions.length > 0) {
+      console.log(`\n--- Insider Positions (${decoded.insiderPositions.length}) ---`)
+      for (const ip of decoded.insiderPositions) {
         console.log(
-            `After rollback to 1008: ${allRecords.length} compensating deltas ` +
-            `(${deletes.length} deletes, ${updates.length} updates)`,
+          `  ${ip.trader} → ${ip.assetId}: vol=${ip.totalVolume.toFixed(2)}, ` +
+            `trades=${ip.tradeCount}, avg_price=${ip.avgPrice.toFixed(4)}, ` +
+            `detected_at=${ip.detectedAt}`,
         )
-        db.ack(rollbackBatch.sequence)
-
-        // Show prevValues on updates (allows downstream to diff)
-        const updatesWithPrev = updates.filter((r) => r.prevValues != null)
-        if (updatesWithPrev.length > 0) {
-            console.log('\nSample compensating update (with prevValues):')
-            const sample = updatesWithPrev[0]
-            console.log(`  table: ${sample.table}`)
-            console.log(`  key:`, sample.key)
-            console.log(`  values:`, sample.values)
-            console.log(`  prevValues:`, sample.prevValues)
-        }
+      }
+    } else {
+      console.log('\n--- No insiders detected ---')
     }
+  }
 
-    // Re-ingest corrected data after rollback
-    const correctedOrders = generateOrders(1009, 1_700_000_108, 5)
-    db.processBatch('orders', 1009, transformOrders(correctedOrders))
+  // Demonstrate rollback
+  console.log('\n=== Rollback Demo ===\n')
 
-    const afterFix = db.flush()
-    if (afterFix) {
-        const decoded = decodeBatch(afterFix)
-        console.log(
-            `\nAfter re-ingest: ${decoded.tokenSummaries.length} token summaries, ` +
-            `${decoded.insiderPositions.length} insider positions`,
-        )
-        db.ack(afterFix.sequence)
+  // Process one more block
+  const extraOrders = generateOrders(1010, 1_700_000_120, 10)
+  db.processBatch('orders', 1010, transformOrders(extraOrders))
+
+  const beforeRollback = db.flush()
+  if (beforeRollback) {
+    const count = Object.values(beforeRollback.tables).reduce((s, r) => s + r.length, 0)
+    console.log(`Before rollback: ${count} new records`)
+    db.ack(beforeRollback.sequence)
+  }
+
+  // Rollback to block 1008 (undoes blocks 1009 and 1010)
+  db.rollback(1008)
+  const rollbackBatch = db.flush()
+  if (rollbackBatch) {
+    const allRecords = Object.values(rollbackBatch.tables).flat()
+    const deletes = allRecords.filter((r) => r.operation === 'delete')
+    const updates = allRecords.filter((r) => r.operation === 'update')
+    console.log(
+      `After rollback to 1008: ${allRecords.length} compensating deltas ` +
+        `(${deletes.length} deletes, ${updates.length} updates)`,
+    )
+    db.ack(rollbackBatch.sequence)
+
+    // Show prevValues on updates (allows downstream to diff)
+    const updatesWithPrev = updates.filter((r) => r.prevValues != null)
+    if (updatesWithPrev.length > 0) {
+      console.log('\nSample compensating update (with prevValues):')
+      const sample = updatesWithPrev[0]
+      console.log(`  table: ${sample.table}`)
+      console.log(`  key:`, sample.key)
+      console.log(`  values:`, sample.values)
+      console.log(`  prevValues:`, sample.prevValues)
     }
+  }
 
-    console.log('\n=== Done ===')
+  // Re-ingest corrected data after rollback
+  const correctedOrders = generateOrders(1009, 1_700_000_108, 5)
+  db.processBatch('orders', 1009, transformOrders(correctedOrders))
+
+  const afterFix = db.flush()
+  if (afterFix) {
+    const decoded = decodeBatch(afterFix)
+    console.log(
+      `\nAfter re-ingest: ${decoded.tokenSummaries.length} token summaries, ` +
+        `${decoded.insiderPositions.length} insider positions`,
+    )
+    db.ack(afterFix.sequence)
+  }
+
+  console.log('\n=== Done ===')
 }
 
 main()

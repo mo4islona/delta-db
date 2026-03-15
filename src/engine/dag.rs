@@ -143,6 +143,77 @@ impl DeltaEngine {
         }
     }
 
+    /// Add an external reducer to the pipeline.
+    /// Creates a ReducerEngine and adds it as a new branch (sequential only).
+    /// Must be called before any data processing.
+    pub fn add_reducer(
+        &mut self,
+        def: crate::schema::ast::ReducerDef,
+        storage: std::sync::Arc<dyn crate::storage::StorageBackend>,
+    ) -> crate::error::Result<()> {
+        let name = def.name.clone();
+
+        // Build engine — source must be a raw table (chained external not yet supported)
+        let engine = if let Some(raw) = self.raw_tables.get(&def.source) {
+            ReducerEngine::new(def, storage, raw.registry(), &[])
+        } else {
+            return Err(crate::error::Error::InvalidOperation(format!(
+                "external reducer '{}' source '{}' must be a raw table",
+                name, def.source
+            )));
+        };
+
+        // Find downstream MVs that source from this reducer
+        let mv_names: Vec<String> = self
+            .mvs
+            .keys()
+            .filter(|mv_name| {
+                self.mvs
+                    .get(*mv_name)
+                    .map(|mv| mv.source() == name)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+
+        let mv_entries: Vec<_> = mv_names
+            .into_iter()
+            .filter_map(|n| self.mvs.remove(&n).map(|mv| (n, mv)))
+            .collect();
+
+        // Add as a new branch
+        self.branches.push(PipelineBranch {
+            reducer_name: name.clone(),
+            reducer: engine,
+            mv_entries,
+        });
+
+        // Add to pipeline
+        self.pipeline.push(PipelineNode::Reducer(name));
+
+        Ok(())
+    }
+
+    /// Check if a reducer with the given name exists in the engine.
+    pub fn has_reducer(&self, name: &str) -> bool {
+        self.reducers.contains_key(name)
+            || self.branches.iter().any(|b| b.reducer_name == name)
+    }
+
+    /// Replace the runtime for a named reducer (used for External/FnReducer injection).
+    /// Searches both branches and the reducers HashMap.
+    pub fn set_reducer_runtime(&mut self, name: &str, runtime: Box<dyn crate::reducer_runtime::ReducerRuntime>) {
+        for branch in &mut self.branches {
+            if branch.reducer_name == name {
+                branch.reducer.set_runtime(runtime);
+                return;
+            }
+        }
+        if let Some(reducer) = self.reducers.get_mut(name) {
+            reducer.set_runtime(runtime);
+        }
+    }
+
     /// Process a batch of rows for a raw table at the given block.
     /// Cascades through reducers and MVs, returning all delta records.
     ///
@@ -200,12 +271,16 @@ impl DeltaEngine {
         output_rows.insert(table.to_string(), row_maps);
 
         // Check if parallel branch execution is possible:
-        // - 2+ branches, and all reducers source from raw tables (not from each other)
+        // - 2+ branches, all reducers source from raw tables (not from each other),
+        //   and no external reducers (which require main-thread JS callbacks).
         let can_parallelize = self.branches.len() >= 2
             && self
                 .branches
                 .iter()
-                .all(|b| self.raw_tables.contains_key(b.reducer.source()));
+                .all(|b| {
+                    self.raw_tables.contains_key(b.reducer.source())
+                        && !b.reducer.is_external()
+                });
 
         if can_parallelize {
             // Phase 2a: Process MVs that source directly from raw tables

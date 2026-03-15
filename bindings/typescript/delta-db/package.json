@@ -1,32 +1,40 @@
 {
   "name": "@sqd-pipes/delta-db",
-  "version": "0.0.1-alpha.5",
+  "version": "0.0.1-alpha.9",
   "description": "Embedded rollback-aware computation engine for blockchain data",
-  "main": "src/index.js",
-  "types": "src/index.d.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "napi": {
-    "name": "delta-db",
-    "triples": {
-      "defaults": true
-    }
+    "name": "delta-db"
   },
   "scripts": {
-    "build": "napi build --cargo-cwd ../../.. --features napi --release --dts native.d.ts src",
-    "build:debug": "napi build --cargo-cwd ../../.. --features napi --dts native.d.ts src",
+    "build:native": "napi build --cargo-cwd ../../.. --features napi --release --platform --dts native.d.ts --js false src/native",
+    "build:native:debug": "napi build --cargo-cwd ../../.. --features napi --platform --dts native.d.ts --js false src/native",
+    "build:ts": "tsc -p tsconfig.build.json && cp -r src/native dist/native",
+    "build": "pnpm run build:native && pnpm run build:ts",
+    "artifacts": "napi artifacts",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "lint": "biome check",
+    "lint:fix": "biome check --fix"
   },
   "dependencies": {
     "@msgpack/msgpack": "^3.0.0"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.4.7",
     "@napi-rs/cli": "^2.18.0",
+    "@types/node": "^25.5.0",
+    "typescript": "^5.9.3",
     "vitest": "^3.0.0"
   },
   "files": [
-    "src/index.js",
-    "src/index.d.ts",
-    "src/delta-db.node"
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "dist/**/*.js.map",
+    "src/native/native.js",
+    "src/native/native.d.ts",
+    "src/native/*.node"
   ],
   "license": "MIT"
 }

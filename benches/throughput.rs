@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use delta_db::db::{Config, DeltaDb};
 use delta_db::engine::reducer::ReducerEngine;
+use delta_db::reducer_runtime::fn_reducer::FnReducerRuntime;
 use delta_db::schema::parser::parse_schema;
 use delta_db::storage::memory::MemoryBackend;
 use delta_db::types::{ColumnRegistry, RowMap, Value};
@@ -119,6 +120,64 @@ const REDUCER_LUA_SCHEMA: &str = r#"
     FROM pnl
     GROUP BY user;
 "#;
+
+const REDUCER_FN_SCHEMA: &str = r#"
+    CREATE TABLE trades (
+        block_number UInt64,
+        user         String,
+        side         String,
+        amount       Float64,
+        price        Float64
+    );
+
+    CREATE REDUCER pnl
+    SOURCE trades
+    GROUP BY user
+    STATE (
+        quantity   Float64 DEFAULT 0,
+        cost_basis Float64 DEFAULT 0
+    )
+    LANGUAGE EXTERNAL;
+
+    CREATE MATERIALIZED VIEW position_summary AS
+    SELECT
+        user,
+        sum(trade_pnl)       AS total_pnl,
+        last(position_size)  AS current_position,
+        count()              AS trade_count
+    FROM pnl
+    GROUP BY user;
+"#;
+
+/// Build a PnL FnReducerRuntime — same logic as the Lua/EventRules versions.
+fn pnl_fn_runtime() -> FnReducerRuntime {
+    FnReducerRuntime::new(|state, row| {
+        let side = row.get("side").and_then(|v| v.as_str()).unwrap_or("");
+        let amount = row.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let price = row.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+        let qty = state.get("quantity").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let cost = state.get("cost_basis").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+        let mut emit = HashMap::new();
+
+        if side == "buy" {
+            state.insert("quantity".into(), Value::Float64(qty + amount));
+            state.insert("cost_basis".into(), Value::Float64(cost + amount * price));
+            emit.insert("trade_pnl".into(), Value::Float64(0.0));
+        } else {
+            let avg_cost = if qty > 0.0 { cost / qty } else { 0.0 };
+            emit.insert("trade_pnl".into(), Value::Float64(amount * (price - avg_cost)));
+            state.insert("quantity".into(), Value::Float64(qty - amount));
+            state.insert("cost_basis".into(), Value::Float64(cost - amount * avg_cost));
+        }
+
+        let new_qty = state.get("quantity").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        emit.insert("position_size".into(), Value::Float64(new_qty));
+
+        vec![emit]
+    })
+}
 
 fn make_raw_row(i: usize) -> RowMap {
     HashMap::from([
@@ -362,6 +421,55 @@ fn bench_full_pipeline_lua(backend: Backend) -> BenchResult {
     }
 }
 
+fn bench_full_pipeline_fn_reducer(backend: Backend) -> BenchResult {
+    let total_rows = 50_000;
+    let batch_size = 50;
+    let num_users = 100;
+    let (cfg, _dir) = make_config(REDUCER_FN_SCHEMA, backend);
+    let mut db = DeltaDb::open(cfg).unwrap();
+
+    // Inject the FnReducer runtime
+    db.set_reducer_runtime("pnl", Box::new(pnl_fn_runtime()));
+
+    let rows: Vec<RowMap> = (0..total_rows)
+        .map(|i| {
+            let user = format!("user{}", i % num_users);
+            let side = if i / num_users < 5 {
+                "buy"
+            } else if i % 3 == 0 {
+                "sell"
+            } else {
+                "buy"
+            };
+            make_trade(
+                &user,
+                side,
+                1.0 + (i as f64 * 0.01),
+                2000.0 + (i as f64 * 0.1),
+            )
+        })
+        .collect();
+
+    let start = Instant::now();
+    for (block, chunk) in rows.chunks(batch_size).enumerate() {
+        db.process_batch("trades", block as u64, chunk.to_vec())
+            .unwrap();
+    }
+    db.flush();
+    let elapsed = start.elapsed();
+
+    let rows_per_sec = total_rows as f64 / elapsed.as_secs_f64();
+    BenchResult {
+        name: format!("Full pipeline — FnReducer [{}]", backend),
+        backend: backend.to_string(),
+        total_rows,
+        elapsed_ms: elapsed.as_secs_f64() * 1000.0,
+        rows_per_sec,
+        pass: rows_per_sec > 30_000.0,
+        target: ">30K rows/sec".to_string(),
+    }
+}
+
 fn bench_reducer_event_rules_only() -> BenchResult {
     let total_rows = 200_000;
     let batch_size = 100;
@@ -413,6 +521,119 @@ fn bench_reducer_event_rules_only() -> BenchResult {
         rows_per_sec,
         pass: rows_per_sec > 200_000.0,
         target: ">200K rows/sec".to_string(),
+    }
+}
+
+fn bench_reducer_lua_only() -> BenchResult {
+    let total_rows = 200_000;
+    let batch_size = 100;
+    let num_users = 100;
+
+    let schema = parse_schema(REDUCER_LUA_SCHEMA).unwrap();
+    let storage = Arc::new(MemoryBackend::new());
+    let reducer_def = schema.reducers[0].clone();
+    let source_table = &schema.tables[0];
+    let source_names: Vec<String> = source_table
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    let source_registry = ColumnRegistry::new(source_names);
+    let mut engine = ReducerEngine::new(reducer_def, storage, &source_registry, &[]);
+
+    let rows: Vec<RowMap> = (0..total_rows)
+        .map(|i| {
+            let user = format!("user{}", i % num_users);
+            let side = if i / num_users < 5 {
+                "buy"
+            } else if i % 3 == 0 {
+                "sell"
+            } else {
+                "buy"
+            };
+            make_trade(
+                &user,
+                side,
+                1.0 + (i as f64 * 0.01),
+                2000.0 + (i as f64 * 0.1),
+            )
+        })
+        .collect();
+
+    let start = Instant::now();
+    for (block, chunk) in rows.chunks(batch_size).enumerate() {
+        engine.process_block_maps(block as u64, chunk).unwrap();
+    }
+    let elapsed = start.elapsed();
+
+    let rows_per_sec = total_rows as f64 / elapsed.as_secs_f64();
+    BenchResult {
+        name: "Reducer-only — Lua [Memory]".to_string(),
+        backend: "Memory".to_string(),
+        total_rows,
+        elapsed_ms: elapsed.as_secs_f64() * 1000.0,
+        rows_per_sec,
+        pass: rows_per_sec > 100_000.0,
+        target: ">100K rows/sec".to_string(),
+    }
+}
+
+fn bench_reducer_fn_only() -> BenchResult {
+    let total_rows = 200_000;
+    let batch_size = 100;
+    let num_users = 100;
+
+    let schema = parse_schema(REDUCER_FN_SCHEMA).unwrap();
+    let storage = Arc::new(MemoryBackend::new());
+    let reducer_def = schema.reducers[0].clone();
+    let source_table = &schema.tables[0];
+    let source_names: Vec<String> = source_table
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    let source_registry = ColumnRegistry::new(source_names);
+    let mut engine = ReducerEngine::with_runtime(
+        reducer_def,
+        storage,
+        &source_registry,
+        Box::new(pnl_fn_runtime()),
+    );
+
+    let rows: Vec<RowMap> = (0..total_rows)
+        .map(|i| {
+            let user = format!("user{}", i % num_users);
+            let side = if i / num_users < 5 {
+                "buy"
+            } else if i % 3 == 0 {
+                "sell"
+            } else {
+                "buy"
+            };
+            make_trade(
+                &user,
+                side,
+                1.0 + (i as f64 * 0.01),
+                2000.0 + (i as f64 * 0.1),
+            )
+        })
+        .collect();
+
+    let start = Instant::now();
+    for (block, chunk) in rows.chunks(batch_size).enumerate() {
+        engine.process_block_maps(block as u64, chunk).unwrap();
+    }
+    let elapsed = start.elapsed();
+
+    let rows_per_sec = total_rows as f64 / elapsed.as_secs_f64();
+    BenchResult {
+        name: "Reducer-only — FnReducer [Memory]".to_string(),
+        backend: "Memory".to_string(),
+        total_rows,
+        elapsed_ms: elapsed.as_secs_f64() * 1000.0,
+        rows_per_sec,
+        pass: rows_per_sec > 100_000.0,
+        target: ">100K rows/sec".to_string(),
     }
 }
 
@@ -893,6 +1114,9 @@ fn run_backend_benchmarks(backend: Backend) -> Vec<BenchResult> {
     let r = bench_full_pipeline_lua(backend);
     r.print();
     results.push(r);
+    let r = bench_full_pipeline_fn_reducer(backend);
+    r.print();
+    results.push(r);
     let r = bench_rollback(backend);
     r.print();
     results.push(r);
@@ -927,8 +1151,14 @@ fn main() {
 
     println!("--- Memory ---");
     results.extend(run_backend_benchmarks(Backend::Memory));
-    println!("\n  Isolated:");
+    println!("\n  Reducer-only:");
     let r = bench_reducer_event_rules_only();
+    r.print();
+    results.push(r);
+    let r = bench_reducer_lua_only();
+    r.print();
+    results.push(r);
+    let r = bench_reducer_fn_only();
     r.print();
     results.push(r);
 
