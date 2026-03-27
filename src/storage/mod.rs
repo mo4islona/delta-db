@@ -355,20 +355,14 @@ pub trait StorageBackend: Send + Sync {
     /// Delete all rows for a table where block_number > after_block.
     fn delete_raw_rows_after(&self, table: &str, after_block: BlockNumber) -> Result<()>;
 
-    /// Remove and return encoded rows where block_number > after_block in one pass.
-    ///
-    /// **Warning:** The default implementation is NOT atomic — a crash between the
-    /// read and delete leaves rows in storage while the caller has already consumed
-    /// them. Implementors should override with an atomic version for crash safety.
+    /// Atomically remove and return encoded rows where block_number > after_block.
+    /// Must be implemented as a single atomic operation — a non-atomic read+delete
+    /// can lose data on crash.
     fn take_raw_rows_after(
         &self,
         table: &str,
         after_block: BlockNumber,
-    ) -> Result<Vec<(BlockNumber, Vec<u8>)>> {
-        let rows = self.get_raw_rows(table, after_block + 1, BlockNumber::MAX)?;
-        self.delete_raw_rows_after(table, after_block)?;
-        Ok(rows)
-    }
+    ) -> Result<Vec<(BlockNumber, Vec<u8>)>>;
 
     // --- Reducer state snapshots ---
 
