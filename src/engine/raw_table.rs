@@ -156,6 +156,10 @@ impl RawTableEngine {
         fork_point: BlockNumber,
         batch: &mut StorageWriteBatch,
     ) -> Result<Vec<DeltaRecord>> {
+        if fork_point == BlockNumber::MAX {
+            return Ok(Vec::new());
+        }
+
         // Read rows that will be rolled back (they're still in storage)
         let rolled_back = self
             .storage

@@ -477,12 +477,11 @@ impl StorageBackend for RocksDbBackend {
                         let ub = upper_bound(&raw_table_prefix(table));
                         let mut opts = ReadOptions::default();
                         opts.set_iterate_upper_bound(ub);
-                        let keys: Vec<Box<[u8]>> = self.db
+                        for item in self.db
                             .iterator_cf_opt(cf, opts, IteratorMode::From(&start, Direction::Forward))
-                            .filter_map(|item| item.ok().map(|(k, _)| k))
-                            .collect();
-                        for k in &keys {
-                            wb.delete_cf(cf, k);
+                        {
+                            let (k, _) = item.map_err(to_err)?;
+                            wb.delete_cf(cf, &k);
                         }
                     }
                 }

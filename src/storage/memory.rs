@@ -296,13 +296,15 @@ impl StorageBackend for MemoryBackend {
                     inner.mv_states.remove(&(view.clone(), group_key.clone()));
                 }
                 BatchOp::DeleteRawRowsAfter { table, after_block } => {
-                    let keys: Vec<_> = inner.raw
-                        .range((table.clone(), *after_block + 1)..)
-                        .take_while(|((t, _), _)| t == table)
-                        .map(|(k, _)| k.clone())
-                        .collect();
-                    for k in keys {
-                        inner.raw.remove(&k);
+                    if *after_block < BlockNumber::MAX {
+                        let keys: Vec<_> = inner.raw
+                            .range((table.clone(), *after_block + 1)..)
+                            .take_while(|((t, _), _)| t == table)
+                            .map(|(k, _)| k.clone())
+                            .collect();
+                        for k in keys {
+                            inner.raw.remove(&k);
+                        }
                     }
                 }
             }
