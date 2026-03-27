@@ -219,12 +219,13 @@ impl MVEngine {
             let block_max_ts = rows
                 .iter()
                 .filter_map(|r| r.get(&sw.time_column).and_then(|v| v.as_i64()))
-                .max();
-            if let Some(ts) = block_max_ts {
-                self.block_times.insert(block, ts);
-                if ts > self.current_watermark {
-                    self.current_watermark = ts;
-                }
+                .max()
+                // Fallback: if no rows have a valid timestamp, use current watermark
+                // so the block still participates in expiry rather than leaking.
+                .unwrap_or(self.current_watermark);
+            self.block_times.insert(block, block_max_ts);
+            if block_max_ts > self.current_watermark {
+                self.current_watermark = block_max_ts;
             }
         }
 
@@ -369,7 +370,8 @@ impl MVEngine {
         let window_ms = sw.interval_seconds as i64 * 1000;
         let cutoff = self.current_watermark - window_ms;
 
-        // Find all blocks with timestamp < cutoff (strict less-than: boundary is inclusive)
+        // Find all blocks with timestamp < cutoff (strict less-than: boundary is inclusive).
+        // Scan is bounded by window size since expired blocks are removed each round.
         let expired_blocks: Vec<BlockNumber> = self
             .block_times
             .iter()
@@ -1419,5 +1421,26 @@ mod tests {
         // Restore — group X should not exist
         let mv2 = MVEngine::new(sliding_sum_mv_def(1), storage.clone());
         assert_eq!(mv2.groups.len(), 1); // only Y
+    }
+
+    #[test]
+    fn sliding_window_missing_timestamp_uses_watermark() {
+        let mut mv = MVEngine::new(sliding_sum_mv_def(10), test_storage()); // 10s window
+
+        // Block 1: has timestamp
+        mv.process_block(1, &[
+            make_ts_row(&[("pair", Value::String("X".into())), ("volume", Value::Float64(10.0))], 5_000),
+        ]);
+
+        // Block 2: missing "ts" column — should still get a block_times entry
+        mv.process_block(2, &[
+            make_row(&[("pair", Value::String("X".into())), ("volume", Value::Float64(20.0))]),
+        ]);
+
+        // block_times should have entries for both blocks
+        assert!(mv.block_times.contains_key(&1));
+        assert!(mv.block_times.contains_key(&2));
+        // Block 2 should use watermark (5000) as fallback
+        assert_eq!(mv.block_times[&2], 5_000);
     }
 }
