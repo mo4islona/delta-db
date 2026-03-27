@@ -154,6 +154,12 @@ impl DeltaDb {
     /// Process a batch of rows for a raw table at the given block number.
     /// Delta records are buffered internally.
     /// Returns true if backpressure should be applied (buffer is full).
+    ///
+    /// **Warning:** This method writes raw rows to storage immediately but does
+    /// not persist `latest_block` metadata until the next `finalize()`. A crash
+    /// between these two operations leaves orphaned raw rows in storage that are
+    /// never replayed into reducer/MV state on recovery. For crash-safe ingestion,
+    /// use `ingest()` which commits all writes atomically.
     pub fn process_batch(
         &mut self,
         table: &str,
@@ -173,8 +179,14 @@ impl DeltaDb {
 
     /// Roll back all state after fork_point.
     /// Compensating delta records are buffered.
+    /// Raw-row deletions + metadata updates are committed atomically.
     pub fn rollback(&mut self, fork_point: BlockNumber) -> Result<()> {
-        let deltas = self.engine.rollback(fork_point)?;
+        let mut batch = StorageWriteBatch::new();
+        let deltas = self.engine.rollback_to_batch(fork_point, &mut batch)?;
+
+        // Persist updated latest_block + block_hashes atomically with raw-row deletions
+        self.append_meta_to_batch(&mut batch)?;
+        self.storage.commit(&batch)?;
 
         self.buffer.push(
             deltas,
@@ -1150,5 +1162,79 @@ mod tests {
         assert_eq!(bob.values.get("current_position"), Some(&Value::Float64(5.0)));
         assert_eq!(alice.values.get("trade_count"), Some(&Value::UInt64(1)));
         assert_eq!(bob.values.get("trade_count"), Some(&Value::UInt64(1)));
+    }
+
+    #[test]
+    fn rollback_persists_metadata_atomically() {
+        use crate::storage::memory::MemoryBackend;
+
+        let storage = Arc::new(MemoryBackend::new());
+        let mut db = DeltaDb::open(
+            Config::new(SIMPLE_SCHEMA).storage(storage.clone()),
+        ).unwrap();
+
+        // Process blocks 1-3
+        db.process_batch("swaps", 1, vec![make_swap("ETH", 10.0)]).unwrap();
+        db.process_batch("swaps", 2, vec![make_swap("ETH", 20.0)]).unwrap();
+        db.process_batch("swaps", 3, vec![make_swap("ETH", 30.0)]).unwrap();
+        db.finalize(1).unwrap();
+
+        // Rollback to block 1
+        db.rollback(1).unwrap();
+
+        // Verify metadata was persisted — latest_block should be 1
+        let latest_bytes = storage.get_meta("latest_block").unwrap().unwrap();
+        let latest = u64::from_be_bytes(latest_bytes.try_into().unwrap());
+        assert_eq!(latest, 1, "latest_block should be persisted after rollback");
+
+        // Verify block_hashes only has block 1
+        let hashes_bytes = storage.get_meta("block_hashes").unwrap().unwrap();
+        let hashes: BTreeMap<BlockNumber, String> = serde_json::from_slice(&hashes_bytes).unwrap();
+        assert!(!hashes.contains_key(&2), "block 2 hash should be removed");
+        assert!(!hashes.contains_key(&3), "block 3 hash should be removed");
+
+        // Verify raw rows for blocks 2,3 are deleted
+        let rows_after = storage.get_raw_rows("swaps", 2, 3).unwrap();
+        assert!(rows_after.is_empty(), "raw rows for rolled-back blocks should be deleted");
+    }
+
+    #[test]
+    fn rollback_survives_simulated_restart() {
+        use crate::storage::memory::MemoryBackend;
+
+        let storage = Arc::new(MemoryBackend::new());
+
+        // Phase 1: process and finalize
+        {
+            let mut db = DeltaDb::open(
+                Config::new(SIMPLE_SCHEMA).storage(storage.clone()),
+            ).unwrap();
+            db.process_batch("swaps", 1, vec![make_swap("ETH", 10.0)]).unwrap();
+            db.process_batch("swaps", 2, vec![make_swap("ETH", 20.0)]).unwrap();
+            db.process_batch("swaps", 3, vec![make_swap("ETH", 30.0)]).unwrap();
+            db.finalize(1).unwrap();
+
+            // Rollback to block 1
+            db.rollback(1).unwrap();
+            db.flush();
+        }
+
+        // Phase 2: "restart" — open from same storage
+        {
+            let mut db = DeltaDb::open(
+                Config::new(SIMPLE_SCHEMA).storage(storage.clone()),
+            ).unwrap();
+
+            // latest_block should be 1 (not 3 — the ghost head)
+            assert_eq!(db.latest_block(), 1);
+
+            // Process block 2 with new data — should work correctly
+            db.process_batch("swaps", 2, vec![make_swap("BTC", 50.0)]).unwrap();
+            let batch = db.flush().unwrap();
+
+            // Should have MV update with the new data
+            let pool_vol = batch.tables.get("pool_volume").unwrap();
+            assert!(!pool_vol.is_empty());
+        }
     }
 }

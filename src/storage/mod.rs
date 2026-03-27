@@ -30,6 +30,10 @@ pub enum BatchOp {
         view: String,
         group_key: Vec<u8>,
     },
+    DeleteRawRowsAfter {
+        table: String,
+        after_block: BlockNumber,
+    },
 }
 
 /// A collection of operations to be committed atomically.
@@ -79,6 +83,13 @@ impl StorageWriteBatch {
         self.ops.push(BatchOp::DeleteMvState {
             view: view.to_string(),
             group_key: group_key.to_vec(),
+        });
+    }
+
+    pub fn delete_raw_rows_after(&mut self, table: &str, after_block: BlockNumber) {
+        self.ops.push(BatchOp::DeleteRawRowsAfter {
+            table: table.to_string(),
+            after_block,
         });
     }
 }
@@ -344,16 +355,14 @@ pub trait StorageBackend: Send + Sync {
     /// Delete all rows for a table where block_number > after_block.
     fn delete_raw_rows_after(&self, table: &str, after_block: BlockNumber) -> Result<()>;
 
-    /// Remove and return encoded rows where block_number > after_block in one pass.
+    /// Atomically remove and return encoded rows where block_number > after_block.
+    /// Must be implemented as a single atomic operation — a non-atomic read+delete
+    /// can lose data on crash.
     fn take_raw_rows_after(
         &self,
         table: &str,
         after_block: BlockNumber,
-    ) -> Result<Vec<(BlockNumber, Vec<u8>)>> {
-        let rows = self.get_raw_rows(table, after_block + 1, BlockNumber::MAX)?;
-        self.delete_raw_rows_after(table, after_block)?;
-        Ok(rows)
-    }
+    ) -> Result<Vec<(BlockNumber, Vec<u8>)>>;
 
     // --- Reducer state snapshots ---
 

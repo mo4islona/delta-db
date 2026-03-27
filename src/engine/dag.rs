@@ -519,6 +519,24 @@ impl DeltaEngine {
 
     /// Roll back all state after fork_point.
     pub fn rollback(&mut self, fork_point: BlockNumber) -> Result<Vec<DeltaRecord>> {
+        self.rollback_inner(fork_point, None)
+    }
+
+    /// Roll back all state after fork_point, deferring raw-row deletions
+    /// to the provided write batch for atomic commit with metadata.
+    pub fn rollback_to_batch(
+        &mut self,
+        fork_point: BlockNumber,
+        batch: &mut StorageWriteBatch,
+    ) -> Result<Vec<DeltaRecord>> {
+        self.rollback_inner(fork_point, Some(batch))
+    }
+
+    fn rollback_inner(
+        &mut self,
+        fork_point: BlockNumber,
+        mut write_batch: Option<&mut StorageWriteBatch>,
+    ) -> Result<Vec<DeltaRecord>> {
         let mut all_deltas = Vec::new();
 
         // Roll back in reverse pipeline order
@@ -552,7 +570,11 @@ impl DeltaEngine {
                 }
                 PipelineNode::RawTable(name) => {
                     let raw_engine = self.raw_tables.get(name).unwrap();
-                    let deltas = raw_engine.rollback(fork_point)?;
+                    let deltas = if let Some(ref mut batch) = write_batch {
+                        raw_engine.rollback_to_batch(fork_point, batch)?
+                    } else {
+                        raw_engine.rollback(fork_point)?
+                    };
                     if !self.virtual_tables.contains(name) {
                         all_deltas.extend(deltas);
                     }
