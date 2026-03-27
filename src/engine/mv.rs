@@ -360,11 +360,9 @@ impl MVEngine {
         }
 
         // Delete stale groups from storage (expired/removed since last finalize)
-        if is_sliding {
-            for key in self.removed_groups.drain(..) {
-                let gk_bytes = storage::encode_group_key(&key);
-                batch.delete_mv_state(&self.def.name, &gk_bytes);
-            }
+        for key in self.removed_groups.drain(..) {
+            let gk_bytes = storage::encode_group_key(&key);
+            batch.delete_mv_state(&self.def.name, &gk_bytes);
         }
 
         if !is_sliding {
@@ -521,9 +519,7 @@ impl MVEngine {
                     });
                     // Clean up empty group and track for storage deletion
                     self.groups.remove(key);
-                    if self.sliding_window.is_some() {
-                        self.removed_groups.push(key.clone());
-                    }
+                    self.removed_groups.push(key.clone());
                 }
                 (None, true) => {
                     // Was never emitted and is empty — no delta needed
@@ -973,6 +969,48 @@ mod tests {
         assert_eq!(new_deltas.len(), 1);
         assert_eq!(new_deltas[0].operation, DeltaOperation::Update);
         assert_eq!(new_deltas[0].values.get("total_volume"), Some(&Value::Float64(35.0)));
+    }
+
+    #[test]
+    fn non_sliding_mv_finalize_deletes_empty_group_from_storage() {
+        let storage = test_storage();
+
+        // Phase 1: Two groups persisted — ETH/USDC and BTC/USDC
+        {
+            let mut mv = MVEngine::new(simple_sum_mv_def(), storage.clone());
+            mv.process_block(1, &[
+                make_row(&[("pool", Value::String("ETH/USDC".into())), ("amount", Value::Float64(10.0))]),
+            ]);
+            mv.process_block(2, &[
+                make_row(&[("pool", Value::String("BTC/USDC".into())), ("amount", Value::Float64(20.0))]),
+            ]);
+            let mut batch = StorageWriteBatch::new();
+            mv.finalize(1, &mut batch);
+            storage.commit(&batch).unwrap();
+        }
+
+        // Phase 2: Rollback block 2 (above finalized=1) — BTC/USDC group empties
+        {
+            let mut mv = MVEngine::new(simple_sum_mv_def(), storage.clone());
+            // Replay unfinalized block 2
+            mv.process_block(2, &[
+                make_row(&[("pool", Value::String("BTC/USDC".into())), ("amount", Value::Float64(20.0))]),
+            ]);
+            // Rollback to block 1, removing block 2
+            let deltas = mv.rollback(1);
+            // BTC/USDC should get a Delete delta (it only had unfinalized data)
+            assert!(deltas.iter().any(|d| d.operation == DeltaOperation::Delete));
+
+            let mut batch = StorageWriteBatch::new();
+            mv.finalize(1, &mut batch);
+            storage.commit(&batch).unwrap();
+        }
+
+        // Phase 3: Restore — BTC/USDC should not be resurrected
+        {
+            let mv = MVEngine::new(simple_sum_mv_def(), storage.clone());
+            assert_eq!(mv.groups.len(), 1, "only ETH/USDC should survive");
+        }
     }
 
     // -----------------------------------------------------------------------
