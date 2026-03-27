@@ -977,6 +977,7 @@ mod tests {
                     },
                 ],
                 group_by: vec!["user".into()],
+                sliding_window: None,
             }],
         }
     }
@@ -1013,6 +1014,7 @@ mod tests {
                     },
                 ],
                 group_by: vec!["pool".into()],
+                sliding_window: None,
             }],
         }
     }
@@ -1308,6 +1310,7 @@ mod tests {
                     },
                 ],
                 group_by: vec!["user".into()],
+                sliding_window: None,
             }],
         };
 

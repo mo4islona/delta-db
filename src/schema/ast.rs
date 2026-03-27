@@ -43,12 +43,24 @@ pub struct SelectItem {
     pub alias: Option<String>,
 }
 
+/// Configuration for a sliding (rolling) time window on a materialized view.
+/// When present, the MV aggregations cover only the last `interval_seconds`
+/// of data, with old blocks expiring as new data arrives.
+#[derive(Debug, Clone)]
+pub struct SlidingWindowDef {
+    /// Duration of the sliding window in seconds.
+    pub interval_seconds: u64,
+    /// The column containing row timestamps (milliseconds) used for expiry.
+    pub time_column: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct MVDef {
     pub name: String,
     pub source: String,
     pub select: Vec<SelectItem>,
     pub group_by: Vec<String>,
+    pub sliding_window: Option<SlidingWindowDef>,
 }
 
 #[derive(Debug, Clone)]

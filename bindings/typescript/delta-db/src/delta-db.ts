@@ -38,7 +38,7 @@ export interface IngestInput {
   data: Record<string, Record<string, any>[]>
   rollbackChain?: DeltaDbCursor[]
   finalizedHead: DeltaDbCursor
-  onDelta?: (batch: DeltaBatch) => void
+  onDelta?: (batch: DeltaBatch) => void | Promise<void>
 }
 
 export interface StateFieldDef {
@@ -82,7 +82,7 @@ export class DeltaDb {
     this.#native.finalize(block)
   }
 
-  ingest(input: IngestInput): DeltaBatch | null {
+  async ingest(input: IngestInput): Promise<DeltaBatch | null> {
     const buf = this.#native.ingest({
       data: Buffer.from(encoder.encode(input.data)),
       rollbackChain: input.rollbackChain,
@@ -90,7 +90,7 @@ export class DeltaDb {
     })
     const batch = buf ? (decode(buf) as DeltaBatch) : null
     if (batch && input.onDelta) {
-      input.onDelta(batch)
+      await input.onDelta(batch)
       this.#native.ack(batch.sequence)
     }
     return batch

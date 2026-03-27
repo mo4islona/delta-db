@@ -292,6 +292,9 @@ impl StorageBackend for MemoryBackend {
                 BatchOp::PutMeta { key, value } => {
                     inner.meta.insert(key.clone(), value.clone());
                 }
+                BatchOp::DeleteMvState { view, group_key } => {
+                    inner.mv_states.remove(&(view.clone(), group_key.clone()));
+                }
             }
         }
         Ok(())

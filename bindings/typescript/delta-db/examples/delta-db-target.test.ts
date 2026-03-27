@@ -235,10 +235,10 @@ describe('DeltaDb', () => {
 // ─── Ingest + Fork Resolution Tests ──────────────────────────────
 
 describe('DeltaDb ingest', () => {
-  it('should ingest data and return batch with cursor', () => {
+  it('should ingest data and return batch with cursor', async () => {
     const db = DeltaDb.open({ schema: SIMPLE_SCHEMA })
 
-    const batch = db.ingest({
+    const batch = await db.ingest({
       data: {
         transfers: [
           { block_number: 100, tx_index: 0, from_addr: 'alice', to_addr: 'bob', value: 10 },
@@ -258,10 +258,10 @@ describe('DeltaDb ingest', () => {
     expect(db.cursor?.hash).toBe('0x64')
   })
 
-  it('should resolve fork cursor from stored hashes', () => {
+  it('should resolve fork cursor from stored hashes', async () => {
     const db = DeltaDb.open({ schema: SIMPLE_SCHEMA })
 
-    db.ingest({
+    await db.ingest({
       data: {
         transfers: [
           { block_number: 100, tx_index: 0, from_addr: 'a', to_addr: 'b', value: 1 },

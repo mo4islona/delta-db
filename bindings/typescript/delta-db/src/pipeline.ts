@@ -60,7 +60,7 @@ export class Pipeline {
   /** @internal */
   _addView<TSource>(name: string, source: string, opts: ViewOptions<TSource>): ViewHandle {
     const groupByItems = Array.isArray(opts.groupBy) ? opts.groupBy : [opts.groupBy]
-    const sql = viewToSql(name, source, groupByItems, opts.select as any)
+    const sql = viewToSql(name, source, groupByItems, opts.select as any, opts.slidingWindow)
     this.#views.push({ sql })
     return new ViewHandle(name)
   }
