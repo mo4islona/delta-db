@@ -1,5 +1,5 @@
 import {describe, expect, it} from 'vitest'
-import {datetime, float64, interval, Pipeline, string, uint64} from '../src'
+import {datetime, float64, interval, Pipeline, string, uint64, type SlidingWindowOptions} from '../src'
 
 describe('Pipeline builder', () => {
     it('builds a PnL pipeline and produces correct MV output', () => {
@@ -279,5 +279,98 @@ describe('Pipeline builder', () => {
         expect(batch.tables.orders).toBeUndefined()
         expect(batch.tables.summary).toHaveLength(1)
         expect(batch.tables.summary[0].values.total).toBe(100)
+    })
+
+    it('creates a sliding window view with time-based expiry', () => {
+        const p = new Pipeline()
+        const trades = p.table('trades', {
+            block_number: uint64(),
+            block_time: datetime(),
+            pair: string(),
+            volume: float64(),
+        })
+
+        trades.createView('volume_1h', {
+            groupBy: ['pair'],
+            select: (agg) => ({
+                pair: agg.key.pair,
+                totalVolume: agg.sum('volume'),
+                tradeCount: agg.count(),
+            }),
+            slidingWindow: {
+                interval: '1 hour',
+                timeColumn: 'block_time',
+            },
+        })
+
+        const db = p.build()
+
+        // Block 1: ETH volume=100 at t=0
+        db.processBatch('trades', 1, [
+            {pair: 'ETH', volume: 100, block_time: 0},
+        ])
+        // Block 2: ETH volume=200 at t=30min
+        db.processBatch('trades', 2, [
+            {pair: 'ETH', volume: 200, block_time: 1_800_000},
+        ])
+
+        const batch1 = db.flush()!
+        const vol1 = batch1.tables.volume_1h
+        // Should have Insert + Update for ETH
+        const latest1 = vol1[vol1.length - 1]
+        expect(latest1.values.totalVolume).toBe(300)
+        expect(latest1.values.tradeCount).toBe(2)
+
+        // Block 3: ETH volume=50 at t=1hr+1s → block 1 expires
+        db.processBatch('trades', 3, [
+            {pair: 'ETH', volume: 50, block_time: 3_601_000},
+        ])
+        const batch2 = db.flush()!
+        const vol2 = batch2.tables.volume_1h
+        expect(vol2).toHaveLength(1)
+        // After expiry: 200 + 50 = 250
+        expect(vol2[0].values.totalVolume).toBe(250)
+        expect(vol2[0].values.tradeCount).toBe(2)
+    })
+
+    it('sliding window emits Delete when group fully expires', () => {
+        const p = new Pipeline()
+        const trades = p.table('trades', {
+            block_number: uint64(),
+            block_time: datetime(),
+            pair: string(),
+            volume: float64(),
+        })
+
+        trades.createView('volume_1h', {
+            groupBy: ['pair'],
+            select: (agg) => ({
+                pair: agg.key.pair,
+                totalVolume: agg.sum('volume'),
+            }),
+            slidingWindow: {
+                interval: '1 hour',
+                timeColumn: 'block_time',
+            },
+        })
+
+        const db = p.build()
+
+        // DOGE at t=0
+        db.processBatch('trades', 1, [{pair: 'DOGE', volume: 1000, block_time: 0}])
+        db.flush()
+
+        // ETH at t=1hr+1s → DOGE expires completely
+        db.processBatch('trades', 2, [{pair: 'ETH', volume: 100, block_time: 3_601_000}])
+        const batch = db.flush()!
+        const records = batch.tables.volume_1h
+
+        const dogeDelete = records.find((r: any) => r.key.pair === 'DOGE')
+        expect(dogeDelete).toBeDefined()
+        expect(dogeDelete!.operation).toBe('delete')
+
+        const ethInsert = records.find((r: any) => r.key.pair === 'ETH')
+        expect(ethInsert).toBeDefined()
+        expect(ethInsert!.operation).toBe('insert')
     })
 })
