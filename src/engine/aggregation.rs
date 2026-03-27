@@ -41,6 +41,10 @@ pub trait AggregationFunc: Send + Sync {
     fn from_bytes(bytes: &[u8]) -> Self
     where
         Self: Sized;
+
+    /// Return the block numbers that have unfinalized contributions.
+    /// Used for rebuilding block_groups from persisted sliding window state.
+    fn block_numbers(&self) -> Vec<BlockNumber>;
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +114,10 @@ impl AggregationFunc for SumAgg {
     fn from_bytes(bytes: &[u8]) -> Self {
         rmp_serde::from_slice(bytes).unwrap()
     }
+
+    fn block_numbers(&self) -> Vec<BlockNumber> {
+        self.blocks.keys().copied().collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +186,10 @@ impl AggregationFunc for CountAgg {
 
     fn from_bytes(bytes: &[u8]) -> Self {
         rmp_serde::from_slice(bytes).unwrap()
+    }
+
+    fn block_numbers(&self) -> Vec<BlockNumber> {
+        self.blocks.keys().copied().collect()
     }
 }
 
@@ -263,6 +275,10 @@ impl AggregationFunc for MinAgg {
     fn from_bytes(bytes: &[u8]) -> Self {
         rmp_serde::from_slice(bytes).unwrap()
     }
+
+    fn block_numbers(&self) -> Vec<BlockNumber> {
+        self.blocks.keys().copied().collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -347,6 +363,10 @@ impl AggregationFunc for MaxAgg {
     fn from_bytes(bytes: &[u8]) -> Self {
         rmp_serde::from_slice(bytes).unwrap()
     }
+
+    fn block_numbers(&self) -> Vec<BlockNumber> {
+        self.blocks.keys().copied().collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -429,6 +449,10 @@ impl AggregationFunc for AvgAgg {
 
     fn from_bytes(bytes: &[u8]) -> Self {
         rmp_serde::from_slice(bytes).unwrap()
+    }
+
+    fn block_numbers(&self) -> Vec<BlockNumber> {
+        self.blocks.keys().copied().collect()
     }
 }
 
@@ -514,6 +538,10 @@ impl AggregationFunc for FirstAgg {
     fn from_bytes(bytes: &[u8]) -> Self {
         rmp_serde::from_slice(bytes).unwrap()
     }
+
+    fn block_numbers(&self) -> Vec<BlockNumber> {
+        self.blocks.keys().copied().collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -592,6 +620,10 @@ impl AggregationFunc for LastAgg {
 
     fn from_bytes(bytes: &[u8]) -> Self {
         rmp_serde::from_slice(bytes).unwrap()
+    }
+
+    fn block_numbers(&self) -> Vec<BlockNumber> {
+        self.blocks.keys().copied().collect()
     }
 }
 

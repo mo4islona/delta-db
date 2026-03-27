@@ -42,6 +42,10 @@ path = "tests/uniswap/tests.rs"
 name = "polymarket"
 path = "tests/polymarket/tests.rs"
 
+[[test]]
+name = "sliding"
+path = "tests/sliding/tests.rs"
+
 [[bench]]
 name = "throughput"
 harness = false

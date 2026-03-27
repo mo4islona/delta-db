@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::error::Error;
 use crate::types::ColumnType;
 
@@ -13,6 +15,9 @@ pub fn parse_schema(input: &str) -> Result<Schema, Error> {
 
     // Split out CREATE REDUCER blocks before sqlparser sees them
     let (sql_part, reducers) = extract_reducers(&input_part)?;
+
+    // Strip WINDOW SLIDING clauses before sqlparser sees them
+    let (sql_part, sliding_windows) = extract_sliding_windows(&sql_part)?;
 
     // Preprocess: replace "CREATE VIRTUAL TABLE" with "CREATE TABLE"
     // and track which table names are virtual.
@@ -35,7 +40,11 @@ pub fn parse_schema(input: &str) -> Result<Schema, Error> {
                 tables.push(def);
             }
             sql::Statement::CreateView { name, query, materialized: true, .. } => {
-                materialized_views.push(parse_create_mv(&name, &query)?);
+                let mut mv = parse_create_mv(&name, &query)?;
+                if let Some(sw) = sliding_windows.get(&mv.name) {
+                    mv.sliding_window = Some(sw.clone());
+                }
+                materialized_views.push(mv);
             }
             _ => {
                 return Err(Error::Schema(format!("unsupported statement: {stmt}")));
@@ -103,6 +112,146 @@ fn extract_virtual_tables(input: &str) -> (String, Vec<String>) {
     }
 
     (result, virtual_names)
+}
+
+/// Strip `WINDOW SLIDING INTERVAL <N> <UNIT> BY <column>` clauses from MV
+/// definitions before sqlparser sees them. Returns cleaned SQL and a map of
+/// MV name → SlidingWindowDef.
+fn extract_sliding_windows(input: &str) -> Result<(String, HashMap<String, SlidingWindowDef>), Error> {
+    let mut result = String::with_capacity(input.len());
+    let mut windows = HashMap::new();
+    let upper = input.to_uppercase();
+    let mut pos = 0;
+
+    while pos < input.len() {
+        if let Some(offset) = upper[pos..].find("WINDOW SLIDING") {
+            let abs = pos + offset;
+            // Ensure word boundary
+            if abs > 0
+                && !input.as_bytes()[abs - 1].is_ascii_whitespace()
+                && input.as_bytes()[abs - 1] != b';'
+            {
+                result.push_str(&input[pos..=abs]);
+                pos = abs + 1;
+                continue;
+            }
+
+            // Copy everything before the WINDOW SLIDING clause
+            result.push_str(&input[pos..abs]);
+
+            // Parse: WINDOW SLIDING INTERVAL <N> <UNIT> BY <column>
+            let rest = &upper[abs + "WINDOW SLIDING".len()..];
+
+            // Skip whitespace and expect INTERVAL
+            let trimmed = rest.trim_start();
+            if !trimmed.starts_with("INTERVAL") {
+                return Err(Error::Schema(
+                    "WINDOW SLIDING: expected INTERVAL after SLIDING".into(),
+                ));
+            }
+            let after_interval = &trimmed["INTERVAL".len()..];
+            // Parse number
+            let after_interval_trimmed = after_interval.trim_start();
+            let num_end = after_interval_trimmed
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(after_interval_trimmed.len());
+            if num_end == 0 {
+                return Err(Error::Schema(
+                    "WINDOW SLIDING: expected numeric interval value".into(),
+                ));
+            }
+            let n: u64 = after_interval_trimmed[..num_end].parse().map_err(|_| {
+                Error::Schema("WINDOW SLIDING: invalid interval value".into())
+            })?;
+
+            // Parse unit
+            let after_num = after_interval_trimmed[num_end..].trim_start();
+            let unit_end = after_num
+                .find(|c: char| !c.is_ascii_alphabetic())
+                .unwrap_or(after_num.len());
+            let unit = &after_num[..unit_end];
+            let interval_seconds = match unit {
+                "SECOND" | "SECONDS" => n,
+                "MINUTE" | "MINUTES" => n * 60,
+                "HOUR" | "HOURS" => n * 3600,
+                "DAY" | "DAYS" => n * 86400,
+                _ => {
+                    return Err(Error::Schema(format!(
+                        "WINDOW SLIDING: unsupported interval unit '{unit}'"
+                    )));
+                }
+            };
+            if interval_seconds == 0 {
+                return Err(Error::Schema(
+                    "WINDOW SLIDING: interval must be greater than 0".into(),
+                ));
+            }
+
+            // Parse BY <column>
+            let after_unit = after_num[unit_end..].trim_start();
+            if !after_unit.starts_with("BY") {
+                return Err(Error::Schema(
+                    "WINDOW SLIDING: expected BY <column> after interval".into(),
+                ));
+            }
+            let after_by = after_unit["BY".len()..].trim_start();
+            let col_end = after_by
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(after_by.len());
+            if col_end == 0 {
+                return Err(Error::Schema(
+                    "WINDOW SLIDING: expected column name after BY".into(),
+                ));
+            }
+            // Compute the absolute end position of the WINDOW SLIDING clause
+            let clause_end_in_upper =
+                abs + "WINDOW SLIDING".len() + (rest.len() - after_by.len()) + col_end;
+            let time_column = input
+                [clause_end_in_upper - col_end..clause_end_in_upper]
+                .trim()
+                .to_string();
+
+            // Find MV name by scanning backward for CREATE MATERIALIZED VIEW <name>
+            let before = &upper[..abs];
+            let mv_name = find_mv_name_before(before, &input[..abs]).ok_or_else(|| {
+                Error::Schema(
+                    "WINDOW SLIDING: could not determine which MATERIALIZED VIEW this belongs to"
+                        .into(),
+                )
+            })?;
+
+            windows.insert(
+                mv_name,
+                SlidingWindowDef {
+                    interval_seconds,
+                    time_column,
+                },
+            );
+
+            pos = clause_end_in_upper;
+        } else {
+            result.push_str(&input[pos..]);
+            break;
+        }
+    }
+
+    Ok((result, windows))
+}
+
+/// Scan backward from `pos` in the uppercased text to find the most recent
+/// `CREATE MATERIALIZED VIEW <name>` and return the name (using original casing).
+fn find_mv_name_before(upper_before: &str, orig_before: &str) -> Option<String> {
+    let keyword = "CREATE MATERIALIZED VIEW";
+    let idx = upper_before.rfind(keyword)?;
+    let after_keyword = &orig_before[idx + keyword.len()..];
+    let trimmed = after_keyword.trim_start();
+    let name_end = trimmed
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(trimmed.len());
+    if name_end == 0 {
+        return None;
+    }
+    Some(trimmed[..name_end].to_string())
 }
 
 fn map_column_type(dt: &sql::DataType, col_name: &sql::Ident) -> Result<ColumnType, Error> {
@@ -185,7 +334,7 @@ fn parse_create_mv(name: &sql::ObjectName, query: &sql::Query) -> Result<MVDef, 
         }
     };
 
-    Ok(MVDef { name: view_name, source, select: items, group_by })
+    Ok(MVDef { name: view_name, source, select: items, group_by, sliding_window: None })
 }
 
 fn parse_select_expr(
@@ -1465,6 +1614,20 @@ fn validate_schema(schema: &Schema) -> Result<(), Error> {
                 mv.name, mv.source
             )));
         }
+
+        // Validate sliding window time_column exists in source table
+        if let Some(ref sw) = mv.sliding_window {
+            if source_is_table {
+                let source_table =
+                    schema.tables.iter().find(|t| t.name == mv.source).unwrap();
+                if !source_table.columns.iter().any(|c| c.name == sw.time_column) {
+                    return Err(Error::Schema(format!(
+                        "MV '{}': WINDOW SLIDING BY column '{}' not found in source table '{}'",
+                        mv.name, sw.time_column, mv.source
+                    )));
+                }
+            }
+        }
     }
 
     Ok(())
@@ -2061,5 +2224,169 @@ mod tests {
         "#;
         let err = parse_schema(sql).unwrap_err();
         assert!(err.to_string().contains("cannot source from itself"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Sliding window parser tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_sliding_window_basic() {
+        let sql = r#"
+            CREATE TABLE trades (
+                block_number UInt64,
+                block_time   DateTime,
+                pair         String,
+                volume       Float64
+            );
+
+            CREATE MATERIALIZED VIEW volume_1h AS
+              SELECT pair, SUM(volume) AS total_volume, COUNT() AS trade_count
+              FROM trades
+              GROUP BY pair
+              WINDOW SLIDING INTERVAL 1 HOUR BY block_time;
+        "#;
+        let schema = parse_schema(sql).unwrap();
+        assert_eq!(schema.materialized_views.len(), 1);
+        let mv = &schema.materialized_views[0];
+        assert_eq!(mv.name, "volume_1h");
+        assert_eq!(mv.group_by, vec!["pair"]);
+
+        let sw = mv.sliding_window.as_ref().expect("should have sliding window");
+        assert_eq!(sw.interval_seconds, 3600);
+        assert_eq!(sw.time_column, "block_time");
+    }
+
+    #[test]
+    fn parse_sliding_window_various_units() {
+        let cases = [
+            ("INTERVAL 30 SECOND", 30u64),
+            ("INTERVAL 5 MINUTE", 300),
+            ("INTERVAL 2 HOUR", 7200),
+            ("INTERVAL 1 DAY", 86400),
+        ];
+        for (interval, expected_secs) in cases {
+            let sql = format!(
+                r#"
+                CREATE TABLE t (block_number UInt64, ts DateTime, x Float64);
+                CREATE MATERIALIZED VIEW mv AS
+                  SELECT SUM(x) AS total FROM t GROUP BY x
+                  WINDOW SLIDING {interval} BY ts;
+                "#
+            );
+            let schema = parse_schema(&sql).unwrap();
+            let sw = schema.materialized_views[0]
+                .sliding_window
+                .as_ref()
+                .expect("should have sliding window");
+            assert_eq!(sw.interval_seconds, expected_secs, "failed for {interval}");
+            assert_eq!(sw.time_column, "ts");
+        }
+    }
+
+    #[test]
+    fn parse_sliding_window_mixed_mvs() {
+        let sql = r#"
+            CREATE TABLE trades (
+                block_number UInt64,
+                block_time   DateTime,
+                pair         String,
+                volume       Float64,
+                price        Float64
+            );
+
+            CREATE MATERIALIZED VIEW candles_5m AS
+              SELECT
+                pair,
+                toStartOfInterval(block_time, INTERVAL 5 MINUTE) AS window_start,
+                SUM(volume) AS vol
+              FROM trades
+              GROUP BY pair, window_start;
+
+            CREATE MATERIALIZED VIEW volume_1h AS
+              SELECT pair, SUM(volume) AS total
+              FROM trades
+              GROUP BY pair
+              WINDOW SLIDING INTERVAL 1 HOUR BY block_time;
+
+            CREATE MATERIALIZED VIEW totals AS
+              SELECT pair, SUM(volume) AS total
+              FROM trades
+              GROUP BY pair;
+        "#;
+        let schema = parse_schema(sql).unwrap();
+        assert_eq!(schema.materialized_views.len(), 3);
+
+        // candles_5m: no sliding window (tumbling)
+        assert!(schema.materialized_views[0].sliding_window.is_none());
+
+        // volume_1h: sliding window
+        let sw = schema.materialized_views[1]
+            .sliding_window
+            .as_ref()
+            .expect("volume_1h should have sliding window");
+        assert_eq!(sw.interval_seconds, 3600);
+
+        // totals: no sliding window (unbounded)
+        assert!(schema.materialized_views[2].sliding_window.is_none());
+    }
+
+    #[test]
+    fn parse_sliding_window_no_window_backward_compat() {
+        let sql = r#"
+            CREATE TABLE t (block_number UInt64, x Float64);
+            CREATE MATERIALIZED VIEW mv AS
+              SELECT SUM(x) AS total FROM t GROUP BY x;
+        "#;
+        let schema = parse_schema(sql).unwrap();
+        assert!(schema.materialized_views[0].sliding_window.is_none());
+    }
+
+    #[test]
+    fn parse_sliding_window_rejects_missing_interval() {
+        let sql = r#"
+            CREATE TABLE t (block_number UInt64, ts DateTime, x Float64);
+            CREATE MATERIALIZED VIEW mv AS
+              SELECT SUM(x) AS total FROM t GROUP BY x
+              WINDOW SLIDING BY ts;
+        "#;
+        let err = parse_schema(sql).unwrap_err();
+        assert!(err.to_string().contains("INTERVAL"));
+    }
+
+    #[test]
+    fn parse_sliding_window_rejects_zero_interval() {
+        let sql = r#"
+            CREATE TABLE t (block_number UInt64, ts DateTime, x Float64);
+            CREATE MATERIALIZED VIEW mv AS
+              SELECT SUM(x) AS total FROM t GROUP BY x
+              WINDOW SLIDING INTERVAL 0 HOUR BY ts;
+        "#;
+        let err = parse_schema(sql).unwrap_err();
+        assert!(err.to_string().contains("greater than 0"));
+    }
+
+    #[test]
+    fn parse_sliding_window_rejects_missing_by() {
+        let sql = r#"
+            CREATE TABLE t (block_number UInt64, ts DateTime, x Float64);
+            CREATE MATERIALIZED VIEW mv AS
+              SELECT SUM(x) AS total FROM t GROUP BY x
+              WINDOW SLIDING INTERVAL 1 HOUR;
+        "#;
+        let err = parse_schema(sql).unwrap_err();
+        assert!(err.to_string().contains("BY"));
+    }
+
+    #[test]
+    fn parse_sliding_window_rejects_bad_time_column() {
+        let sql = r#"
+            CREATE TABLE t (block_number UInt64, x Float64);
+            CREATE MATERIALIZED VIEW mv AS
+              SELECT SUM(x) AS total FROM t GROUP BY x
+              WINDOW SLIDING INTERVAL 1 HOUR BY nonexistent;
+        "#;
+        let err = parse_schema(sql).unwrap_err();
+        assert!(err.to_string().contains("nonexistent"));
     }
 }

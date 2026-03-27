@@ -26,6 +26,10 @@ pub enum BatchOp {
         key: String,
         value: Vec<u8>,
     },
+    DeleteMvState {
+        view: String,
+        group_key: Vec<u8>,
+    },
 }
 
 /// A collection of operations to be committed atomically.
@@ -68,6 +72,13 @@ impl StorageWriteBatch {
         self.ops.push(BatchOp::PutMeta {
             key: key.to_string(),
             value: value.to_vec(),
+        });
+    }
+
+    pub fn delete_mv_state(&mut self, view: &str, group_key: &[u8]) {
+        self.ops.push(BatchOp::DeleteMvState {
+            view: view.to_string(),
+            group_key: group_key.to_vec(),
         });
     }
 }

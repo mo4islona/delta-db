@@ -466,6 +466,10 @@ impl StorageBackend for RocksDbBackend {
                     let cf = self.db.cf_handle(CF_META).expect("meta CF");
                     wb.put_cf(cf, key.as_bytes(), value);
                 }
+                BatchOp::DeleteMvState { view, group_key } => {
+                    let cf = self.db.cf_handle(CF_MV).expect("mv CF");
+                    wb.delete_cf(cf, kv_key(view, group_key));
+                }
             }
         }
         self.db.write(wb).map_err(to_err)
