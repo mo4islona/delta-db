@@ -470,6 +470,21 @@ impl StorageBackend for RocksDbBackend {
                     let cf = self.db.cf_handle(CF_MV).expect("mv CF");
                     wb.delete_cf(cf, kv_key(view, group_key));
                 }
+                BatchOp::DeleteRawRowsAfter { table, after_block } => {
+                    if *after_block < BlockNumber::MAX {
+                        let cf = self.db.cf_handle(CF_RAW).expect("raw CF");
+                        let start = raw_key(table, *after_block + 1);
+                        let ub = upper_bound(&raw_table_prefix(table));
+                        let mut opts = ReadOptions::default();
+                        opts.set_iterate_upper_bound(ub);
+                        for item in self.db
+                            .iterator_cf_opt(cf, opts, IteratorMode::From(&start, Direction::Forward))
+                        {
+                            let (k, _) = item.map_err(to_err)?;
+                            wb.delete_cf(cf, &k);
+                        }
+                    }
+                }
             }
         }
         self.db.write(wb).map_err(to_err)
