@@ -37,6 +37,12 @@ export function parseDuration(s: string): number {
   return n * mult
 }
 
+// ─── SQL escaping ───────────────────────────────────────────────
+
+function sqlEscape(s: string): string {
+  return s.replace(/'/g, "''")
+}
+
 // ─── Interval helper ─────────────────────────────────────────────
 
 export interface IntervalExpr {
@@ -102,9 +108,19 @@ export interface ReducerOptions<TState, TRow, TEmit> {
   reduce: (state: ReducerCtx<TState, TEmit>, row: TRow) => void
 }
 
+export interface SlidingWindowOptions<TSource = any> {
+  /** Window duration, e.g. "1 hour", "30 minutes", "86400 seconds" */
+  interval: string
+  /** Column containing row timestamps (DateTime in milliseconds).
+   *  Must be a numeric/DateTime column from the source table or reducer output. */
+  timeColumn: string & keyof TSource
+}
+
 export interface ViewOptions<TSource = any> {
   groupBy: GroupByItem | GroupByItem[]
   select: (agg: AggProxy<TSource>) => Record<string, AggExpr | KeyRef>
+  /** When set, the MV computes rolling aggregations over the given time window. */
+  slidingWindow?: SlidingWindowOptions<TSource>
 }
 
 // ─── Type inference from initialState ────────────────────────────
@@ -125,7 +141,7 @@ export function inferStateFields(initialState: Record<string, unknown>): StateFi
         break
       case 'string':
         columnType = 'String'
-        defaultValue = `'${value}'`
+        defaultValue = `'${sqlEscape(value as string)}'`
         break
       case 'boolean':
         columnType = 'Boolean'
@@ -133,11 +149,11 @@ export function inferStateFields(initialState: Record<string, unknown>): StateFi
         break
       case 'object':
         columnType = 'Json'
-        defaultValue = `'${JSON.stringify(value)}'`
+        defaultValue = `'${sqlEscape(JSON.stringify(value))}'`
         break
       default:
         columnType = 'String'
-        defaultValue = `'${String(value)}'`
+        defaultValue = `'${sqlEscape(String(value))}'`
     }
     fields.push({ name, columnType, defaultValue })
   }
@@ -176,6 +192,7 @@ export function viewToSql(
   source: string,
   groupByItems: GroupByItem[],
   selectFn: (agg: AggProxy<any>) => Record<string, AggExpr | KeyRef>,
+  slidingWindow?: SlidingWindowOptions,
 ): string {
   const groupByCols: string[] = []
   const intervalDefs: { column: string; seconds: number; alias: string }[] = []
@@ -240,5 +257,12 @@ export function viewToSql(
     }
   }
 
-  return `CREATE MATERIALIZED VIEW ${name} AS SELECT ${selectItems.join(', ')} FROM ${source} GROUP BY ${groupByCols.join(', ')};`
+  let sql = `CREATE MATERIALIZED VIEW ${name} AS SELECT ${selectItems.join(', ')} FROM ${source} GROUP BY ${groupByCols.join(', ')}`
+
+  if (slidingWindow) {
+    const seconds = parseDuration(slidingWindow.interval)
+    sql += ` WINDOW SLIDING INTERVAL ${seconds} SECOND BY ${slidingWindow.timeColumn}`
+  }
+
+  return sql + ';'
 }

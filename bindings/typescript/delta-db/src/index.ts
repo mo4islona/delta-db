@@ -8,6 +8,7 @@ export {
   type KeyRef,
   type ReducerCtx,
   type ReducerOptions,
+  type SlidingWindowOptions,
   type ViewOptions,
 } from './ddl'
 export {

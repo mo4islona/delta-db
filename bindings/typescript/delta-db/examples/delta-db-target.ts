@@ -57,7 +57,7 @@ export function deltaDbTarget<TInput = Record<string, any[]>>({
           throw new Error('ctx.head.finalized is required — source must provide finalization info')
         }
 
-        const batch = db.ingest({
+        const batch = await db.ingest({
           data: mapped,
           rollbackChain: ctx.state.rollbackChain,
           finalizedHead: ctx.head.finalized,
