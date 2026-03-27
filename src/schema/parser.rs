@@ -170,17 +170,22 @@ fn extract_sliding_windows(input: &str) -> Result<(String, HashMap<String, Slidi
                 .find(|c: char| !c.is_ascii_alphabetic())
                 .unwrap_or(after_num.len());
             let unit = &after_num[..unit_end];
-            let interval_seconds = match unit {
-                "SECOND" | "SECONDS" => n,
-                "MINUTE" | "MINUTES" => n * 60,
-                "HOUR" | "HOURS" => n * 3600,
-                "DAY" | "DAYS" => n * 86400,
+            let multiplier: u64 = match unit {
+                "SECOND" | "SECONDS" => 1,
+                "MINUTE" | "MINUTES" => 60,
+                "HOUR" | "HOURS" => 3600,
+                "DAY" | "DAYS" => 86400,
                 _ => {
                     return Err(Error::Schema(format!(
                         "WINDOW SLIDING: unsupported interval unit '{unit}'"
                     )));
                 }
             };
+            let interval_seconds = n.checked_mul(multiplier).ok_or_else(|| {
+                Error::Schema(format!(
+                    "WINDOW SLIDING: interval value {n} {unit} overflows"
+                ))
+            })?;
             if interval_seconds == 0 {
                 return Err(Error::Schema(
                     "WINDOW SLIDING: interval must be greater than 0".into(),
@@ -240,18 +245,29 @@ fn extract_sliding_windows(input: &str) -> Result<(String, HashMap<String, Slidi
 
 /// Scan backward from `pos` in the uppercased text to find the most recent
 /// `CREATE MATERIALIZED VIEW <name>` and return the name (using original casing).
+/// Handles plain identifiers (`my_view`), dotted names (`schema.view`),
+/// and quoted identifiers (`"My View"`).
 fn find_mv_name_before(upper_before: &str, orig_before: &str) -> Option<String> {
     let keyword = "CREATE MATERIALIZED VIEW";
     let idx = upper_before.rfind(keyword)?;
     let after_keyword = &orig_before[idx + keyword.len()..];
     let trimmed = after_keyword.trim_start();
-    let name_end = trimmed
-        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .unwrap_or(trimmed.len());
-    if name_end == 0 {
-        return None;
+
+    if trimmed.starts_with('"') {
+        // Quoted identifier: find closing quote
+        let end = trimmed[1..].find('"').map(|i| i + 2)?;
+        // Return without quotes to match sqlparser's ObjectName.to_string()
+        Some(trimmed[1..end - 1].to_string())
+    } else {
+        // Unquoted: allow alphanumeric, underscore, and dot (for schema.name)
+        let name_end = trimmed
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '.')
+            .unwrap_or(trimmed.len());
+        if name_end == 0 {
+            return None;
+        }
+        Some(trimmed[..name_end].to_string())
     }
-    Some(trimmed[..name_end].to_string())
 }
 
 fn map_column_type(dt: &sql::DataType, col_name: &sql::Ident) -> Result<ColumnType, Error> {
@@ -1615,16 +1631,31 @@ fn validate_schema(schema: &Schema) -> Result<(), Error> {
             )));
         }
 
-        // Validate sliding window time_column exists in source table
+        // Validate sliding window time_column exists in source table with a numeric type
         if let Some(ref sw) = mv.sliding_window {
             if source_is_table {
                 let source_table =
                     schema.tables.iter().find(|t| t.name == mv.source).unwrap();
-                if !source_table.columns.iter().any(|c| c.name == sw.time_column) {
-                    return Err(Error::Schema(format!(
-                        "MV '{}': WINDOW SLIDING BY column '{}' not found in source table '{}'",
-                        mv.name, sw.time_column, mv.source
-                    )));
+                let col = source_table.columns.iter().find(|c| c.name == sw.time_column);
+                match col {
+                    None => {
+                        return Err(Error::Schema(format!(
+                            "MV '{}': WINDOW SLIDING BY column '{}' not found in source table '{}'",
+                            mv.name, sw.time_column, mv.source
+                        )));
+                    }
+                    Some(c) => {
+                        let valid = matches!(
+                            c.column_type,
+                            ColumnType::DateTime | ColumnType::UInt64 | ColumnType::Int64
+                        );
+                        if !valid {
+                            return Err(Error::Schema(format!(
+                                "MV '{}': WINDOW SLIDING BY column '{}' must be DateTime, UInt64, or Int64 (got {:?})",
+                                mv.name, sw.time_column, c.column_type
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -2388,5 +2419,29 @@ mod tests {
         "#;
         let err = parse_schema(sql).unwrap_err();
         assert!(err.to_string().contains("nonexistent"));
+    }
+
+    #[test]
+    fn parse_sliding_window_rejects_non_datetime_column() {
+        let sql = r#"
+            CREATE TABLE t (block_number UInt64, name String, x Float64);
+            CREATE MATERIALIZED VIEW mv AS
+              SELECT SUM(x) AS total FROM t GROUP BY x
+              WINDOW SLIDING INTERVAL 1 HOUR BY name;
+        "#;
+        let err = parse_schema(sql).unwrap_err();
+        assert!(err.to_string().contains("must be DateTime"));
+    }
+
+    #[test]
+    fn parse_sliding_window_rejects_overflow_interval() {
+        let sql = r#"
+            CREATE TABLE t (block_number UInt64, ts DateTime, x Float64);
+            CREATE MATERIALIZED VIEW mv AS
+              SELECT SUM(x) AS total FROM t GROUP BY x
+              WINDOW SLIDING INTERVAL 999999999999999999 DAY BY ts;
+        "#;
+        let err = parse_schema(sql).unwrap_err();
+        assert!(err.to_string().contains("overflows"));
     }
 }

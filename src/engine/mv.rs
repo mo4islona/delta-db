@@ -61,6 +61,8 @@ pub struct MVEngine {
     block_times: BTreeMap<BlockNumber, i64>,
     /// The maximum timestamp seen across all blocks (the "watermark").
     current_watermark: i64,
+    /// Group keys removed since last finalize (for storage cleanup).
+    removed_groups: Vec<GroupKey>,
 }
 
 impl MVEngine {
@@ -166,10 +168,11 @@ impl MVEngine {
                 }
             }
 
-            // Rebuild block_groups from restored agg state
+            // Rebuild block_groups from restored agg state (union of all aggs'
+            // block numbers, since different agg types may track different blocks)
             for (group_key, aggs) in &groups {
-                if let Some(first_agg) = aggs.first() {
-                    for block in first_agg.block_numbers() {
+                for agg in aggs {
+                    for block in agg.block_numbers() {
                         block_groups
                             .entry(block)
                             .or_default()
@@ -195,6 +198,7 @@ impl MVEngine {
             sliding_window,
             block_times,
             current_watermark,
+            removed_groups: Vec::new(),
         }
     }
 
@@ -355,6 +359,14 @@ impl MVEngine {
             batch.put_meta(&format!("mv_block_times:{}", self.def.name), &bt_bytes);
         }
 
+        // Delete stale groups from storage (expired/removed since last finalize)
+        if is_sliding {
+            for key in self.removed_groups.drain(..) {
+                let gk_bytes = storage::encode_group_key(&key);
+                batch.delete_mv_state(&self.def.name, &gk_bytes);
+            }
+        }
+
         if !is_sliding {
             // Remove finalized blocks from tracking using split_off
             let remaining = self.block_groups.split_off(&(block + 1));
@@ -367,7 +379,7 @@ impl MVEngine {
     /// Returns the set of group keys affected by expiry.
     fn expire_old_blocks(&mut self) -> FxHashSet<GroupKey> {
         let sw = self.sliding_window.as_ref().unwrap();
-        let window_ms = sw.interval_seconds as i64 * 1000;
+        let window_ms = (sw.interval_seconds as i64).saturating_mul(1000);
         let cutoff = self.current_watermark - window_ms;
 
         // Find all blocks with timestamp < cutoff (strict less-than: boundary is inclusive).
@@ -499,7 +511,7 @@ impl MVEngine {
                     }
                 }
                 (Some(prev_vals), true) => {
-                    // Group became empty after rollback -> Delete
+                    // Group became empty after rollback/expiry -> Delete
                     deltas.push(DeltaRecord {
                         table: self.def.name.clone(),
                         operation: DeltaOperation::Delete,
@@ -507,8 +519,11 @@ impl MVEngine {
                         values: prev_vals.clone(),
                         prev_values: Some(prev_vals),
                     });
-                    // Clean up empty group
+                    // Clean up empty group and track for storage deletion
                     self.groups.remove(key);
+                    if self.sliding_window.is_some() {
+                        self.removed_groups.push(key.clone());
+                    }
                 }
                 (None, true) => {
                     // Was never emitted and is empty — no delta needed
