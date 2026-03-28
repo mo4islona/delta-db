@@ -4,6 +4,105 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{BlockNumber, Value};
 
+// ---------------------------------------------------------------------------
+// Numeric accumulator — mode determined by column type at construction
+// ---------------------------------------------------------------------------
+
+use crate::types::ColumnType;
+
+/// Whether an aggregation column uses integer or float arithmetic.
+/// Determined once at construction from the source column's declared type.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+enum NumMode {
+    Int,
+    Float,
+}
+
+impl NumMode {
+    fn from_column_type(ct: &ColumnType) -> Self {
+        match ct {
+            ColumnType::UInt64 | ColumnType::Int64 | ColumnType::DateTime => NumMode::Int,
+            _ => NumMode::Float,
+        }
+    }
+}
+
+/// Accumulates numeric values in either i128 (integer columns) or f64 (float columns).
+/// The variant is fixed at construction — no mixed-type branches.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+enum NumAccum {
+    Int(i128),
+    Float(f64),
+}
+
+impl NumAccum {
+    fn zero(mode: NumMode) -> Self {
+        match mode {
+            NumMode::Int => NumAccum::Int(0),
+            NumMode::Float => NumAccum::Float(0.0),
+        }
+    }
+
+    /// Extract a numeric value, coercing to the accumulator's mode.
+    fn from_value(v: &Value, mode: NumMode) -> Option<Self> {
+        match mode {
+            NumMode::Int => match v {
+                Value::UInt64(n) => Some(NumAccum::Int(*n as i128)),
+                Value::Int64(n) => Some(NumAccum::Int(*n as i128)),
+                Value::DateTime(n) => Some(NumAccum::Int(*n as i128)),
+                _ => None,
+            },
+            NumMode::Float => v.as_f64().map(NumAccum::Float),
+        }
+    }
+
+    fn add(self, other: NumAccum) -> NumAccum {
+        match (self, other) {
+            (NumAccum::Int(a), NumAccum::Int(b)) => NumAccum::Int(a.saturating_add(b)),
+            (NumAccum::Float(a), NumAccum::Float(b)) => NumAccum::Float(a + b),
+            _ => unreachable!("mode is fixed at construction"),
+        }
+    }
+
+    fn to_f64(self) -> f64 {
+        match self {
+            NumAccum::Int(v) => v as f64,
+            NumAccum::Float(v) => v,
+        }
+    }
+
+    fn to_value(self) -> Value {
+        match self {
+            NumAccum::Int(v) => {
+                if v >= 0 && v <= u64::MAX as i128 {
+                    Value::UInt64(v as u64)
+                } else if v >= i64::MIN as i128 && v <= i64::MAX as i128 {
+                    Value::Int64(v as i64)
+                } else {
+                    Value::Float64(v as f64)
+                }
+            }
+            NumAccum::Float(v) => Value::Float64(v),
+        }
+    }
+
+    fn min(self, other: NumAccum) -> NumAccum {
+        match (self, other) {
+            (NumAccum::Int(a), NumAccum::Int(b)) => NumAccum::Int(a.min(b)),
+            (NumAccum::Float(a), NumAccum::Float(b)) => NumAccum::Float(a.min(b)),
+            _ => unreachable!("mode is fixed at construction"),
+        }
+    }
+
+    fn max(self, other: NumAccum) -> NumAccum {
+        match (self, other) {
+            (NumAccum::Int(a), NumAccum::Int(b)) => NumAccum::Int(a.max(b)),
+            (NumAccum::Float(a), NumAccum::Float(b)) => NumAccum::Float(a.max(b)),
+            _ => unreachable!("mode is fixed at construction"),
+        }
+    }
+}
+
 /// Trait for rollback-aware aggregation functions.
 ///
 /// Each function tracks per-block contributions separately from finalized state,
@@ -53,16 +152,18 @@ pub trait AggregationFunc: Send + Sync {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SumAgg {
-    finalized: f64,
-    blocks: BTreeMap<BlockNumber, f64>,
-    /// Whether any block has ever been finalized (prevents false deletion on zero-sum groups).
+    mode: NumMode,
+    finalized: NumAccum,
+    blocks: BTreeMap<BlockNumber, NumAccum>,
     has_finalized: bool,
 }
 
 impl SumAgg {
-    pub fn new() -> Self {
+    pub fn new(column_type: &ColumnType) -> Self {
+        let mode = NumMode::from_column_type(column_type);
         Self {
-            finalized: 0.0,
+            mode,
+            finalized: NumAccum::zero(mode),
             blocks: BTreeMap::new(),
             has_finalized: false,
         }
@@ -71,8 +172,24 @@ impl SumAgg {
 
 impl AggregationFunc for SumAgg {
     fn add_block(&mut self, block: BlockNumber, values: &[Value]) {
-        let partial: f64 = values.iter().filter_map(|v| v.as_f64()).sum();
-        *self.blocks.entry(block).or_insert(0.0) += partial;
+        let mut has_values = false;
+        let partial = values
+            .iter()
+            .filter_map(|v| {
+                let n = NumAccum::from_value(v, self.mode);
+                if n.is_some() {
+                    has_values = true;
+                }
+                n
+            })
+            .fold(NumAccum::zero(self.mode), NumAccum::add);
+        if has_values {
+            let entry = self
+                .blocks
+                .entry(block)
+                .or_insert(NumAccum::zero(self.mode));
+            *entry = entry.add(partial);
+        }
     }
 
     fn remove_block(&mut self, block: BlockNumber) {
@@ -84,23 +201,23 @@ impl AggregationFunc for SumAgg {
     }
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
-        let to_finalize: Vec<_> = self
-            .blocks
-            .range(..=block)
-            .map(|(&b, &v)| (b, v))
-            .collect();
+        let to_finalize: Vec<_> = self.blocks.range(..=block).map(|(&b, &v)| (b, v)).collect();
         if !to_finalize.is_empty() {
             self.has_finalized = true;
         }
         for (b, v) in to_finalize {
-            self.finalized += v;
+            self.finalized = self.finalized.add(v);
             self.blocks.remove(&b);
         }
     }
 
     fn current_value(&self) -> Value {
-        let total = self.finalized + self.blocks.values().sum::<f64>();
-        Value::Float64(total)
+        let total = self
+            .blocks
+            .values()
+            .copied()
+            .fold(self.finalized, NumAccum::add);
+        total.to_value()
     }
 
     fn has_data(&self) -> bool {
@@ -160,11 +277,7 @@ impl AggregationFunc for CountAgg {
     }
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
-        let to_finalize: Vec<_> = self
-            .blocks
-            .range(..=block)
-            .map(|(&b, &v)| (b, v))
-            .collect();
+        let to_finalize: Vec<_> = self.blocks.range(..=block).map(|(&b, &v)| (b, v)).collect();
         for (b, v) in to_finalize {
             self.finalized += v;
             self.blocks.remove(&b);
@@ -205,13 +318,15 @@ impl AggregationFunc for CountAgg {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MinAgg {
-    finalized: Option<f64>,
-    blocks: BTreeMap<BlockNumber, f64>,
+    mode: NumMode,
+    finalized: Option<NumAccum>,
+    blocks: BTreeMap<BlockNumber, NumAccum>,
 }
 
 impl MinAgg {
-    pub fn new() -> Self {
+    pub fn new(column_type: &ColumnType) -> Self {
         Self {
+            mode: NumMode::from_column_type(column_type),
             finalized: None,
             blocks: BTreeMap::new(),
         }
@@ -220,10 +335,13 @@ impl MinAgg {
 
 impl AggregationFunc for MinAgg {
     fn add_block(&mut self, block: BlockNumber, values: &[Value]) {
-        let block_min = values.iter().filter_map(|v| v.as_f64()).reduce(f64::min);
+        let block_min = values
+            .iter()
+            .filter_map(|v| NumAccum::from_value(v, self.mode))
+            .reduce(NumAccum::min);
         if let Some(min_val) = block_min {
-            let entry = self.blocks.entry(block).or_insert(f64::INFINITY);
-            *entry = entry.min(min_val);
+            let entry = self.blocks.entry(block).or_insert(min_val);
+            *entry = (*entry).min(min_val);
         }
     }
 
@@ -236,11 +354,7 @@ impl AggregationFunc for MinAgg {
     }
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
-        let to_finalize: Vec<_> = self
-            .blocks
-            .range(..=block)
-            .map(|(&b, &v)| (b, v))
-            .collect();
+        let to_finalize: Vec<_> = self.blocks.range(..=block).map(|(&b, &v)| (b, v)).collect();
         for (b, v) in to_finalize {
             self.finalized = Some(match self.finalized {
                 Some(f) => f.min(v),
@@ -251,7 +365,7 @@ impl AggregationFunc for MinAgg {
     }
 
     fn current_value(&self) -> Value {
-        let unfinalized_min = self.blocks.values().copied().reduce(f64::min);
+        let unfinalized_min = self.blocks.values().copied().reduce(NumAccum::min);
         let result = match (self.finalized, unfinalized_min) {
             (Some(f), Some(u)) => Some(f.min(u)),
             (Some(f), None) => Some(f),
@@ -259,7 +373,7 @@ impl AggregationFunc for MinAgg {
             (None, None) => None,
         };
         match result {
-            Some(v) => Value::Float64(v),
+            Some(v) => v.to_value(),
             None => Value::Null,
         }
     }
@@ -293,13 +407,15 @@ impl AggregationFunc for MinAgg {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaxAgg {
-    finalized: Option<f64>,
-    blocks: BTreeMap<BlockNumber, f64>,
+    mode: NumMode,
+    finalized: Option<NumAccum>,
+    blocks: BTreeMap<BlockNumber, NumAccum>,
 }
 
 impl MaxAgg {
-    pub fn new() -> Self {
+    pub fn new(column_type: &ColumnType) -> Self {
         Self {
+            mode: NumMode::from_column_type(column_type),
             finalized: None,
             blocks: BTreeMap::new(),
         }
@@ -308,10 +424,13 @@ impl MaxAgg {
 
 impl AggregationFunc for MaxAgg {
     fn add_block(&mut self, block: BlockNumber, values: &[Value]) {
-        let block_max = values.iter().filter_map(|v| v.as_f64()).reduce(f64::max);
+        let block_max = values
+            .iter()
+            .filter_map(|v| NumAccum::from_value(v, self.mode))
+            .reduce(NumAccum::max);
         if let Some(max_val) = block_max {
-            let entry = self.blocks.entry(block).or_insert(f64::NEG_INFINITY);
-            *entry = entry.max(max_val);
+            let entry = self.blocks.entry(block).or_insert(max_val);
+            *entry = (*entry).max(max_val);
         }
     }
 
@@ -324,11 +443,7 @@ impl AggregationFunc for MaxAgg {
     }
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
-        let to_finalize: Vec<_> = self
-            .blocks
-            .range(..=block)
-            .map(|(&b, &v)| (b, v))
-            .collect();
+        let to_finalize: Vec<_> = self.blocks.range(..=block).map(|(&b, &v)| (b, v)).collect();
         for (b, v) in to_finalize {
             self.finalized = Some(match self.finalized {
                 Some(f) => f.max(v),
@@ -339,7 +454,7 @@ impl AggregationFunc for MaxAgg {
     }
 
     fn current_value(&self) -> Value {
-        let unfinalized_max = self.blocks.values().copied().reduce(f64::max);
+        let unfinalized_max = self.blocks.values().copied().reduce(NumAccum::max);
         let result = match (self.finalized, unfinalized_max) {
             (Some(f), Some(u)) => Some(f.max(u)),
             (Some(f), None) => Some(f),
@@ -347,7 +462,7 @@ impl AggregationFunc for MaxAgg {
             (None, None) => None,
         };
         match result {
-            Some(v) => Value::Float64(v),
+            Some(v) => v.to_value(),
             None => Value::Null,
         }
     }
@@ -381,15 +496,18 @@ impl AggregationFunc for MaxAgg {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AvgAgg {
-    finalized_sum: f64,
+    mode: NumMode,
+    finalized_sum: NumAccum,
     finalized_count: u64,
-    blocks: BTreeMap<BlockNumber, (f64, u64)>,
+    blocks: BTreeMap<BlockNumber, (NumAccum, u64)>,
 }
 
 impl AvgAgg {
-    pub fn new() -> Self {
+    pub fn new(column_type: &ColumnType) -> Self {
+        let mode = NumMode::from_column_type(column_type);
         Self {
-            finalized_sum: 0.0,
+            mode,
+            finalized_sum: NumAccum::zero(mode),
             finalized_count: 0,
             blocks: BTreeMap::new(),
         }
@@ -398,11 +516,21 @@ impl AvgAgg {
 
 impl AggregationFunc for AvgAgg {
     fn add_block(&mut self, block: BlockNumber, values: &[Value]) {
-        let nums: Vec<f64> = values.iter().filter_map(|v| v.as_f64()).collect();
-        if !nums.is_empty() {
-            let entry = self.blocks.entry(block).or_insert((0.0, 0));
-            entry.0 += nums.iter().sum::<f64>();
-            entry.1 += nums.len() as u64;
+        let mut sum = NumAccum::zero(self.mode);
+        let mut count = 0u64;
+        for v in values {
+            if let Some(n) = NumAccum::from_value(v, self.mode) {
+                sum = sum.add(n);
+                count += 1;
+            }
+        }
+        if count > 0 {
+            let entry = self
+                .blocks
+                .entry(block)
+                .or_insert((NumAccum::zero(self.mode), 0));
+            entry.0 = entry.0.add(sum);
+            entry.1 += count;
         }
     }
 
@@ -415,27 +543,26 @@ impl AggregationFunc for AvgAgg {
     }
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
-        let to_finalize: Vec<_> = self
-            .blocks
-            .range(..=block)
-            .map(|(&b, &v)| (b, v))
-            .collect();
+        let to_finalize: Vec<_> = self.blocks.range(..=block).map(|(&b, &v)| (b, v)).collect();
         for (b, (s, c)) in to_finalize {
-            self.finalized_sum += s;
+            self.finalized_sum = self.finalized_sum.add(s);
             self.finalized_count += c;
             self.blocks.remove(&b);
         }
     }
 
     fn current_value(&self) -> Value {
-        let total_sum: f64 =
-            self.finalized_sum + self.blocks.values().map(|(s, _)| s).sum::<f64>();
+        let total_sum = self
+            .blocks
+            .values()
+            .map(|(s, _)| *s)
+            .fold(self.finalized_sum, NumAccum::add);
         let total_count: u64 =
             self.finalized_count + self.blocks.values().map(|(_, c)| c).sum::<u64>();
         if total_count == 0 {
             Value::Null
         } else {
-            Value::Float64(total_sum / total_count as f64)
+            Value::Float64(total_sum.to_f64() / total_count as f64)
         }
     }
 
@@ -520,11 +647,7 @@ impl AggregationFunc for FirstAgg {
             return v.clone();
         }
         // Otherwise pick the earliest unfinalized block's first value
-        self.blocks
-            .values()
-            .next()
-            .cloned()
-            .unwrap_or(Value::Null)
+        self.blocks.values().next().cloned().unwrap_or(Value::Null)
     }
 
     fn has_data(&self) -> bool {
@@ -652,14 +775,14 @@ pub fn to_start_of_interval(datetime_ms: i64, interval_seconds: u64) -> i64 {
 
 use crate::schema::ast::AggFunc;
 
-/// Create a boxed aggregation function from the schema's AggFunc enum.
-pub fn create_agg(func: &AggFunc) -> Box<dyn AggregationFunc> {
+/// Create a boxed aggregation function from the schema's AggFunc enum and source column type.
+pub fn create_agg(func: &AggFunc, column_type: &ColumnType) -> Box<dyn AggregationFunc> {
     match func {
-        AggFunc::Sum => Box::new(SumAgg::new()),
+        AggFunc::Sum => Box::new(SumAgg::new(column_type)),
         AggFunc::Count => Box::new(CountAgg::new()),
-        AggFunc::Min => Box::new(MinAgg::new()),
-        AggFunc::Max => Box::new(MaxAgg::new()),
-        AggFunc::Avg => Box::new(AvgAgg::new()),
+        AggFunc::Min => Box::new(MinAgg::new(column_type)),
+        AggFunc::Max => Box::new(MaxAgg::new(column_type)),
+        AggFunc::Avg => Box::new(AvgAgg::new(column_type)),
         AggFunc::First => Box::new(FirstAgg::new()),
         AggFunc::Last => Box::new(LastAgg::new()),
     }
@@ -686,7 +809,7 @@ mod tests {
 
     #[test]
     fn sum_basic() {
-        let mut agg = SumAgg::new();
+        let mut agg = SumAgg::new(&ColumnType::Float64);
         agg.add_block(100, &[Value::Float64(10.0), Value::Float64(20.0)]);
         agg.add_block(101, &[Value::Float64(5.0)]);
         assert_eq!(agg.current_value(), Value::Float64(35.0));
@@ -694,7 +817,7 @@ mod tests {
 
     #[test]
     fn sum_rollback() {
-        let mut agg = SumAgg::new();
+        let mut agg = SumAgg::new(&ColumnType::Float64);
         agg.add_block(100, &[Value::Float64(10.0)]);
         agg.add_block(101, &[Value::Float64(20.0)]);
         agg.add_block(102, &[Value::Float64(30.0)]);
@@ -708,7 +831,7 @@ mod tests {
 
     #[test]
     fn sum_finalize() {
-        let mut agg = SumAgg::new();
+        let mut agg = SumAgg::new(&ColumnType::Float64);
         agg.add_block(100, &[Value::Float64(10.0)]);
         agg.add_block(101, &[Value::Float64(20.0)]);
         agg.add_block(102, &[Value::Float64(30.0)]);
@@ -724,15 +847,22 @@ mod tests {
 
     #[test]
     fn sum_with_integers() {
-        let mut agg = SumAgg::new();
-        agg.add_block(100, &[Value::UInt64(10), Value::Int64(5)]);
-        assert_eq!(agg.current_value(), Value::Float64(15.0));
+        let mut agg = SumAgg::new(&ColumnType::UInt64);
+        agg.add_block(100, &[Value::UInt64(10), Value::UInt64(5)]);
+        assert_eq!(agg.current_value(), Value::UInt64(15));
     }
 
     #[test]
     fn sum_ignores_non_numeric() {
-        let mut agg = SumAgg::new();
-        agg.add_block(100, &[Value::Float64(10.0), Value::String("hello".into()), Value::Null]);
+        let mut agg = SumAgg::new(&ColumnType::Float64);
+        agg.add_block(
+            100,
+            &[
+                Value::Float64(10.0),
+                Value::String("hello".into()),
+                Value::Null,
+            ],
+        );
         assert_eq!(agg.current_value(), Value::Float64(10.0));
     }
 
@@ -749,7 +879,10 @@ mod tests {
     #[test]
     fn count_skips_null() {
         let mut agg = CountAgg::new();
-        agg.add_block(100, &[Value::Float64(1.0), Value::Null, Value::Float64(2.0)]);
+        agg.add_block(
+            100,
+            &[Value::Float64(1.0), Value::Null, Value::Float64(2.0)],
+        );
         assert_eq!(agg.current_value(), Value::UInt64(2));
     }
 
@@ -781,7 +914,7 @@ mod tests {
 
     #[test]
     fn min_basic() {
-        let mut agg = MinAgg::new();
+        let mut agg = MinAgg::new(&ColumnType::Float64);
         agg.add_block(100, &[Value::Float64(30.0), Value::Float64(10.0)]);
         agg.add_block(101, &[Value::Float64(20.0)]);
         assert_eq!(agg.current_value(), Value::Float64(10.0));
@@ -789,7 +922,7 @@ mod tests {
 
     #[test]
     fn min_rollback_recomputes() {
-        let mut agg = MinAgg::new();
+        let mut agg = MinAgg::new(&ColumnType::Float64);
         agg.add_block(100, &[Value::Float64(20.0)]);
         agg.add_block(101, &[Value::Float64(5.0)]); // this is the global min
         agg.add_block(102, &[Value::Float64(15.0)]);
@@ -801,7 +934,7 @@ mod tests {
 
     #[test]
     fn min_finalize_preserves() {
-        let mut agg = MinAgg::new();
+        let mut agg = MinAgg::new(&ColumnType::Float64);
         agg.add_block(100, &[Value::Float64(10.0)]);
         agg.add_block(101, &[Value::Float64(5.0)]);
         agg.add_block(102, &[Value::Float64(20.0)]);
@@ -817,7 +950,7 @@ mod tests {
 
     #[test]
     fn min_empty() {
-        let agg = MinAgg::new();
+        let agg = MinAgg::new(&ColumnType::Float64);
         assert_eq!(agg.current_value(), Value::Null);
         assert!(!agg.has_data());
     }
@@ -826,7 +959,7 @@ mod tests {
 
     #[test]
     fn max_basic() {
-        let mut agg = MaxAgg::new();
+        let mut agg = MaxAgg::new(&ColumnType::Float64);
         agg.add_block(100, &[Value::Float64(10.0), Value::Float64(30.0)]);
         agg.add_block(101, &[Value::Float64(20.0)]);
         assert_eq!(agg.current_value(), Value::Float64(30.0));
@@ -834,7 +967,7 @@ mod tests {
 
     #[test]
     fn max_rollback_recomputes() {
-        let mut agg = MaxAgg::new();
+        let mut agg = MaxAgg::new(&ColumnType::Float64);
         agg.add_block(100, &[Value::Float64(10.0)]);
         agg.add_block(101, &[Value::Float64(50.0)]); // global max
         agg.add_block(102, &[Value::Float64(30.0)]);
@@ -845,7 +978,7 @@ mod tests {
 
     #[test]
     fn max_finalize_preserves() {
-        let mut agg = MaxAgg::new();
+        let mut agg = MaxAgg::new(&ColumnType::Float64);
         agg.add_block(100, &[Value::Float64(50.0)]);
         agg.add_block(101, &[Value::Float64(10.0)]);
         agg.add_block(102, &[Value::Float64(30.0)]);
@@ -860,7 +993,7 @@ mod tests {
 
     #[test]
     fn avg_basic() {
-        let mut agg = AvgAgg::new();
+        let mut agg = AvgAgg::new(&ColumnType::Float64);
         agg.add_block(100, &[Value::Float64(10.0), Value::Float64(20.0)]);
         agg.add_block(101, &[Value::Float64(30.0)]);
         // avg(10, 20, 30) = 20
@@ -869,7 +1002,7 @@ mod tests {
 
     #[test]
     fn avg_rollback() {
-        let mut agg = AvgAgg::new();
+        let mut agg = AvgAgg::new(&ColumnType::Float64);
         agg.add_block(100, &[Value::Float64(10.0)]);
         agg.add_block(101, &[Value::Float64(30.0)]);
         // avg(10, 30) = 20
@@ -882,7 +1015,7 @@ mod tests {
 
     #[test]
     fn avg_finalize_then_rollback() {
-        let mut agg = AvgAgg::new();
+        let mut agg = AvgAgg::new(&ColumnType::Float64);
         agg.add_block(100, &[Value::Float64(10.0)]);
         agg.add_block(101, &[Value::Float64(20.0)]);
         agg.add_block(102, &[Value::Float64(60.0)]);
@@ -899,7 +1032,7 @@ mod tests {
 
     #[test]
     fn avg_empty() {
-        let agg = AvgAgg::new();
+        let agg = AvgAgg::new(&ColumnType::Float64);
         assert_eq!(agg.current_value(), Value::Null);
     }
 
@@ -985,7 +1118,14 @@ mod tests {
     #[test]
     fn last_multiple_values_in_block() {
         let mut agg = LastAgg::new();
-        agg.add_block(100, &[Value::Float64(10.0), Value::Float64(20.0), Value::Float64(30.0)]);
+        agg.add_block(
+            100,
+            &[
+                Value::Float64(10.0),
+                Value::Float64(20.0),
+                Value::Float64(30.0),
+            ],
+        );
         assert_eq!(agg.current_value(), Value::Float64(30.0));
     }
 
@@ -1026,7 +1166,7 @@ mod tests {
 
     #[test]
     fn sum_serde_roundtrip() {
-        let mut agg = SumAgg::new();
+        let mut agg = SumAgg::new(&ColumnType::Float64);
         agg.add_block(100, &[Value::Float64(10.0)]);
         agg.add_block(101, &[Value::Float64(20.0)]);
         agg.finalize_up_to(100);
@@ -1064,10 +1204,10 @@ mod tests {
     fn ohlcv_candle_rollback() {
         // Simulate: 50 trades across blocks 1000-1003. Block 1003 gets rolled back.
         let mut open = FirstAgg::new();
-        let mut high = MaxAgg::new();
-        let mut low = MinAgg::new();
+        let mut high = MaxAgg::new(&ColumnType::Float64);
+        let mut low = MinAgg::new(&ColumnType::Float64);
         let mut close = LastAgg::new();
-        let mut volume = SumAgg::new();
+        let mut volume = SumAgg::new(&ColumnType::Float64);
         let mut count = CountAgg::new();
 
         // Block 1000: price=100, amount=1
@@ -1127,16 +1267,16 @@ mod tests {
         // After rollback
         assert_eq!(open.current_value(), Value::Float64(100.0)); // unchanged
         assert_eq!(high.current_value(), Value::Float64(110.0)); // recomputed
-        assert_eq!(low.current_value(), Value::Float64(90.0));   // recomputed
+        assert_eq!(low.current_value(), Value::Float64(90.0)); // recomputed
         assert_eq!(close.current_value(), Value::Float64(90.0)); // falls back to block 1002
         assert_eq!(volume.current_value(), Value::Float64(6.0)); // subtracted
-        assert_eq!(count.current_value(), Value::UInt64(3));      // subtracted
+        assert_eq!(count.current_value(), Value::UInt64(3)); // subtracted
     }
 
     /// Issue #15: SumAgg must report has_data=true even when finalized sum is exactly 0.0.
     #[test]
     fn sum_has_data_after_zero_sum_finalization() {
-        let mut agg = SumAgg::new();
+        let mut agg = SumAgg::new(&ColumnType::Float64);
         assert!(!agg.has_data(), "empty agg should have no data");
 
         agg.add_block(100, &[Value::Float64(10.0)]);
@@ -1145,7 +1285,48 @@ mod tests {
 
         agg.finalize_up_to(101);
         assert_eq!(agg.current_value(), Value::Float64(0.0));
-        assert!(agg.has_data(),
-            "agg with finalized zero sum should still report has_data=true");
+        assert!(
+            agg.has_data(),
+            "agg with finalized zero sum should still report has_data=true"
+        );
+    }
+
+    /// Integer aggregations must preserve precision for values > 2^53.
+    #[test]
+    fn sum_preserves_large_integer_precision() {
+        let mut agg = SumAgg::new(&ColumnType::UInt64);
+        let large: u64 = (1u64 << 53) + 1; // 9007199254740993 — loses precision as f64
+        agg.add_block(100, &[Value::UInt64(large)]);
+        agg.add_block(101, &[Value::UInt64(large)]);
+        let expected = large * 2;
+        assert_eq!(agg.current_value(), Value::UInt64(expected));
+    }
+
+    #[test]
+    fn min_preserves_large_integer_precision() {
+        let mut agg = MinAgg::new(&ColumnType::UInt64);
+        let a: u64 = (1u64 << 53) + 1;
+        let b: u64 = (1u64 << 53) + 2;
+        agg.add_block(100, &[Value::UInt64(b)]);
+        agg.add_block(101, &[Value::UInt64(a)]);
+        // a and b are indistinguishable as f64 — this test would fail with f64 accumulation
+        assert_eq!(agg.current_value(), Value::UInt64(a));
+    }
+
+    #[test]
+    fn max_preserves_large_integer_precision() {
+        let mut agg = MaxAgg::new(&ColumnType::UInt64);
+        let a: u64 = (1u64 << 53) + 1;
+        let b: u64 = (1u64 << 53) + 2;
+        agg.add_block(100, &[Value::UInt64(a)]);
+        agg.add_block(101, &[Value::UInt64(b)]);
+        assert_eq!(agg.current_value(), Value::UInt64(b));
+    }
+
+    #[test]
+    fn sum_float_column_returns_float() {
+        let mut agg = SumAgg::new(&ColumnType::Float64);
+        agg.add_block(100, &[Value::Float64(10.5)]);
+        assert_eq!(agg.current_value(), Value::Float64(10.5));
     }
 }
