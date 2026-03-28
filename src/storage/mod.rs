@@ -1,7 +1,7 @@
 pub mod memory;
 pub mod rocks;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::types::{BlockNumber, ColumnRegistry, GroupKey, Row, RowMap, Value};
 use std::sync::Arc;
 
@@ -194,74 +194,74 @@ fn encode_value(buf: &mut Vec<u8>, val: &Value) {
     }
 }
 
-fn decode_value(bytes: &[u8], pos: &mut usize) -> Value {
-    let tag = bytes[*pos];
-    *pos += 1;
+fn read_bytes<'a>(bytes: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8]> {
+    if *pos + n > bytes.len() {
+        return Err(Error::Storage(format!(
+            "truncated data: need {} bytes at offset {}, have {} remaining",
+            n,
+            *pos,
+            bytes.len() - *pos
+        )));
+    }
+    let slice = &bytes[*pos..*pos + n];
+    *pos += n;
+    Ok(slice)
+}
+
+fn decode_value(bytes: &[u8], pos: &mut usize) -> Result<Value> {
+    let tag = *read_bytes(bytes, pos, 1)?.first().unwrap();
     match tag {
-        TAG_NULL => Value::Null,
+        TAG_NULL => Ok(Value::Null),
         TAG_UINT64 => {
-            let v = u64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
-            *pos += 8;
-            Value::UInt64(v)
+            let v = u64::from_le_bytes(read_bytes(bytes, pos, 8)?.try_into().unwrap());
+            Ok(Value::UInt64(v))
         }
         TAG_INT64 => {
-            let v = i64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
-            *pos += 8;
-            Value::Int64(v)
+            let v = i64::from_le_bytes(read_bytes(bytes, pos, 8)?.try_into().unwrap());
+            Ok(Value::Int64(v))
         }
         TAG_FLOAT64 => {
-            let v = f64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
-            *pos += 8;
-            Value::Float64(v)
+            let v = f64::from_le_bytes(read_bytes(bytes, pos, 8)?.try_into().unwrap());
+            Ok(Value::Float64(v))
         }
         TAG_STRING => {
-            let len = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap()) as usize;
-            *pos += 4;
-            let s = std::str::from_utf8(&bytes[*pos..*pos + len])
-                .expect("invalid utf8 in stored string")
+            let len = u32::from_le_bytes(read_bytes(bytes, pos, 4)?.try_into().unwrap()) as usize;
+            let s = std::str::from_utf8(read_bytes(bytes, pos, len)?)
+                .map_err(|e| Error::Storage(format!("invalid utf8 in stored string: {e}")))?
                 .to_string();
-            *pos += len;
-            Value::String(s)
+            Ok(Value::String(s))
         }
         TAG_DATETIME => {
-            let v = i64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
-            *pos += 8;
-            Value::DateTime(v)
+            let v = i64::from_le_bytes(read_bytes(bytes, pos, 8)?.try_into().unwrap());
+            Ok(Value::DateTime(v))
         }
         TAG_BOOLEAN => {
-            let v = bytes[*pos] != 0;
-            *pos += 1;
-            Value::Boolean(v)
+            let v = read_bytes(bytes, pos, 1)?[0] != 0;
+            Ok(Value::Boolean(v))
         }
         TAG_BYTES => {
-            let len = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap()) as usize;
-            *pos += 4;
-            let v = bytes[*pos..*pos + len].to_vec();
-            *pos += len;
-            Value::Bytes(v)
+            let len = u32::from_le_bytes(read_bytes(bytes, pos, 4)?.try_into().unwrap()) as usize;
+            let v = read_bytes(bytes, pos, len)?.to_vec();
+            Ok(Value::Bytes(v))
         }
         TAG_UINT256 => {
-            let v: [u8; 32] = bytes[*pos..*pos + 32].try_into().unwrap();
-            *pos += 32;
-            Value::Uint256(v)
+            let v: [u8; 32] = read_bytes(bytes, pos, 32)?.try_into().unwrap();
+            Ok(Value::Uint256(v))
         }
         TAG_BASE58 => {
-            let len = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap()) as usize;
-            *pos += 4;
-            let v = bytes[*pos..*pos + len].to_vec();
-            *pos += len;
-            Value::Base58(v)
+            let len = u32::from_le_bytes(read_bytes(bytes, pos, 4)?.try_into().unwrap()) as usize;
+            let v = read_bytes(bytes, pos, len)?.to_vec();
+            Ok(Value::Base58(v))
         }
         TAG_JSON => {
-            let len = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap()) as usize;
-            *pos += 4;
-            let s = std::str::from_utf8(&bytes[*pos..*pos + len])
-                .expect("invalid utf8 in stored json");
-            let v = serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
-            *pos += len;
-            Value::JSON(v)
+            let len = u32::from_le_bytes(read_bytes(bytes, pos, 4)?.try_into().unwrap()) as usize;
+            let s = std::str::from_utf8(read_bytes(bytes, pos, len)?)
+                .map_err(|e| Error::Storage(format!("invalid utf8 in stored json: {e}")))?;
+            let v = serde_json::from_str(s)
+                .map_err(|e| Error::Storage(format!("invalid json in stored data: {e}")))?;
+            Ok(Value::JSON(v))
         }
-        _ => panic!("unknown value type tag: {tag}"),
+        _ => Err(Error::Storage(format!("unknown value type tag: {tag}"))),
     }
 }
 
@@ -312,22 +312,30 @@ pub fn encode_rows(rows: &[Row]) -> Vec<u8> {
 }
 
 /// Decode rows from bytes, wrapping each with the given registry.
-pub fn decode_rows(bytes: &[u8], registry: &Arc<ColumnRegistry>) -> Vec<Row> {
+pub fn decode_rows(bytes: &[u8], registry: &Arc<ColumnRegistry>) -> Result<Vec<Row>> {
     let mut pos = 0;
-    let num_rows = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
-    pos += 4;
-    let num_cols = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
-    pos += 2;
+    let num_rows = u32::from_le_bytes(read_bytes(bytes, &mut pos, 4)?.try_into().unwrap()) as usize;
+    let num_cols = u16::from_le_bytes(read_bytes(bytes, &mut pos, 2)?.try_into().unwrap()) as usize;
 
-    let mut rows = Vec::with_capacity(num_rows);
+    if num_cols != registry.len() {
+        return Err(Error::Storage(format!(
+            "decode_rows: header column count {} does not match registry length {}",
+            num_cols,
+            registry.len()
+        )));
+    }
+
+    let mut rows = Vec::new();
+    rows.try_reserve(num_rows)
+        .map_err(|_| Error::Storage(format!("decode_rows: cannot allocate {num_rows} rows")))?;
     for _ in 0..num_rows {
         let mut values = Vec::with_capacity(num_cols);
         for _ in 0..num_cols {
-            values.push(decode_value(bytes, &mut pos));
+            values.push(decode_value(bytes, &mut pos)?);
         }
         rows.push(Row::from_values(registry.clone(), values));
     }
-    rows
+    Ok(rows)
 }
 
 /// Storage backend trait for Delta DB persistence.
@@ -397,18 +405,9 @@ pub trait StorageBackend: Send + Sync {
 
     // --- Reducer finalized state ---
 
-    fn get_reducer_finalized(
-        &self,
-        reducer: &str,
-        group_key: &[u8],
-    ) -> Result<Option<Vec<u8>>>;
+    fn get_reducer_finalized(&self, reducer: &str, group_key: &[u8]) -> Result<Option<Vec<u8>>>;
 
-    fn set_reducer_finalized(
-        &self,
-        reducer: &str,
-        group_key: &[u8],
-        state: &[u8],
-    ) -> Result<()>;
+    fn set_reducer_finalized(&self, reducer: &str, group_key: &[u8], state: &[u8]) -> Result<()>;
 
     fn delete_reducer_states_up_to(
         &self,
@@ -419,24 +418,11 @@ pub trait StorageBackend: Send + Sync {
 
     // --- MV state ---
 
-    fn put_mv_state(
-        &self,
-        view: &str,
-        group_key: &[u8],
-        state: &[u8],
-    ) -> Result<()>;
+    fn put_mv_state(&self, view: &str, group_key: &[u8], state: &[u8]) -> Result<()>;
 
-    fn get_mv_state(
-        &self,
-        view: &str,
-        group_key: &[u8],
-    ) -> Result<Option<Vec<u8>>>;
+    fn get_mv_state(&self, view: &str, group_key: &[u8]) -> Result<Option<Vec<u8>>>;
 
-    fn delete_mv_state(
-        &self,
-        view: &str,
-        group_key: &[u8],
-    ) -> Result<()>;
+    fn delete_mv_state(&self, view: &str, group_key: &[u8]) -> Result<()>;
 
     fn list_mv_group_keys(&self, view: &str) -> Result<Vec<Vec<u8>>>;
 
@@ -455,4 +441,38 @@ pub trait StorageBackend: Send + Sync {
     /// All operations in the batch either succeed together or fail together.
     /// Used for crash-safe finalization.
     fn commit(&self, batch: &StorageWriteBatch) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_rows_truncated_returns_err() {
+        let reg = Arc::new(ColumnRegistry::new(vec!["x".to_string()]));
+        assert!(decode_rows(&[], &reg).is_err());
+        assert!(decode_rows(&[0, 0], &reg).is_err()); // too short for header
+    }
+
+    #[test]
+    fn decode_rows_unknown_tag_returns_err() {
+        let reg = Arc::new(ColumnRegistry::new(vec!["x".to_string()]));
+        // Header: 1 row, 1 col, then an invalid tag byte (0xFF)
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // num_rows
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // num_cols
+        bytes.push(0xFF); // unknown tag
+        assert!(decode_rows(&bytes, &reg).is_err());
+    }
+
+    #[test]
+    fn decode_rows_column_count_mismatch_returns_err() {
+        let reg = Arc::new(ColumnRegistry::new(vec!["x".to_string(), "y".to_string()]));
+        // Header says 1 col but registry has 2
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // num_rows
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // num_cols = 1, registry = 2
+        let err = decode_rows(&bytes, &reg).unwrap_err();
+        assert!(err.to_string().contains("column count"));
+    }
 }

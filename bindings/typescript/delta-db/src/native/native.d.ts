@@ -58,16 +58,6 @@ export declare class DeltaDb {
    */
   registerReducer(config: ExternalReducerConfig, callback: (...args: any[]) => any): void
   /**
-   * Process a batch of rows for a raw table.
-   * `rows` is a msgpack-encoded Buffer: `[{col: val, ...}, ...]`.
-   * Returns true if backpressure should be applied.
-   */
-  processBatch(table: string, block: number, rows: Buffer): boolean
-  /** Roll back all state after fork_point. */
-  rollback(forkPoint: number): void
-  /** Finalize all state up to and including the given block. */
-  finalize(block: number): void
-  /**
    * Atomic ingest: process all tables, store rollback chain, finalize, flush.
    * Returns a msgpack-encoded DeltaBatch buffer, or null if no records produced.
    */
