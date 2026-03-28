@@ -132,8 +132,15 @@ impl DeltaDb {
         // If the reducer already exists in the engine (defined via SQL with
         // LANGUAGE EXTERNAL), we only need to store the callback — the
         // ExternalRuntime will pick it up from the thread-local context.
-        // Only add a new reducer if it doesn't already exist.
-        if !self.inner.has_reducer(&config.name) {
+        // Then replay unfinalized blocks (skipped during open() because
+        // no JS context existed at that point).
+        if self.inner.has_reducer(&config.name) {
+            // Install JS context for the replay call
+            let _guard = install_context(env, &self.external_callbacks);
+            self.inner
+                .replay_reducer(&config.name)
+                .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;
+        } else {
             let state_fields: Vec<StateField> = config
                 .state
                 .into_iter()
@@ -156,6 +163,8 @@ impl DeltaDb {
                 requires: vec![],
             };
 
+            // Install JS context for the replay inside register_reducer
+            let _guard = install_context(env, &self.external_callbacks);
             self.inner
                 .register_reducer(def)
                 .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;

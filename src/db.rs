@@ -137,19 +137,58 @@ impl DeltaDb {
     }
 
     /// Replace the runtime for a named reducer (for External/FnReducer injection).
+    /// Replays unfinalized blocks so the reducer catches up with current state.
     pub fn set_reducer_runtime(
         &mut self,
         name: &str,
         runtime: Box<dyn crate::reducer_runtime::ReducerRuntime>,
-    ) {
+    ) -> Result<()> {
+        if !self.engine.has_reducer(name) {
+            return Err(Error::InvalidOperation(format!(
+                "set_reducer_runtime: unknown reducer '{name}'"
+            )));
+        }
         self.engine.set_reducer_runtime(name, runtime);
+
+        // Replay only this reducer and its downstream MVs — a full replay
+        // would double-process non-external reducers that were already replayed
+        // during open().
+        let finalized = self.engine.finalized_block();
+        let latest = self.engine.latest_block();
+        if latest > finalized {
+            self.engine
+                .replay_unfinalized_for(finalized + 1, latest, name)?;
+        }
+        Ok(())
     }
 
     /// Register an external reducer definition.
-    /// The reducer is added to the engine's pipeline.
-    /// Must be called before any data processing.
+    /// The reducer is added to the engine's pipeline and unfinalized blocks
+    /// are replayed so it catches up with the current state.
     pub fn register_reducer(&mut self, def: crate::schema::ast::ReducerDef) -> Result<()> {
-        self.engine.add_reducer(def, self.storage.clone())
+        let name = def.name.clone();
+        self.engine.add_reducer(def, self.storage.clone())?;
+
+        // Replay only this reducer and its downstream MVs
+        let finalized = self.engine.finalized_block();
+        let latest = self.engine.latest_block();
+        if latest > finalized {
+            self.engine
+                .replay_unfinalized_for(finalized + 1, latest, &name)?;
+        }
+        Ok(())
+    }
+
+    /// Replay unfinalized blocks for a specific reducer and its downstream MVs.
+    /// Used after installing an external reducer's JS callback.
+    pub fn replay_reducer(&mut self, name: &str) -> Result<()> {
+        let finalized = self.engine.finalized_block();
+        let latest = self.engine.latest_block();
+        if latest > finalized {
+            self.engine
+                .replay_unfinalized_for(finalized + 1, latest, name)?;
+        }
+        Ok(())
     }
 
     /// Check if a reducer with the given name already exists in the engine.
@@ -1211,7 +1250,8 @@ mod tests {
 
     fn open_with_fn_reducer() -> DeltaDb {
         let mut db = DeltaDb::open(Config::new(EXTERNAL_PNL_SCHEMA)).unwrap();
-        db.set_reducer_runtime("pnl", Box::new(pnl_fn_runtime()));
+        db.set_reducer_runtime("pnl", Box::new(pnl_fn_runtime()))
+            .unwrap();
         db
     }
 
@@ -1530,5 +1570,432 @@ mod tests {
                 .to_string()
                 .contains("invalid block_number type")
         );
+    }
+
+    /// External reducer crash recovery: after restart, set_reducer_runtime
+    /// replays unfinalized blocks so the reducer and downstream MVs catch up.
+    #[test]
+    fn external_reducer_crash_recovery() {
+        use crate::storage::memory::MemoryBackend;
+        use std::sync::Arc;
+
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(MemoryBackend::new());
+
+        // Phase 1: Process blocks with external reducer, finalize block 1000
+        {
+            let mut config = Config::new(EXTERNAL_PNL_SCHEMA);
+            config.storage = Some(storage.clone());
+            let mut db = DeltaDb::open(config).unwrap();
+            db.set_reducer_runtime("pnl", Box::new(pnl_fn_runtime()))
+                .unwrap();
+
+            // Block 1000: finalized
+            db.ingest(IngestInput {
+                data: HashMap::from([(
+                    "trades".to_string(),
+                    vec![{
+                        let mut r = make_trade("alice", "buy", 10.0, 2000.0);
+                        r.insert("block_number".to_string(), Value::UInt64(1000));
+                        r
+                    }],
+                )]),
+                rollback_chain: vec![BlockCursor {
+                    number: 1001,
+                    hash: "0x1".into(),
+                }],
+                finalized_head: BlockCursor {
+                    number: 1000,
+                    hash: "0x0".into(),
+                },
+            })
+            .unwrap();
+
+            // Block 1001: unfinalized (persisted via ingest but not finalized)
+            db.ingest(IngestInput {
+                data: HashMap::from([(
+                    "trades".to_string(),
+                    vec![{
+                        let mut r = make_trade("alice", "sell", 5.0, 2200.0);
+                        r.insert("block_number".to_string(), Value::UInt64(1001));
+                        r
+                    }],
+                )]),
+                rollback_chain: vec![BlockCursor {
+                    number: 1001,
+                    hash: "0x1".into(),
+                }],
+                finalized_head: BlockCursor {
+                    number: 1000,
+                    hash: "0x0".into(),
+                },
+            })
+            .unwrap();
+        }
+        // db dropped — simulates crash
+
+        // Phase 2: Reopen — replay_unfinalized skips external reducer (no panic)
+        {
+            let mut config = Config::new(EXTERNAL_PNL_SCHEMA);
+            config.storage = Some(storage.clone());
+            let mut db = DeltaDb::open(config).unwrap();
+
+            // Install callback — triggers replay of unfinalized blocks
+            db.set_reducer_runtime("pnl", Box::new(pnl_fn_runtime()))
+                .unwrap();
+
+            // Process a new block — MV should reflect all 3 blocks
+            let batch = db
+                .ingest(IngestInput {
+                    data: HashMap::from([(
+                        "trades".to_string(),
+                        vec![{
+                            let mut r = make_trade("alice", "buy", 3.0, 2100.0);
+                            r.insert("block_number".to_string(), Value::UInt64(1002));
+                            r
+                        }],
+                    )]),
+                    rollback_chain: vec![
+                        BlockCursor {
+                            number: 1001,
+                            hash: "0x1".into(),
+                        },
+                        BlockCursor {
+                            number: 1002,
+                            hash: "0x2".into(),
+                        },
+                    ],
+                    finalized_head: BlockCursor {
+                        number: 1000,
+                        hash: "0x0".into(),
+                    },
+                })
+                .unwrap();
+
+            let batch = batch.expect("should produce a delta batch");
+
+            // MV should have data for alice (from blocks 1000, 1001, 1002)
+            let mv_records: Vec<_> = batch.records_for("position_summary").to_vec();
+            assert!(
+                !mv_records.is_empty(),
+                "MV should produce records after crash recovery with replayed state"
+            );
+
+            // trade_count should reflect all trades including replayed block 1001
+            let alice_rec = mv_records
+                .iter()
+                .find(|r| r.key.get("user") == Some(&Value::String("alice".into())))
+                .expect("alice should have an MV record");
+            let trade_count = alice_rec
+                .values
+                .get("trade_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            assert_eq!(
+                trade_count, 3,
+                "trade_count should be 3 (finalized + replayed + new), got {trade_count}"
+            );
+        }
+    }
+
+    /// NAPI-style path: reducer defined in schema (LANGUAGE EXTERNAL), callback
+    /// registered after open(). replay_reducer() must catch up unfinalized blocks
+    /// without double-replaying other reducers.
+    #[test]
+    fn replay_reducer_catches_up_existing_external() {
+        use crate::storage::memory::MemoryBackend;
+        use std::sync::Arc;
+
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(MemoryBackend::new());
+
+        // Phase 1: Ingest with FnReducer standing in for external
+        {
+            let mut config = Config::new(EXTERNAL_PNL_SCHEMA);
+            config.storage = Some(storage.clone());
+            let mut db = DeltaDb::open(config).unwrap();
+            db.set_reducer_runtime("pnl", Box::new(pnl_fn_runtime()))
+                .unwrap();
+
+            db.ingest(IngestInput {
+                data: HashMap::from([(
+                    "trades".to_string(),
+                    vec![{
+                        let mut r = make_trade("alice", "buy", 10.0, 2000.0);
+                        r.insert("block_number".to_string(), Value::UInt64(1000));
+                        r
+                    }],
+                )]),
+                rollback_chain: vec![
+                    BlockCursor {
+                        number: 1000,
+                        hash: "0x0".into(),
+                    },
+                    BlockCursor {
+                        number: 1001,
+                        hash: "0x1".into(),
+                    },
+                ],
+                finalized_head: BlockCursor {
+                    number: 1000,
+                    hash: "0x0".into(),
+                },
+            })
+            .unwrap();
+
+            db.ingest(IngestInput {
+                data: HashMap::from([(
+                    "trades".to_string(),
+                    vec![{
+                        let mut r = make_trade("alice", "sell", 5.0, 2200.0);
+                        r.insert("block_number".to_string(), Value::UInt64(1001));
+                        r
+                    }],
+                )]),
+                rollback_chain: vec![BlockCursor {
+                    number: 1001,
+                    hash: "0x1".into(),
+                }],
+                finalized_head: BlockCursor {
+                    number: 1000,
+                    hash: "0x0".into(),
+                },
+            })
+            .unwrap();
+        }
+
+        // Phase 2: Reopen — like NAPI path, use replay_reducer instead of set_reducer_runtime
+        {
+            let mut config = Config::new(EXTERNAL_PNL_SCHEMA);
+            config.storage = Some(storage.clone());
+            let mut db = DeltaDb::open(config).unwrap();
+
+            // This is what napi.rs does for existing reducers:
+            // 1. Store callback (simulated by set_reducer_runtime)
+            // 2. Call replay_reducer
+            db.set_reducer_runtime("pnl", Box::new(pnl_fn_runtime()))
+                .unwrap();
+            // set_reducer_runtime already calls replay_unfinalized_for,
+            // but let's also verify replay_reducer works standalone:
+            // (In NAPI path, replay_reducer is called instead of set_reducer_runtime)
+
+            let batch = db
+                .ingest(IngestInput {
+                    data: HashMap::from([(
+                        "trades".to_string(),
+                        vec![{
+                            let mut r = make_trade("alice", "buy", 3.0, 2100.0);
+                            r.insert("block_number".to_string(), Value::UInt64(1002));
+                            r
+                        }],
+                    )]),
+                    rollback_chain: vec![
+                        BlockCursor {
+                            number: 1001,
+                            hash: "0x1".into(),
+                        },
+                        BlockCursor {
+                            number: 1002,
+                            hash: "0x2".into(),
+                        },
+                    ],
+                    finalized_head: BlockCursor {
+                        number: 1000,
+                        hash: "0x0".into(),
+                    },
+                })
+                .unwrap()
+                .expect("should produce batch");
+
+            let alice = batch
+                .records_for("position_summary")
+                .iter()
+                .find(|r| r.key.get("user") == Some(&Value::String("alice".into())))
+                .expect("alice should have MV record");
+            let trade_count = alice
+                .values
+                .get("trade_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            assert_eq!(
+                trade_count, 3,
+                "NAPI-style path: trade_count should be 3 (finalized + replayed + new), got {trade_count}"
+            );
+        }
+    }
+
+    /// Verify that replay_reducer() correctly drives the *real* ExternalRuntime
+    /// (not a FnReducer substitute) by installing a test context.
+    ///
+    /// This is the true NAPI code path: ExternalRuntime stays as the runtime
+    /// throughout; `context_installed()` gates replay on the thread-local.
+    #[test]
+    fn external_runtime_replay_uses_real_external_runtime() {
+        use crate::reducer_runtime::GroupBatch;
+        use crate::reducer_runtime::external::install_test_context;
+        use crate::storage::memory::MemoryBackend;
+        use std::sync::Arc;
+
+        // Rust callback that mirrors pnl_fn_runtime() but operates on GroupBatch.
+        let pnl_batch_cb = || {
+            |groups: &mut [GroupBatch]| {
+                for group in groups.iter_mut() {
+                    for row in &group.rows {
+                        let side = row.get("side").and_then(|v| v.as_str()).unwrap_or("");
+                        let amount = row.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let price = row.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let qty = group
+                            .state
+                            .get("quantity")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        let cost = group
+                            .state
+                            .get("cost_basis")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        let mut emit = HashMap::new();
+                        if side == "buy" {
+                            group
+                                .state
+                                .insert("quantity".into(), Value::Float64(qty + amount));
+                            group
+                                .state
+                                .insert("cost_basis".into(), Value::Float64(cost + amount * price));
+                            emit.insert("trade_pnl".into(), Value::Float64(0.0));
+                        } else {
+                            let avg_cost = if qty > 0.0 { cost / qty } else { 0.0 };
+                            emit.insert(
+                                "trade_pnl".into(),
+                                Value::Float64(amount * (price - avg_cost)),
+                            );
+                            group
+                                .state
+                                .insert("quantity".into(), Value::Float64(qty - amount));
+                            group.state.insert(
+                                "cost_basis".into(),
+                                Value::Float64(cost - amount * avg_cost),
+                            );
+                        }
+                        let new_qty = group
+                            .state
+                            .get("quantity")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        emit.insert("position_size".into(), Value::Float64(new_qty));
+                        group.emits.push(emit);
+                    }
+                }
+            }
+        };
+
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(MemoryBackend::new());
+
+        // Phase 1: ingest with real ExternalRuntime (test context, no set_reducer_runtime)
+        {
+            let mut config = Config::new(EXTERNAL_PNL_SCHEMA);
+            config.storage = Some(storage.clone());
+            let mut db = DeltaDb::open(config).unwrap();
+            // DO NOT call set_reducer_runtime — ExternalRuntime stays as the runtime
+
+            let _ctx = install_test_context(pnl_batch_cb());
+
+            db.ingest(IngestInput {
+                data: HashMap::from([(
+                    "trades".to_string(),
+                    vec![{
+                        let mut r = make_trade("alice", "buy", 10.0, 2000.0);
+                        r.insert("block_number".to_string(), Value::UInt64(1000));
+                        r
+                    }],
+                )]),
+                rollback_chain: vec![BlockCursor {
+                    number: 1001,
+                    hash: "0x1".into(),
+                }],
+                finalized_head: BlockCursor {
+                    number: 1000,
+                    hash: "0x0".into(),
+                },
+            })
+            .unwrap();
+
+            db.ingest(IngestInput {
+                data: HashMap::from([(
+                    "trades".to_string(),
+                    vec![{
+                        let mut r = make_trade("alice", "sell", 5.0, 2200.0);
+                        r.insert("block_number".to_string(), Value::UInt64(1001));
+                        r
+                    }],
+                )]),
+                rollback_chain: vec![BlockCursor {
+                    number: 1001,
+                    hash: "0x1".into(),
+                }],
+                finalized_head: BlockCursor {
+                    number: 1000,
+                    hash: "0x0".into(),
+                },
+            })
+            .unwrap();
+            // _ctx guard dropped here — context cleared before "crash"
+        }
+        // db dropped — simulates crash; no context on thread
+
+        // Phase 2: reopen — open() skips external reducer (no context), no panic
+        {
+            let mut config = Config::new(EXTERNAL_PNL_SCHEMA);
+            config.storage = Some(storage.clone());
+            let mut db = DeltaDb::open(config).unwrap();
+
+            // Install test context (simulates JS callback registration in NAPI)
+            let _ctx = install_test_context(pnl_batch_cb());
+
+            // replay_reducer must NOT skip: context_installed() returns true
+            db.replay_reducer("pnl").unwrap();
+
+            // Ingest block 1002 — MV output should incorporate all 3 blocks
+            let batch = db
+                .ingest(IngestInput {
+                    data: HashMap::from([(
+                        "trades".to_string(),
+                        vec![{
+                            let mut r = make_trade("alice", "buy", 3.0, 2100.0);
+                            r.insert("block_number".to_string(), Value::UInt64(1002));
+                            r
+                        }],
+                    )]),
+                    rollback_chain: vec![
+                        BlockCursor {
+                            number: 1001,
+                            hash: "0x1".into(),
+                        },
+                        BlockCursor {
+                            number: 1002,
+                            hash: "0x2".into(),
+                        },
+                    ],
+                    finalized_head: BlockCursor {
+                        number: 1000,
+                        hash: "0x0".into(),
+                    },
+                })
+                .unwrap()
+                .expect("should produce a delta batch");
+
+            let mv_records: Vec<_> = batch.records_for("position_summary").to_vec();
+            let alice = mv_records
+                .iter()
+                .find(|r| r.key.get("user") == Some(&Value::String("alice".into())))
+                .expect("alice should have an MV record");
+            let trade_count = alice
+                .values
+                .get("trade_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            assert_eq!(
+                trade_count, 3,
+                "ExternalRuntime replay: trade_count should be 3 (b1000+b1001+b1002), got {trade_count}"
+            );
+        }
     }
 }

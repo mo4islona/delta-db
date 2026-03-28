@@ -21,8 +21,8 @@ mod napi_bridge {
     use std::cell::RefCell;
     use std::collections::HashMap;
 
-    use napi::sys;
     use napi::NapiValue;
+    use napi::sys;
 
     use crate::json_conv::value_to_json;
     use crate::types::{Row, Value};
@@ -38,7 +38,7 @@ mod napi_bridge {
     }
 
     thread_local! {
-        static EXTERNAL_CTX: RefCell<Option<ExternalContext>> = const { RefCell::new(None) };
+        pub(crate) static EXTERNAL_CTX: RefCell<Option<ExternalContext>> = const { RefCell::new(None) };
     }
 
     /// Install the external callback context for the current thread.
@@ -164,11 +164,7 @@ mod napi_bridge {
 
     // ── Marshalling: JS → Rust ─────────────────────────────────────
 
-    fn js_result_to_groups(
-        env: &napi::Env,
-        result: napi::JsUnknown,
-        groups: &mut [GroupBatch],
-    ) {
+    fn js_result_to_groups(env: &napi::Env, result: napi::JsUnknown, groups: &mut [GroupBatch]) {
         let result_obj: napi::JsObject = result
             .coerce_to_object()
             .expect("external reducer must return an array");
@@ -188,14 +184,11 @@ mod napi_bridge {
             let js_emits: napi::JsObject = group_result
                 .get_named_property("emits")
                 .expect("result group missing 'emits'");
-            let emits_len = js_emits
-                .get_array_length()
-                .expect("emits must be an array");
+            let emits_len = js_emits.get_array_length().expect("emits must be an array");
 
             for j in 0..emits_len {
-                let js_emit: napi::JsObject = js_emits
-                    .get_element(j)
-                    .expect("emit element missing");
+                let js_emit: napi::JsObject =
+                    js_emits.get_element(j).expect("emit element missing");
                 let emit_map = js_object_to_value_map(env, &js_emit);
                 group.emits.push(emit_map);
             }
@@ -205,9 +198,7 @@ mod napi_bridge {
     fn js_object_to_value_map(env: &napi::Env, obj: &napi::JsObject) -> HashMap<String, Value> {
         let mut map = HashMap::new();
 
-        let keys = obj
-            .get_property_names()
-            .expect("failed to get object keys");
+        let keys = obj.get_property_names().expect("failed to get object keys");
         let len = keys.get_array_length().expect("keys not an array");
 
         for i in 0..len {
@@ -266,7 +257,64 @@ mod napi_bridge {
 }
 
 #[cfg(feature = "napi")]
-pub use napi_bridge::{install_context, ContextGuard};
+pub use napi_bridge::{ContextGuard, install_context};
+
+// ─── Test-only context (non-napi builds) ─────────────────────────
+
+/// A test-only callback context that lets unit tests drive `ExternalRuntime`
+/// without a real JS/napi environment.
+///
+/// Install via `install_test_context(callback)` before calling `ingest()` or
+/// `replay_reducer()`. The returned guard clears the context on drop.
+#[cfg(test)]
+pub mod test_bridge {
+    use std::cell::RefCell;
+
+    use super::GroupBatch;
+
+    type TestCallback = Box<dyn Fn(&mut [GroupBatch])>;
+
+    thread_local! {
+        pub(super) static TEST_CTX: RefCell<Option<TestCallback>> = RefCell::new(None);
+    }
+
+    /// RAII guard — clears the test context on drop.
+    pub struct TestContextGuard;
+
+    impl Drop for TestContextGuard {
+        fn drop(&mut self) {
+            TEST_CTX.with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+
+    /// Install a Rust callback as the `ExternalRuntime` context for the current
+    /// thread. The callback receives the `GroupBatch` slice for each block,
+    /// processes rows, and fills `group.emits` — identical to the JS contract.
+    pub fn install_test_context(f: impl Fn(&mut [GroupBatch]) + 'static) -> TestContextGuard {
+        TEST_CTX.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(f));
+        });
+        TestContextGuard
+    }
+}
+
+#[cfg(test)]
+pub use test_bridge::{TestContextGuard, install_test_context};
+
+/// Returns true when a JS (or test) callback context is installed on the
+/// current thread. Used by `replay_unfinalized` to decide whether to skip
+/// external reducers — false means "no host yet, skip to avoid panic".
+pub fn context_installed() -> bool {
+    #[cfg(feature = "napi")]
+    if napi_bridge::EXTERNAL_CTX.with(|cell| cell.borrow().is_some()) {
+        return true;
+    }
+    #[cfg(test)]
+    if test_bridge::TEST_CTX.with(|cell| cell.borrow().is_some()) {
+        return true;
+    }
+    false
+}
 
 // ─── ExternalRuntime ───────────────────────────────────────────────
 
@@ -292,7 +340,11 @@ impl ExternalRuntime {
 }
 
 impl ReducerRuntime for ExternalRuntime {
-    fn process(&self, _state: &mut HashMap<String, Value>, _row: &Row) -> crate::error::Result<Vec<RowMap>> {
+    fn process(
+        &self,
+        _state: &mut HashMap<String, Value>,
+        _row: &Row,
+    ) -> crate::error::Result<Vec<RowMap>> {
         panic!(
             "ExternalRuntime::process() should not be called directly; \
              use_batched_processing() returns true"
@@ -307,12 +359,25 @@ impl ReducerRuntime for ExternalRuntime {
         #[cfg(feature = "napi")]
         {
             napi_bridge::call_js_batch(&self.reducer_id, groups);
+            return Ok(());
+        }
+        #[cfg(test)]
+        {
+            test_bridge::TEST_CTX.with(|cell| {
+                let borrow = cell.borrow();
+                let cb = borrow.as_ref().expect(
+                    "ExternalRuntime::process_grouped() called without install_test_context",
+                );
+                cb(groups);
+            });
+            return Ok(());
         }
         #[cfg(not(feature = "napi"))]
         {
             let _ = groups;
             panic!("ExternalRuntime requires the 'napi' feature");
         }
+        #[allow(unreachable_code)]
         Ok(())
     }
 }

@@ -9,30 +9,54 @@ use crate::types::{BlockNumber, Value};
 // ---------------------------------------------------------------------------
 
 use crate::types::ColumnType;
+use ethnum::U256;
 
-/// Whether an aggregation column uses integer or float arithmetic.
+/// Whether an aggregation column uses integer, float, or big-integer arithmetic.
 /// Determined once at construction from the source column's declared type.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 enum NumMode {
     Int,
     Float,
+    BigInt,
 }
 
 impl NumMode {
     fn from_column_type(ct: &ColumnType) -> Self {
         match ct {
             ColumnType::UInt64 | ColumnType::Int64 | ColumnType::DateTime => NumMode::Int,
+            ColumnType::Uint256 => NumMode::BigInt,
             _ => NumMode::Float,
         }
     }
 }
 
-/// Accumulates numeric values in either i128 (integer columns) or f64 (float columns).
+/// Accumulates numeric values in i128, f64, or U256 depending on column type.
 /// The variant is fixed at construction — no mixed-type branches.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 enum NumAccum {
     Int(i128),
     Float(f64),
+    BigInt(#[serde(with = "u256_serde")] U256),
+}
+
+mod u256_serde {
+    use ethnum::U256;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &U256, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bytes(&v.to_be_bytes())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<U256, D::Error> {
+        use serde::de::Error;
+        let bytes: &[u8] = <&[u8]>::deserialize(d)?;
+        if bytes.len() != 32 {
+            return Err(D::Error::invalid_length(bytes.len(), &"32 bytes for U256"));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(bytes);
+        Ok(U256::from_be_bytes(arr))
+    }
 }
 
 impl NumAccum {
@@ -40,6 +64,7 @@ impl NumAccum {
         match mode {
             NumMode::Int => NumAccum::Int(0),
             NumMode::Float => NumAccum::Float(0.0),
+            NumMode::BigInt => NumAccum::BigInt(U256::ZERO),
         }
     }
 
@@ -53,6 +78,11 @@ impl NumAccum {
                 _ => None,
             },
             NumMode::Float => v.as_f64().map(NumAccum::Float),
+            NumMode::BigInt => match v {
+                Value::Uint256(bytes) => Some(NumAccum::BigInt(U256::from_be_bytes(*bytes))),
+                Value::UInt64(n) => Some(NumAccum::BigInt(U256::from(*n))),
+                _ => None,
+            },
         }
     }
 
@@ -60,6 +90,7 @@ impl NumAccum {
         match (self, other) {
             (NumAccum::Int(a), NumAccum::Int(b)) => NumAccum::Int(a.saturating_add(b)),
             (NumAccum::Float(a), NumAccum::Float(b)) => NumAccum::Float(a + b),
+            (NumAccum::BigInt(a), NumAccum::BigInt(b)) => NumAccum::BigInt(a.saturating_add(b)),
             _ => unreachable!("mode is fixed at construction"),
         }
     }
@@ -68,6 +99,7 @@ impl NumAccum {
         match self {
             NumAccum::Int(v) => v as f64,
             NumAccum::Float(v) => v,
+            NumAccum::BigInt(v) => v.as_f64(),
         }
     }
 
@@ -83,6 +115,7 @@ impl NumAccum {
                 }
             }
             NumAccum::Float(v) => Value::Float64(v),
+            NumAccum::BigInt(v) => Value::Uint256(v.to_be_bytes()),
         }
     }
 
@@ -90,6 +123,7 @@ impl NumAccum {
         match (self, other) {
             (NumAccum::Int(a), NumAccum::Int(b)) => NumAccum::Int(a.min(b)),
             (NumAccum::Float(a), NumAccum::Float(b)) => NumAccum::Float(a.min(b)),
+            (NumAccum::BigInt(a), NumAccum::BigInt(b)) => NumAccum::BigInt(a.min(b)),
             _ => unreachable!("mode is fixed at construction"),
         }
     }
@@ -98,6 +132,7 @@ impl NumAccum {
         match (self, other) {
             (NumAccum::Int(a), NumAccum::Int(b)) => NumAccum::Int(a.max(b)),
             (NumAccum::Float(a), NumAccum::Float(b)) => NumAccum::Float(a.max(b)),
+            (NumAccum::BigInt(a), NumAccum::BigInt(b)) => NumAccum::BigInt(a.max(b)),
             _ => unreachable!("mode is fixed at construction"),
         }
     }
@@ -561,6 +596,9 @@ impl AggregationFunc for AvgAgg {
             self.finalized_count + self.blocks.values().map(|(_, c)| c).sum::<u64>();
         if total_count == 0 {
             Value::Null
+        } else if let NumAccum::BigInt(sum) = total_sum {
+            // Integer division for Uint256 — no f64 precision loss
+            Value::Uint256((sum / U256::from(total_count)).to_be_bytes())
         } else {
             Value::Float64(total_sum.to_f64() / total_count as f64)
         }
@@ -1328,5 +1366,88 @@ mod tests {
         let mut agg = SumAgg::new(&ColumnType::Float64);
         agg.add_block(100, &[Value::Float64(10.5)]);
         assert_eq!(agg.current_value(), Value::Float64(10.5));
+    }
+
+    // --- Uint256 aggregation tests ---
+
+    fn u256_val(lo: u128) -> Value {
+        Value::Uint256(ethnum::U256::from(lo).to_be_bytes())
+    }
+
+    fn u256_from_val(v: &Value) -> ethnum::U256 {
+        match v {
+            Value::Uint256(b) => ethnum::U256::from_be_bytes(*b),
+            _ => panic!("expected Uint256, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn uint256_sum() {
+        let mut agg = SumAgg::new(&ColumnType::Uint256);
+        // Values larger than u64::MAX
+        let big: u128 = (u64::MAX as u128) + 1;
+        agg.add_block(100, &[u256_val(big)]);
+        agg.add_block(101, &[u256_val(big)]);
+        assert_eq!(
+            u256_from_val(&agg.current_value()),
+            ethnum::U256::from(big * 2)
+        );
+    }
+
+    #[test]
+    fn uint256_min_max() {
+        let mut min_agg = MinAgg::new(&ColumnType::Uint256);
+        let mut max_agg = MaxAgg::new(&ColumnType::Uint256);
+        let a: u128 = 100;
+        let b: u128 = 200;
+        min_agg.add_block(100, &[u256_val(a), u256_val(b)]);
+        max_agg.add_block(100, &[u256_val(a), u256_val(b)]);
+        assert_eq!(
+            u256_from_val(&min_agg.current_value()),
+            ethnum::U256::from(a)
+        );
+        assert_eq!(
+            u256_from_val(&max_agg.current_value()),
+            ethnum::U256::from(b)
+        );
+    }
+
+    #[test]
+    fn uint256_avg() {
+        let mut agg = AvgAgg::new(&ColumnType::Uint256);
+        agg.add_block(100, &[u256_val(100), u256_val(200)]);
+        // AVG of Uint256 returns Uint256 (integer division)
+        assert_eq!(
+            u256_from_val(&agg.current_value()),
+            ethnum::U256::from(150u64)
+        );
+    }
+
+    #[test]
+    fn uint256_avg_large_values_no_precision_loss() {
+        let mut agg = AvgAgg::new(&ColumnType::Uint256);
+        // 1 ETH = 10^18 wei — values > 2^53 that lose precision as f64
+        let one_eth: u128 = 1_000_000_000_000_000_000;
+        let two_eth: u128 = 2 * one_eth;
+        agg.add_block(100, &[u256_val(one_eth), u256_val(two_eth)]);
+        // AVG = 1.5 ETH = 1_500_000_000_000_000_000 (exact in U256)
+        let expected = ethnum::U256::from(one_eth + one_eth / 2);
+        assert_eq!(u256_from_val(&agg.current_value()), expected);
+    }
+
+    #[test]
+    fn uint256_rollback() {
+        let mut agg = SumAgg::new(&ColumnType::Uint256);
+        agg.add_block(100, &[u256_val(100)]);
+        agg.add_block(101, &[u256_val(200)]);
+        assert_eq!(
+            u256_from_val(&agg.current_value()),
+            ethnum::U256::from(300u64)
+        );
+        agg.remove_block(101);
+        assert_eq!(
+            u256_from_val(&agg.current_value()),
+            ethnum::U256::from(100u64)
+        );
     }
 }

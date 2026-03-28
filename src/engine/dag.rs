@@ -116,10 +116,32 @@ impl DeltaEngine {
             })
             .collect();
 
+        // Build column type maps for reducer output (state fields + group_by from source table)
+        let reducer_column_types: HashMap<String, HashMap<String, ColumnType>> = schema
+            .reducers
+            .iter()
+            .map(|r| {
+                let mut cols: HashMap<String, ColumnType> = r
+                    .state
+                    .iter()
+                    .map(|s| (s.name.clone(), s.column_type.clone()))
+                    .collect();
+                if let Some(table_cols) = table_column_types.get(&r.source) {
+                    for col in &r.group_by {
+                        if let Some(ct) = table_cols.get(col) {
+                            cols.insert(col.clone(), ct.clone());
+                        }
+                    }
+                }
+                (r.name.clone(), cols)
+            })
+            .collect();
+
         for mv_def in &schema.materialized_views {
-            // Resolve source column types: from table or reducer state fields
+            // Resolve source column types: from table or reducer output
             let source_col_types = table_column_types
                 .get(&mv_def.source)
+                .or_else(|| reducer_column_types.get(&mv_def.source))
                 .cloned()
                 .unwrap_or_default();
             mvs.insert(
@@ -591,6 +613,53 @@ impl DeltaEngine {
         from_block: BlockNumber,
         to_block: BlockNumber,
     ) -> Result<()> {
+        self.replay_unfinalized_inner(from_block, to_block, None)
+    }
+
+    /// Replay only a specific reducer and its direct downstream MVs.
+    /// Note: only 1 level of MV depth (MV→MV chaining is not supported).
+    pub fn replay_unfinalized_for(
+        &mut self,
+        from_block: BlockNumber,
+        to_block: BlockNumber,
+        reducer_name: &str,
+    ) -> Result<()> {
+        // Find MV names that source from this reducer
+        let mv_names: HashSet<String> = self
+            .pipeline
+            .iter()
+            .filter_map(|node| {
+                if let PipelineNode::MV(name) = node {
+                    let source = if let Some(&(bi, mi)) = self.mv_branch_index.get(name) {
+                        self.branches[bi].mv_entries[mi].1.source().to_string()
+                    } else if let Some(mv) = self.mvs.get(name) {
+                        mv.source().to_string()
+                    } else {
+                        return None;
+                    };
+                    if source == reducer_name {
+                        Some(name.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut filter = HashSet::new();
+        filter.insert(reducer_name.to_string());
+        filter.extend(mv_names);
+        self.replay_unfinalized_inner(from_block, to_block, Some(&filter))
+    }
+
+    fn replay_unfinalized_inner(
+        &mut self,
+        from_block: BlockNumber,
+        to_block: BlockNumber,
+        only_nodes: Option<&HashSet<String>>,
+    ) -> Result<()> {
         if from_block > to_block {
             return Ok(());
         }
@@ -625,7 +694,28 @@ impl DeltaEngine {
                             // Skip — rows already in storage
                         }
                         PipelineNode::Reducer(name) => {
-                            let enriched = if let Some(branch) =
+                            // Skip if filtered out
+                            if let Some(filter) = &only_nodes {
+                                if !filter.contains(name.as_str()) {
+                                    continue;
+                                }
+                            }
+
+                            // Skip external reducers when no JS context is installed
+                            let is_ext = self
+                                .branch_index
+                                .get(name)
+                                .map(|&i| self.branches[i].reducer.needs_host_callback())
+                                .unwrap_or_else(|| {
+                                    self.reducers
+                                        .get(name)
+                                        .map(|r| r.needs_host_callback())
+                                        .unwrap_or(false)
+                                });
+
+                            let enriched = if is_ext {
+                                Vec::new()
+                            } else if let Some(branch) =
                                 self.branch_index.get(name).map(|&i| &mut self.branches[i])
                             {
                                 let source = branch.reducer.source().to_string();
@@ -652,6 +742,13 @@ impl DeltaEngine {
                             }
                         }
                         PipelineNode::MV(name) => {
+                            // Skip if filtered out
+                            if let Some(filter) = &only_nodes {
+                                if !filter.contains(name.as_str()) {
+                                    continue;
+                                }
+                            }
+
                             if let Some(&(bi, mi)) = self.mv_branch_index.get(name) {
                                 let mv = &mut self.branches[bi].mv_entries[mi].1;
                                 let source = mv.source().to_string();
@@ -1747,6 +1844,169 @@ mod tests {
         assert!(
             deltas.len() > 0,
             "should produce some deltas without panicking"
+        );
+    }
+
+    /// replay_unfinalized_for must replay ONLY the target reducer,
+    /// not double-process other reducers that were already replayed.
+    #[test]
+    fn replay_unfinalized_for_does_not_double_replay() {
+        // Schema with two reducers: counter_a and counter_b, each with an MV
+        let schema = Schema {
+            modules: vec![],
+            tables: vec![TableDef {
+                name: "events".to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "block_number".to_string(),
+                        column_type: ColumnType::UInt64,
+                    },
+                    ColumnDef {
+                        name: "pool".to_string(),
+                        column_type: ColumnType::String,
+                    },
+                    ColumnDef {
+                        name: "amount".to_string(),
+                        column_type: ColumnType::Float64,
+                    },
+                ],
+                virtual_table: false,
+            }],
+            reducers: vec![
+                ReducerDef {
+                    name: "counter_a".to_string(),
+                    source: "events".to_string(),
+                    group_by: vec!["pool".to_string()],
+                    state: vec![StateField {
+                        name: "total".to_string(),
+                        column_type: ColumnType::Float64,
+                        default: "0".to_string(),
+                    }],
+                    requires: vec![],
+                    body: ReducerBody::EventRules {
+                        when_blocks: vec![WhenBlock {
+                            condition: Expr::Int(1),
+                            lets: vec![],
+                            sets: vec![(
+                                "total".to_string(),
+                                Expr::BinaryOp {
+                                    left: Box::new(Expr::StateRef("total".into())),
+                                    op: BinaryOp::Add,
+                                    right: Box::new(Expr::RowRef("amount".into())),
+                                },
+                            )],
+                            emits: vec![("total".to_string(), Expr::StateRef("total".into()))],
+                        }],
+                        always_emit: None,
+                    },
+                },
+                ReducerDef {
+                    name: "counter_b".to_string(),
+                    source: "events".to_string(),
+                    group_by: vec!["pool".to_string()],
+                    state: vec![StateField {
+                        name: "total".to_string(),
+                        column_type: ColumnType::Float64,
+                        default: "0".to_string(),
+                    }],
+                    requires: vec![],
+                    body: ReducerBody::EventRules {
+                        when_blocks: vec![WhenBlock {
+                            condition: Expr::Int(1),
+                            lets: vec![],
+                            sets: vec![(
+                                "total".to_string(),
+                                Expr::BinaryOp {
+                                    left: Box::new(Expr::StateRef("total".into())),
+                                    op: BinaryOp::Add,
+                                    right: Box::new(Expr::RowRef("amount".into())),
+                                },
+                            )],
+                            emits: vec![("total".to_string(), Expr::StateRef("total".into()))],
+                        }],
+                        always_emit: None,
+                    },
+                },
+            ],
+            materialized_views: vec![
+                MVDef {
+                    name: "mv_a".to_string(),
+                    source: "counter_a".to_string(),
+                    select: vec![
+                        SelectItem {
+                            expr: SelectExpr::Column("pool".into()),
+                            alias: None,
+                        },
+                        SelectItem {
+                            expr: SelectExpr::Agg(AggFunc::Sum, Some("total".into())),
+                            alias: Some("sum_a".into()),
+                        },
+                    ],
+                    group_by: vec!["pool".into()],
+                    sliding_window: None,
+                },
+                MVDef {
+                    name: "mv_b".to_string(),
+                    source: "counter_b".to_string(),
+                    select: vec![
+                        SelectItem {
+                            expr: SelectExpr::Column("pool".into()),
+                            alias: None,
+                        },
+                        SelectItem {
+                            expr: SelectExpr::Agg(AggFunc::Sum, Some("total".into())),
+                            alias: Some("sum_b".into()),
+                        },
+                    ],
+                    group_by: vec!["pool".into()],
+                    sliding_window: None,
+                },
+            ],
+        };
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let mut engine = DeltaEngine::new(&schema, storage.clone());
+
+        // Process block 1000
+        let rows = vec![RowMap::from([
+            ("pool".to_string(), Value::String("ETH".into())),
+            ("amount".to_string(), Value::Float64(100.0)),
+        ])];
+        engine.process_batch("events", 1000, rows).unwrap();
+
+        // Full replay (simulates open() recovery) — both reducers see block 1000
+        let mut engine2 = DeltaEngine::new(&schema, storage.clone());
+        engine2.replay_unfinalized(1000, 1000).unwrap();
+
+        // Now replay_for counter_a ONLY — counter_b must NOT be double-replayed
+        engine2
+            .replay_unfinalized_for(1000, 1000, "counter_a")
+            .unwrap();
+
+        // Process block 1001 to get deltas
+        let rows2 = vec![RowMap::from([
+            ("pool".to_string(), Value::String("ETH".into())),
+            ("amount".to_string(), Value::Float64(50.0)),
+        ])];
+        let (deltas, _) = engine2.process_batch("events", 1001, rows2).unwrap();
+
+        // counter_b was replayed once (full replay). State after block 1000 = 100.
+        // Block 1001 adds 50 → state = 150, emits total=150.
+        // mv_b SUM(total) = 100 (block 1000) + 150 (block 1001) = 250.
+        // If counter_b were double-replayed, block 1000 state = 200,
+        // block 1001 state = 250, SUM = 200 + 250 = 450.
+        let mv_b: Vec<_> = deltas.iter().filter(|d| d.table == "mv_b").collect();
+        assert!(!mv_b.is_empty(), "mv_b should have deltas");
+        let sum_b = mv_b
+            .last()
+            .unwrap()
+            .values
+            .get("sum_b")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        assert!(
+            (sum_b - 250.0).abs() < 0.01,
+            "counter_b NOT double-replayed: expected 250, got {sum_b}"
         );
     }
 }
