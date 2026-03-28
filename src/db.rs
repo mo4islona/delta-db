@@ -8,7 +8,7 @@ use crate::schema::parser::parse_schema;
 use crate::storage::{StorageBackend, StorageWriteBatch};
 use crate::storage::memory::MemoryBackend;
 use crate::storage::rocks::RocksDbBackend;
-use crate::types::{BlockCursor, BlockNumber, DeltaBatch, RowMap};
+use crate::types::{BlockCursor, BlockNumber, DeltaBatch, RowMap, Value};
 
 /// Configuration for opening a DeltaDb instance.
 pub struct Config {
@@ -273,14 +273,20 @@ impl DeltaDb {
         for (table, rows) in input.data {
             let mut by_block: BTreeMap<BlockNumber, Vec<RowMap>> = BTreeMap::new();
             for row in rows {
-                let block = row
-                    .get("block_number")
-                    .and_then(|v| v.as_u64())
-                    .ok_or_else(|| {
-                        Error::InvalidOperation(format!(
+                let block = match row.get("block_number") {
+                    Some(Value::UInt64(n)) => *n,
+                    Some(other) => {
+                        return Err(Error::InvalidOperation(format!(
+                            "row in table '{table}' has invalid block_number type: expected UInt64, got {}",
+                            other.type_name()
+                        )));
+                    }
+                    None => {
+                        return Err(Error::InvalidOperation(format!(
                             "row in table '{table}' missing block_number"
-                        ))
-                    })?;
+                        )));
+                    }
+                };
                 by_block.entry(block).or_default().push(row);
             }
 
@@ -347,7 +353,7 @@ impl DeltaDb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{DeltaOperation, Value};
+    use crate::types::{BlockCursor, DeltaOperation, Value};
     use std::collections::HashMap;
 
     const DEX_SCHEMA: &str = r#"
@@ -1236,5 +1242,48 @@ mod tests {
             let pool_vol = batch.tables.get("pool_volume").unwrap();
             assert!(!pool_vol.is_empty());
         }
+    }
+
+    /// ingest() must reject non-UInt64 block_number values.
+    #[test]
+    fn ingest_rejects_negative_block_number() {
+        let schema = r#"
+            CREATE TABLE t (block_number UInt64, x Float64);
+        "#;
+        let mut db = DeltaDb::open(Config::new(schema)).unwrap();
+        let result = db.ingest(IngestInput {
+            data: HashMap::from([(
+                "t".to_string(),
+                vec![HashMap::from([
+                    ("block_number".to_string(), Value::Int64(-1)),
+                    ("x".to_string(), Value::Float64(1.0)),
+                ])],
+            )]),
+            rollback_chain: vec![],
+            finalized_head: BlockCursor { number: 0, hash: "0x0".into() },
+        });
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid block_number type"));
+    }
+
+    #[test]
+    fn ingest_rejects_float_block_number() {
+        let schema = r#"
+            CREATE TABLE t (block_number UInt64, x Float64);
+        "#;
+        let mut db = DeltaDb::open(Config::new(schema)).unwrap();
+        let result = db.ingest(IngestInput {
+            data: HashMap::from([(
+                "t".to_string(),
+                vec![HashMap::from([
+                    ("block_number".to_string(), Value::Float64(1.5)),
+                    ("x".to_string(), Value::Float64(1.0)),
+                ])],
+            )]),
+            rollback_chain: vec![],
+            finalized_head: BlockCursor { number: 0, hash: "0x0".into() },
+        });
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid block_number type"));
     }
 }
