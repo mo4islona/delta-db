@@ -123,32 +123,11 @@ impl RawTableEngine {
 
     /// Roll back all rows where block_number > fork_point.
     /// Returns compensating Delete delta records for the rolled-back rows.
-    ///
-    /// **Note:** This performs an immediate non-atomic delete. Prefer
-    /// `rollback_to_batch` for crash-safe rollback.
+    /// Uses `rollback_to_batch` internally and commits atomically.
     pub fn rollback(&self, fork_point: BlockNumber) -> Result<Vec<DeltaRecord>> {
-        let rolled_back = self
-            .storage
-            .take_raw_rows_after(&self.def.name, fork_point)?;
-
-        let mut deltas = Vec::new();
-        for (block, data) in rolled_back {
-            let rows = storage::decode_rows(&data, &self.registry)?;
-            for (idx, row) in rows.into_iter().enumerate() {
-                let mut key = HashMap::new();
-                key.insert("block_number".to_string(), Value::UInt64(block));
-                key.insert("_row_index".to_string(), Value::UInt64(idx as u64));
-
-                deltas.push(DeltaRecord {
-                    table: self.def.name.clone(),
-                    operation: DeltaOperation::Delete,
-                    key,
-                    values: row.to_map(),
-                    prev_values: None,
-                });
-            }
-        }
-
+        let mut batch = StorageWriteBatch::new();
+        let deltas = self.rollback_to_batch(fork_point, &mut batch)?;
+        self.storage.commit(&batch)?;
         Ok(deltas)
     }
 

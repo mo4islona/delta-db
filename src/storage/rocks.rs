@@ -169,7 +169,13 @@ impl StorageBackend for RocksDbBackend {
             if !k.starts_with(&prefix) {
                 break;
             }
-            let block = BlockNumber::from_be_bytes(k[prefix.len()..].try_into().unwrap());
+            let block = BlockNumber::from_be_bytes(
+                k.get(prefix.len()..prefix.len() + 8)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or_else(|| {
+                        Error::Storage("corrupt key: missing block number suffix".into())
+                    })?,
+            );
             result.push((block, v.to_vec()));
         }
         Ok(result)
@@ -226,7 +232,13 @@ impl StorageBackend for RocksDbBackend {
                 .iterator_cf_opt(cf, opts, IteratorMode::From(&start, Direction::Forward));
         for item in iter {
             let (k, v) = item.map_err(to_err)?;
-            let block = BlockNumber::from_be_bytes(k[prefix.len()..].try_into().unwrap());
+            let block = BlockNumber::from_be_bytes(
+                k.get(prefix.len()..prefix.len() + 8)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or_else(|| {
+                        Error::Storage("corrupt key: missing block number suffix".into())
+                    })?,
+            );
             result.push((block, v.to_vec()));
             batch.delete_cf(cf, k.as_ref());
         }
@@ -287,7 +299,13 @@ impl StorageBackend for RocksDbBackend {
             if !k.starts_with(&prefix) {
                 break;
             }
-            let blk = BlockNumber::from_be_bytes(k[prefix.len()..].try_into().unwrap());
+            let blk = BlockNumber::from_be_bytes(
+                k.get(prefix.len()..prefix.len() + 8)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or_else(|| {
+                        Error::Storage("corrupt key: missing block number suffix".into())
+                    })?,
+            );
             return Ok(Some((blk, v.to_vec())));
         }
         Ok(None)
