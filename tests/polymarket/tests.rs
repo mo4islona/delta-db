@@ -247,17 +247,17 @@ fn insider_detected_with_full_fields() {
     // first_seen = last_seen = 1000
     assert_eq!(
         rec.values.get("first_seen"),
-        Some(&Value::Float64(1000.0))
+        Some(&Value::Int64(1000))
     );
     assert_eq!(
         rec.values.get("last_seen"),
-        Some(&Value::Float64(1000.0))
+        Some(&Value::Int64(1000))
     );
 
     // detected_at = 1000
     assert_eq!(
         rec.values.get("detected_at"),
-        Some(&Value::Float64(1000.0))
+        Some(&Value::Int64(1000))
     );
 }
 

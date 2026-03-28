@@ -959,10 +959,11 @@ fn parse_emit_list(input: &str, start: usize) -> Result<(Vec<(String, Expr)>, us
 }
 
 fn split_as_alias(s: &str) -> Option<(&str, &str)> {
-    // Find " AS " (case-insensitive) that's not inside parens
+    // Find " AS " (case-insensitive) that's not inside parens.
+    // Uses char_indices() for correct byte offsets with non-ASCII input.
     let upper = s.to_uppercase();
     let mut depth = 0;
-    for (i, c) in s.chars().enumerate() {
+    for (i, c) in s.char_indices() {
         match c {
             '(' => depth += 1,
             ')' => depth -= 1,
@@ -986,6 +987,23 @@ pub fn parse_expr(input: &str) -> Result<Expr, Error> {
 }
 
 fn parse_or_expr(input: &str) -> Result<Expr, Error> {
+    let parts = split_binary_op(input, &[" OR ", " or "]);
+    if parts.len() == 1 {
+        return parse_and_expr(parts[0].trim());
+    }
+    let mut expr = parse_and_expr(parts[0].trim())?;
+    for part in &parts[1..] {
+        let right = parse_and_expr(part.trim())?;
+        expr = Expr::BinaryOp {
+            left: Box::new(expr),
+            op: BinaryOp::Or,
+            right: Box::new(right),
+        };
+    }
+    Ok(expr)
+}
+
+fn parse_and_expr(input: &str) -> Result<Expr, Error> {
     let parts = split_binary_op(input, &[" AND ", " and "]);
     if parts.len() == 1 {
         return parse_comparison_expr(parts[0].trim());
@@ -1268,15 +1286,22 @@ fn read_token(input: &str, pos: usize) -> Result<(String, usize), Error> {
     let start = pos;
     let mut p = pos;
 
-    // Handle quoted strings
+    // Handle quoted strings (with SQL doubled-quote escaping, e.g. 'it''s')
     if p < bytes.len() && (bytes[p] == b'\'' || bytes[p] == b'"') {
         let quote = bytes[p];
         p += 1;
-        while p < bytes.len() && bytes[p] != quote {
-            p += 1;
-        }
-        if p < bytes.len() {
-            p += 1; // closing quote
+        while p < bytes.len() {
+            if bytes[p] == quote {
+                // Check for doubled-quote escape (e.g. '' inside a '-quoted string)
+                if p + 1 < bytes.len() && bytes[p + 1] == quote {
+                    p += 2; // skip both quotes
+                } else {
+                    p += 1; // closing quote
+                    break;
+                }
+            } else {
+                p += 1;
+            }
         }
         return Ok((input[start..p].to_string(), p));
     }
@@ -1432,21 +1457,50 @@ fn split_binary_op<'a>(input: &'a str, ops: &[&str]) -> Vec<&'a str> {
     let mut parts = Vec::new();
     let mut last = 0;
     let mut depth = 0i32;
-    let upper = input.to_uppercase();
+    let bytes = input.as_bytes();
+    let mut i = 0;
 
-    for i in 0..input.len() {
-        match input.as_bytes()[i] {
-            b'(' => depth += 1,
-            b')' => depth -= 1,
-            _ if depth == 0 => {
-                for op in ops {
-                    if upper[i..].starts_with(&op.to_uppercase()) {
-                        parts.push(&input[last..i]);
-                        last = i + op.len();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => { depth += 1; i += 1; }
+            b')' => { depth -= 1; i += 1; }
+            // Skip quoted strings to avoid matching operators inside them
+            q @ (b'\'' | b'"') => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == q {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == q {
+                            i += 1; // doubled-quote escape
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
                     }
                 }
             }
-            _ => {}
+            // Operators are pure ASCII — match case-insensitively on raw bytes
+            // to avoid to_uppercase() byte-length misalignment with non-ASCII input.
+            _ if depth == 0 => {
+                let mut matched = false;
+                for op in ops {
+                    let ob = op.as_bytes();
+                    if i + ob.len() <= bytes.len()
+                        && bytes[i..i + ob.len()].eq_ignore_ascii_case(ob)
+                    {
+                        parts.push(&input[last..i]);
+                        last = i + ob.len();
+                        i = last;
+                        matched = true;
+                        break;
+                    }
+                }
+                if !matched {
+                    i += 1;
+                }
+            }
+            _ => { i += 1; }
         }
     }
     parts.push(&input[last..]);
@@ -2049,6 +2103,83 @@ mod tests {
             }
             _ => panic!("expected Eq, got {expr:?}"),
         }
+    }
+
+    /// Issue #8: OR conditions must be parsed correctly.
+    #[test]
+    fn parse_expr_or_condition() {
+        let expr = parse_expr("row.side = 'buy' OR row.side = 'sell'").unwrap();
+        match expr {
+            Expr::BinaryOp { op: BinaryOp::Or, left, right } => {
+                match *left {
+                    Expr::BinaryOp { op: BinaryOp::Eq, .. } => {}
+                    other => panic!("expected Eq on left, got {other:?}"),
+                }
+                match *right {
+                    Expr::BinaryOp { op: BinaryOp::Eq, .. } => {}
+                    other => panic!("expected Eq on right, got {other:?}"),
+                }
+            }
+            other => panic!("expected Or, got {other:?}"),
+        }
+    }
+
+    /// Issue #8: OR has lower precedence than AND.
+    #[test]
+    fn parse_expr_or_and_precedence() {
+        // "a = 1 OR b = 2 AND c = 3" should parse as "a = 1 OR (b = 2 AND c = 3)"
+        let expr = parse_expr("row.a = '1' OR row.b = '2' AND row.c = '3'").unwrap();
+        match expr {
+            Expr::BinaryOp { op: BinaryOp::Or, right, .. } => {
+                match *right {
+                    Expr::BinaryOp { op: BinaryOp::And, .. } => {}
+                    other => panic!("expected And on right side of Or, got {other:?}"),
+                }
+            }
+            other => panic!("expected Or at top level, got {other:?}"),
+        }
+    }
+
+    /// split_binary_op must not panic on multibyte UTF-8 in quoted strings.
+    #[test]
+    fn parse_expr_multibyte_utf8_in_condition() {
+        let expr = parse_expr("row.msg = 'café' OR row.msg = 'naïve'").unwrap();
+        match expr {
+            Expr::BinaryOp { op: BinaryOp::Or, .. } => {}
+            other => panic!("expected Or, got {other:?}"),
+        }
+    }
+
+    /// to_uppercase() changes byte length for some chars (e.g. 'ß' → "SS").
+    /// split_binary_op must handle this without index misalignment.
+    #[test]
+    fn parse_expr_uppercase_length_change() {
+        // 'ß' is 2 bytes, uppercases to "SS" (2 bytes → 2 chars but same byte count here).
+        // Use a more extreme case: column named with non-ASCII that changes length.
+        let expr = parse_expr("row.x = 'straße' AND row.y = '1'").unwrap();
+        match expr {
+            Expr::BinaryOp { op: BinaryOp::And, .. } => {}
+            other => panic!("expected And, got {other:?}"),
+        }
+    }
+
+    /// Issue #24: read_token must handle SQL doubled-quote escaping.
+    #[test]
+    fn read_token_handles_doubled_quotes() {
+        let (token, end) = read_token("'it''s fine' rest", 0).unwrap();
+        assert_eq!(token, "'it''s fine'");
+        assert_eq!(end, 12);
+    }
+
+    /// Issue #23: split_as_alias must handle non-ASCII characters before AS keyword.
+    #[test]
+    fn parse_mv_with_non_ascii_alias_source() {
+        // Non-ASCII chars before AS keyword — would panic with char-count indexing
+        let result = split_as_alias("SUM(café) AS total");
+        assert!(result.is_some());
+        let (expr, alias) = result.unwrap();
+        assert_eq!(expr, "SUM(café)");
+        assert_eq!(alias, "total");
     }
 
     #[test]

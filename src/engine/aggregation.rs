@@ -55,6 +55,8 @@ pub trait AggregationFunc: Send + Sync {
 pub struct SumAgg {
     finalized: f64,
     blocks: BTreeMap<BlockNumber, f64>,
+    /// Whether any block has ever been finalized (prevents false deletion on zero-sum groups).
+    has_finalized: bool,
 }
 
 impl SumAgg {
@@ -62,6 +64,7 @@ impl SumAgg {
         Self {
             finalized: 0.0,
             blocks: BTreeMap::new(),
+            has_finalized: false,
         }
     }
 }
@@ -86,6 +89,9 @@ impl AggregationFunc for SumAgg {
             .range(..=block)
             .map(|(&b, &v)| (b, v))
             .collect();
+        if !to_finalize.is_empty() {
+            self.has_finalized = true;
+        }
         for (b, v) in to_finalize {
             self.finalized += v;
             self.blocks.remove(&b);
@@ -98,7 +104,7 @@ impl AggregationFunc for SumAgg {
     }
 
     fn has_data(&self) -> bool {
-        self.finalized != 0.0 || !self.blocks.is_empty()
+        self.has_finalized || !self.blocks.is_empty()
     }
 
     fn to_bytes(&self) -> Vec<u8> {
@@ -1125,5 +1131,21 @@ mod tests {
         assert_eq!(close.current_value(), Value::Float64(90.0)); // falls back to block 1002
         assert_eq!(volume.current_value(), Value::Float64(6.0)); // subtracted
         assert_eq!(count.current_value(), Value::UInt64(3));      // subtracted
+    }
+
+    /// Issue #15: SumAgg must report has_data=true even when finalized sum is exactly 0.0.
+    #[test]
+    fn sum_has_data_after_zero_sum_finalization() {
+        let mut agg = SumAgg::new();
+        assert!(!agg.has_data(), "empty agg should have no data");
+
+        agg.add_block(100, &[Value::Float64(10.0)]);
+        agg.add_block(101, &[Value::Float64(-10.0)]);
+        assert!(agg.has_data(), "agg with pending blocks should have data");
+
+        agg.finalize_up_to(101);
+        assert_eq!(agg.current_value(), Value::Float64(0.0));
+        assert!(agg.has_data(),
+            "agg with finalized zero sum should still report has_data=true");
     }
 }
