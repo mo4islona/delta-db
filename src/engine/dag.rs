@@ -519,6 +519,10 @@ impl DeltaEngine {
                                     let source = mv.source().to_string();
                                     if let Some(source_rows) = output_rows.get(&source) {
                                         mv.process_block(block, source_rows);
+                                    } else if let Some(raw_rows) = row_cache.get(&source) {
+                                        let maps: Vec<RowMap> =
+                                            raw_rows.iter().map(|r| r.to_map()).collect();
+                                        mv.process_block(block, &maps);
                                     }
                                     found = true;
                                     break;
@@ -529,6 +533,10 @@ impl DeltaEngine {
                                 let source = mv.source().to_string();
                                 if let Some(source_rows) = output_rows.get(&source) {
                                     mv.process_block(block, source_rows);
+                                } else if let Some(raw_rows) = row_cache.get(&source) {
+                                    let maps: Vec<RowMap> =
+                                        raw_rows.iter().map(|r| r.to_map()).collect();
+                                    mv.process_block(block, &maps);
                                 }
                             }
                         }
@@ -1436,6 +1444,90 @@ mod tests {
         assert_eq!(
             summary3[0].values.get("latest_doubled"),
             Some(&Value::Float64(60.0))
+        );
+    }
+
+    /// Direct raw-table→MV (no reducer) must work during replay_unfinalized.
+    #[test]
+    fn replay_unfinalized_direct_mv() {
+        let schema = Schema {
+            modules: vec![],
+            tables: vec![TableDef {
+                name: "events".to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "block_number".to_string(),
+                        column_type: ColumnType::UInt64,
+                    },
+                    ColumnDef {
+                        name: "pool".to_string(),
+                        column_type: ColumnType::String,
+                    },
+                    ColumnDef {
+                        name: "amount".to_string(),
+                        column_type: ColumnType::Float64,
+                    },
+                ],
+                virtual_table: false,
+            }],
+            reducers: vec![],
+            materialized_views: vec![MVDef {
+                name: "pool_totals".to_string(),
+                source: "events".to_string(),
+                select: vec![
+                    SelectItem {
+                        expr: SelectExpr::Column("pool".to_string()),
+                        alias: None,
+                    },
+                    SelectItem {
+                        expr: SelectExpr::Agg(AggFunc::Sum, Some("amount".to_string())),
+                        alias: Some("total".to_string()),
+                    },
+                ],
+                group_by: vec!["pool".to_string()],
+                sliding_window: None,
+            }],
+        };
+
+        // Process two blocks
+        let rows1 = vec![RowMap::from([
+            ("pool".to_string(), Value::String("ETH".into())),
+            ("amount".to_string(), Value::Float64(100.0)),
+        ])];
+        let rows2 = vec![RowMap::from([
+            ("pool".to_string(), Value::String("ETH".into())),
+            ("amount".to_string(), Value::Float64(200.0)),
+        ])];
+        let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let mut engine = DeltaEngine::new(&schema, storage.clone());
+
+        // Process blocks — raw rows go to storage, MV gets data
+        engine.process_batch("events", 1000, rows1).unwrap();
+        engine.process_batch("events", 1001, rows2).unwrap();
+
+        // Simulate crash recovery: create a fresh engine with the same storage
+        // that has raw rows but no in-memory MV state.
+        let mut engine2 = DeltaEngine::new(&schema, storage);
+
+        // Replay unfinalized blocks — MV sources directly from raw table
+        engine2.replay_unfinalized(1000, 1001).unwrap();
+
+        // After replay, MV should have accumulated 100 + 200 = 300
+        // Process another block to get deltas that confirm the state
+        let rows3 = vec![RowMap::from([
+            ("pool".to_string(), Value::String("ETH".into())),
+            ("amount".to_string(), Value::Float64(50.0)),
+        ])];
+        let deltas = engine2.process_batch("events", 1002, rows3).unwrap();
+        let mv_deltas: Vec<_> = deltas.iter().filter(|d| d.table == "pool_totals").collect();
+        assert!(
+            !mv_deltas.is_empty(),
+            "MV should produce deltas after replay"
+        );
+        // Total should be 100 + 200 + 50 = 350
+        assert_eq!(
+            mv_deltas.last().unwrap().values.get("total"),
+            Some(&Value::Float64(350.0))
         );
     }
 }
