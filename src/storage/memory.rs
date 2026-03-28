@@ -186,22 +186,13 @@ impl StorageBackend for MemoryBackend {
 
     // --- Reducer finalized state ---
 
-    fn get_reducer_finalized(
-        &self,
-        reducer: &str,
-        group_key: &[u8],
-    ) -> Result<Option<Vec<u8>>> {
+    fn get_reducer_finalized(&self, reducer: &str, group_key: &[u8]) -> Result<Option<Vec<u8>>> {
         let inner = self.inner.lock().unwrap();
         let key = (reducer.to_string(), group_key.to_vec());
         Ok(inner.reducer_finalized.get(&key).cloned())
     }
 
-    fn set_reducer_finalized(
-        &self,
-        reducer: &str,
-        group_key: &[u8],
-        state: &[u8],
-    ) -> Result<()> {
+    fn set_reducer_finalized(&self, reducer: &str, group_key: &[u8], state: &[u8]) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         let key = (reducer.to_string(), group_key.to_vec());
         inner.reducer_finalized.insert(key, state.to_vec());
@@ -230,33 +221,20 @@ impl StorageBackend for MemoryBackend {
 
     // --- MV state ---
 
-    fn put_mv_state(
-        &self,
-        view: &str,
-        group_key: &[u8],
-        state: &[u8],
-    ) -> Result<()> {
+    fn put_mv_state(&self, view: &str, group_key: &[u8], state: &[u8]) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         let key = (view.to_string(), group_key.to_vec());
         inner.mv_states.insert(key, state.to_vec());
         Ok(())
     }
 
-    fn get_mv_state(
-        &self,
-        view: &str,
-        group_key: &[u8],
-    ) -> Result<Option<Vec<u8>>> {
+    fn get_mv_state(&self, view: &str, group_key: &[u8]) -> Result<Option<Vec<u8>>> {
         let inner = self.inner.lock().unwrap();
         let key = (view.to_string(), group_key.to_vec());
         Ok(inner.mv_states.get(&key).cloned())
     }
 
-    fn delete_mv_state(
-        &self,
-        view: &str,
-        group_key: &[u8],
-    ) -> Result<()> {
+    fn delete_mv_state(&self, view: &str, group_key: &[u8]) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         let key = (view.to_string(), group_key.to_vec());
         inner.mv_states.remove(&key);
@@ -296,11 +274,19 @@ impl StorageBackend for MemoryBackend {
                 BatchOp::PutRawRows { table, block, data } => {
                     inner.raw.insert((table.clone(), *block), data.clone());
                 }
-                BatchOp::SetReducerFinalized { reducer, group_key, state } => {
+                BatchOp::SetReducerFinalized {
+                    reducer,
+                    group_key,
+                    state,
+                } => {
                     let key = (reducer.clone(), group_key.clone());
                     inner.reducer_finalized.insert(key, state.clone());
                 }
-                BatchOp::PutMvState { view, group_key, state } => {
+                BatchOp::PutMvState {
+                    view,
+                    group_key,
+                    state,
+                } => {
                     let key = (view.clone(), group_key.clone());
                     inner.mv_states.insert(key, state.clone());
                 }
@@ -312,7 +298,8 @@ impl StorageBackend for MemoryBackend {
                 }
                 BatchOp::DeleteRawRowsAfter { table, after_block } => {
                     if *after_block < BlockNumber::MAX {
-                        let keys: Vec<_> = inner.raw
+                        let keys: Vec<_> = inner
+                            .raw
                             .range((table.clone(), *after_block + 1)..)
                             .take_while(|((t, _), _)| t == table)
                             .map(|(k, _)| k.clone())
@@ -350,7 +337,7 @@ impl StorageBackend for MemoryBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{decode_rows, encode_rows, encode_state, decode_state, encode_group_key};
+    use crate::storage::{decode_rows, decode_state, encode_group_key, encode_rows, encode_state};
     use crate::types::{ColumnRegistry, Row, Value};
     use std::sync::Arc;
 
@@ -375,13 +362,17 @@ mod tests {
         let rows1 = vec![make_row(&reg, "alice", 10.0)];
         let rows2 = vec![make_row(&reg, "bob", 20.0)];
 
-        backend.put_raw_rows("swaps", 100, &encode_rows(&rows1)).unwrap();
-        backend.put_raw_rows("swaps", 101, &encode_rows(&rows2)).unwrap();
+        backend
+            .put_raw_rows("swaps", 100, &encode_rows(&rows1))
+            .unwrap();
+        backend
+            .put_raw_rows("swaps", 101, &encode_rows(&rows2))
+            .unwrap();
 
         let result = backend.get_raw_rows("swaps", 100, 101).unwrap();
         assert_eq!(result.len(), 2);
-        let decoded0 = decode_rows(&result[0].1, &reg);
-        let decoded1 = decode_rows(&result[1].1, &reg);
+        let decoded0 = decode_rows(&result[0].1, &reg).unwrap();
+        let decoded1 = decode_rows(&result[1].1, &reg).unwrap();
         assert_eq!(result[0].0, 100);
         assert_eq!(decoded0.len(), 1);
         assert_eq!(result[1].0, 101);
@@ -395,7 +386,9 @@ mod tests {
         for block in 100..110 {
             let mut row = Row::new(reg.clone());
             row.set("block", Value::UInt64(block));
-            backend.put_raw_rows("t", block, &encode_rows(&[row])).unwrap();
+            backend
+                .put_raw_rows("t", block, &encode_rows(&[row]))
+                .unwrap();
         }
 
         let result = backend.get_raw_rows("t", 103, 106).unwrap();
@@ -411,7 +404,9 @@ mod tests {
         for block in 100..105 {
             let mut row = Row::new(reg.clone());
             row.set("b", Value::UInt64(block));
-            backend.put_raw_rows("t", block, &encode_rows(&[row])).unwrap();
+            backend
+                .put_raw_rows("t", block, &encode_rows(&[row]))
+                .unwrap();
         }
 
         backend.delete_raw_rows_after("t", 102).unwrap();
@@ -430,8 +425,12 @@ mod tests {
         let mut row_b = Row::new(reg.clone());
         row_b.set("t", Value::String("b".into()));
 
-        backend.put_raw_rows("a", 100, &encode_rows(&[row_a])).unwrap();
-        backend.put_raw_rows("b", 100, &encode_rows(&[row_b])).unwrap();
+        backend
+            .put_raw_rows("a", 100, &encode_rows(&[row_a]))
+            .unwrap();
+        backend
+            .put_raw_rows("b", 100, &encode_rows(&[row_b]))
+            .unwrap();
 
         backend.delete_raw_rows_after("a", 99).unwrap();
 
@@ -447,22 +446,40 @@ mod tests {
         let state1 = encode_state(&[("qty".to_string(), Value::Float64(10.0))].into());
         let state2 = encode_state(&[("qty".to_string(), Value::Float64(15.0))].into());
 
-        backend.put_reducer_state("pnl", &gk, 1000, &state1).unwrap();
-        backend.put_reducer_state("pnl", &gk, 1001, &state2).unwrap();
+        backend
+            .put_reducer_state("pnl", &gk, 1000, &state1)
+            .unwrap();
+        backend
+            .put_reducer_state("pnl", &gk, 1001, &state2)
+            .unwrap();
 
-        let loaded = backend.get_reducer_state("pnl", &gk, 1000).unwrap().unwrap();
+        let loaded = backend
+            .get_reducer_state("pnl", &gk, 1000)
+            .unwrap()
+            .unwrap();
         let decoded = decode_state(&loaded);
         assert_eq!(decoded.get("qty"), Some(&Value::Float64(10.0)));
 
-        let (blk, data) = backend.get_reducer_state_at_or_before("pnl", &gk, 1005).unwrap().unwrap();
+        let (blk, data) = backend
+            .get_reducer_state_at_or_before("pnl", &gk, 1005)
+            .unwrap()
+            .unwrap();
         assert_eq!(blk, 1001);
         let decoded = decode_state(&data);
         assert_eq!(decoded.get("qty"), Some(&Value::Float64(15.0)));
 
-        let (blk, _) = backend.get_reducer_state_at_or_before("pnl", &gk, 1000).unwrap().unwrap();
+        let (blk, _) = backend
+            .get_reducer_state_at_or_before("pnl", &gk, 1000)
+            .unwrap()
+            .unwrap();
         assert_eq!(blk, 1000);
 
-        assert!(backend.get_reducer_state_at_or_before("pnl", &gk, 999).unwrap().is_none());
+        assert!(
+            backend
+                .get_reducer_state_at_or_before("pnl", &gk, 999)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -578,11 +595,15 @@ mod tests {
         for block in 100..105 {
             let mut row = Row::new(reg.clone());
             row.set("b", Value::UInt64(block));
-            backend.put_raw_rows("t", block, &encode_rows(&[row])).unwrap();
+            backend
+                .put_raw_rows("t", block, &encode_rows(&[row]))
+                .unwrap();
         }
 
         // u64::MAX means "nothing is after this block", should be a no-op
-        backend.delete_raw_rows_after("t", BlockNumber::MAX).unwrap();
+        backend
+            .delete_raw_rows_after("t", BlockNumber::MAX)
+            .unwrap();
 
         let result = backend.get_raw_rows("t", 100, 110).unwrap();
         assert_eq!(result.len(), 5, "All rows should be preserved");
@@ -596,7 +617,9 @@ mod tests {
         for block in 100..105 {
             let mut row = Row::new(reg.clone());
             row.set("b", Value::UInt64(block));
-            backend.put_raw_rows("t", block, &encode_rows(&[row])).unwrap();
+            backend
+                .put_raw_rows("t", block, &encode_rows(&[row]))
+                .unwrap();
         }
 
         let taken = backend.take_raw_rows_after("t", BlockNumber::MAX).unwrap();
@@ -617,11 +640,18 @@ mod tests {
             backend.put_reducer_state("r", &gk, block, &state).unwrap();
         }
 
-        backend.delete_reducer_states_after("r", &gk, BlockNumber::MAX).unwrap();
+        backend
+            .delete_reducer_states_after("r", &gk, BlockNumber::MAX)
+            .unwrap();
 
         for block in 1000..1005 {
-            assert!(backend.get_reducer_state("r", &gk, block).unwrap().is_some(),
-                "Block {block} state should be preserved");
+            assert!(
+                backend
+                    .get_reducer_state("r", &gk, block)
+                    .unwrap()
+                    .is_some(),
+                "Block {block} state should be preserved"
+            );
         }
     }
 
@@ -631,8 +661,12 @@ mod tests {
         let gk1 = encode_group_key(&[Value::String("alice".into())]);
         let gk2 = encode_group_key(&[Value::String("bob".into())]);
 
-        backend.put_reducer_state("r", &gk1, 100, b"alice_state").unwrap();
-        backend.put_reducer_state("r", &gk2, 100, b"bob_state").unwrap();
+        backend
+            .put_reducer_state("r", &gk1, 100, b"alice_state")
+            .unwrap();
+        backend
+            .put_reducer_state("r", &gk2, 100, b"bob_state")
+            .unwrap();
 
         backend.delete_reducer_states_after("r", &gk1, 99).unwrap();
 

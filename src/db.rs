@@ -166,6 +166,9 @@ impl DeltaDb {
     /// between these two operations leaves orphaned raw rows in storage that are
     /// never replayed into reducer/MV state on recovery. For crash-safe ingestion,
     /// use `ingest()` which commits all writes atomically.
+    /// **Deprecated**: Not crash-safe. Use `ingest()` instead.
+    /// Kept public for benchmarks and tests only.
+    #[doc(hidden)]
     pub fn process_batch(
         &mut self,
         table: &str,

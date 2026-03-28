@@ -70,18 +70,6 @@ export class DeltaDb {
     return new DeltaDb(NativeDeltaDb.open(config))
   }
 
-  processBatch(table: string, block: number, rows: Record<string, any>[]): boolean {
-    return this.#native.processBatch(table, block, Buffer.from(encoder.encode(rows)))
-  }
-
-  rollback(forkPoint: number): void {
-    this.#native.rollback(forkPoint)
-  }
-
-  finalize(block: number): void {
-    this.#native.finalize(block)
-  }
-
   async ingest(input: IngestInput): Promise<DeltaBatch | null> {
     const buf = this.#native.ingest({
       data: Buffer.from(encoder.encode(input.data)),

@@ -17,7 +17,11 @@ impl RawTableEngine {
     pub fn new(def: TableDef, storage: Arc<dyn StorageBackend>) -> Self {
         let names: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
         let registry = Arc::new(ColumnRegistry::new(names));
-        Self { def, storage, registry }
+        Self {
+            def,
+            storage,
+            registry,
+        }
     }
 
     pub fn name(&self) -> &str {
@@ -129,7 +133,7 @@ impl RawTableEngine {
 
         let mut deltas = Vec::new();
         for (block, data) in rolled_back {
-            let rows = storage::decode_rows(&data, &self.registry);
+            let rows = storage::decode_rows(&data, &self.registry)?;
             for (idx, row) in rows.into_iter().enumerate() {
                 let mut key = HashMap::new();
                 key.insert("block_number".to_string(), Value::UInt64(block));
@@ -161,16 +165,16 @@ impl RawTableEngine {
         }
 
         // Read rows that will be rolled back (they're still in storage)
-        let rolled_back = self
-            .storage
-            .get_raw_rows(&self.def.name, fork_point + 1, BlockNumber::MAX)?;
+        let rolled_back =
+            self.storage
+                .get_raw_rows(&self.def.name, fork_point + 1, BlockNumber::MAX)?;
 
         // Defer the deletion to the write batch
         batch.delete_raw_rows_after(&self.def.name, fork_point);
 
         let mut deltas = Vec::new();
         for (block, data) in rolled_back {
-            let rows = storage::decode_rows(&data, &self.registry);
+            let rows = storage::decode_rows(&data, &self.registry)?;
             for (idx, row) in rows.into_iter().enumerate() {
                 let mut key = HashMap::new();
                 key.insert("block_number".to_string(), Value::UInt64(block));
@@ -198,27 +202,38 @@ impl RawTableEngine {
         let raw = self
             .storage
             .get_raw_rows(&self.def.name, from_block, to_block)?;
-        Ok(raw
-            .into_iter()
-            .map(|(block, data)| (block, storage::decode_rows(&data, &self.registry)))
-            .collect())
+        raw.into_iter()
+            .map(|(block, data)| {
+                let rows = storage::decode_rows(&data, &self.registry)?;
+                Ok((block, rows))
+            })
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::ast::ColumnDef;
     use crate::storage::memory::MemoryBackend;
     use crate::types::ColumnType;
-    use crate::schema::ast::ColumnDef;
 
     fn test_table_def() -> TableDef {
         TableDef {
             name: "trades".to_string(),
             columns: vec![
-                ColumnDef { name: "block_number".to_string(), column_type: ColumnType::UInt64 },
-                ColumnDef { name: "user".to_string(), column_type: ColumnType::String },
-                ColumnDef { name: "amount".to_string(), column_type: ColumnType::Float64 },
+                ColumnDef {
+                    name: "block_number".to_string(),
+                    column_type: ColumnType::UInt64,
+                },
+                ColumnDef {
+                    name: "user".to_string(),
+                    column_type: ColumnType::String,
+                },
+                ColumnDef {
+                    name: "amount".to_string(),
+                    column_type: ColumnType::Float64,
+                },
             ],
             virtual_table: false,
         }
@@ -242,12 +257,21 @@ mod tests {
         assert_eq!(deltas.len(), 2);
         assert_eq!(deltas[0].operation, DeltaOperation::Insert);
         assert_eq!(deltas[0].table, "trades");
-        assert_eq!(deltas[0].key.get("block_number"), Some(&Value::UInt64(1000)));
+        assert_eq!(
+            deltas[0].key.get("block_number"),
+            Some(&Value::UInt64(1000))
+        );
         assert_eq!(deltas[0].key.get("_row_index"), Some(&Value::UInt64(0)));
-        assert_eq!(deltas[0].values.get("user"), Some(&Value::String("alice".into())));
+        assert_eq!(
+            deltas[0].values.get("user"),
+            Some(&Value::String("alice".into()))
+        );
 
         assert_eq!(deltas[1].key.get("_row_index"), Some(&Value::UInt64(1)));
-        assert_eq!(deltas[1].values.get("user"), Some(&Value::String("bob".into())));
+        assert_eq!(
+            deltas[1].values.get("user"),
+            Some(&Value::String("bob".into()))
+        );
     }
 
     #[test]
@@ -280,7 +304,12 @@ mod tests {
 
         engine.ingest(1000, &[make_row_map("alice", 10.0)]).unwrap();
         engine.ingest(1001, &[make_row_map("bob", 20.0)]).unwrap();
-        engine.ingest(1002, &[make_row_map("carol", 30.0), make_row_map("dave", 40.0)]).unwrap();
+        engine
+            .ingest(
+                1002,
+                &[make_row_map("carol", 30.0), make_row_map("dave", 40.0)],
+            )
+            .unwrap();
 
         // Rollback to block 1000 (delete 1001 and 1002)
         let deltas = engine.rollback(1000).unwrap();
@@ -293,7 +322,11 @@ mod tests {
         }
 
         // Verify bob's row is in the deltas
-        assert!(deltas.iter().any(|d| d.values.get("user") == Some(&Value::String("bob".into()))));
+        assert!(
+            deltas
+                .iter()
+                .any(|d| d.values.get("user") == Some(&Value::String("bob".into())))
+        );
 
         // Verify storage only has block 1000
         let remaining = engine.get_rows(1000, 1010).unwrap();
