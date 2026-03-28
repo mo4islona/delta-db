@@ -190,7 +190,7 @@ struct BatchRef<'a>(&'a DeltaBatch);
 
 impl Serialize for BatchRef<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(4))?;
+        let mut map = serializer.serialize_map(Some(5))?;
         map.serialize_entry("sequence", &self.0.sequence)?;
         map.serialize_entry(
             "finalizedHead",
@@ -201,6 +201,31 @@ impl Serialize for BatchRef<'_> {
             &self.0.latest_head.as_ref().map(|c| CursorRef(c)),
         )?;
         map.serialize_entry("tables", &TablesRef(&self.0.tables))?;
+        let perf_refs: Vec<PerfNodeRef> = self.0.perf.iter().map(PerfNodeRef).collect();
+        map.serialize_entry("perf", &perf_refs)?;
+        map.end()
+    }
+}
+
+struct PerfNodeRef<'a>(&'a crate::types::PerfNode);
+
+impl Serialize for PerfNodeRef<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(4))?;
+        map.serialize_entry(
+            "kind",
+            match self.0.kind {
+                crate::types::PerfNodeKind::Pipeline => "pipeline",
+                crate::types::PerfNodeKind::RawTable => "raw_table",
+                crate::types::PerfNodeKind::Reducer => "reducer",
+                crate::types::PerfNodeKind::MV => "mv",
+                crate::types::PerfNodeKind::Parallel => "parallel",
+            },
+        )?;
+        map.serialize_entry("name", &self.0.name)?;
+        map.serialize_entry("durationMs", &self.0.duration_ms)?;
+        let children: Vec<PerfNodeRef> = self.0.children.iter().map(PerfNodeRef).collect();
+        map.serialize_entry("children", &children)?;
         map.end()
     }
 }
@@ -394,16 +419,20 @@ mod tests {
                 number: 1000,
                 hash: "0xdef".into(),
             }),
-            tables: HashMap::from([("swaps".into(), vec![DeltaRecord {
-                table: "swaps".into(),
-                operation: DeltaOperation::Insert,
-                key: HashMap::from([("block_number".into(), Value::UInt64(1000))]),
-                values: HashMap::from([
-                    ("pool".into(), Value::String("ETH/USDC".into())),
-                    ("amount".into(), Value::Float64(100.5)),
-                ]),
-                prev_values: None,
-            }])]),
+            tables: HashMap::from([(
+                "swaps".into(),
+                vec![DeltaRecord {
+                    table: "swaps".into(),
+                    operation: DeltaOperation::Insert,
+                    key: HashMap::from([("block_number".into(), Value::UInt64(1000))]),
+                    values: HashMap::from([
+                        ("pool".into(), Value::String("ETH/USDC".into())),
+                        ("amount".into(), Value::Float64(100.5)),
+                    ]),
+                    prev_values: None,
+                }],
+            )]),
+            perf: vec![],
         };
 
         let buf = encode_batch_to_msgpack(&batch);
@@ -431,13 +460,17 @@ mod tests {
             sequence: 2,
             finalized_head: None,
             latest_head: None,
-            tables: HashMap::from([("volume".into(), vec![DeltaRecord {
-                table: "volume".into(),
-                operation: DeltaOperation::Update,
-                key: HashMap::from([("pool".into(), Value::String("ETH".into()))]),
-                values: HashMap::from([("total".into(), Value::Float64(300.0))]),
-                prev_values: Some(HashMap::from([("total".into(), Value::Float64(200.0))])),
-            }])]),
+            tables: HashMap::from([(
+                "volume".into(),
+                vec![DeltaRecord {
+                    table: "volume".into(),
+                    operation: DeltaOperation::Update,
+                    key: HashMap::from([("pool".into(), Value::String("ETH".into()))]),
+                    values: HashMap::from([("total".into(), Value::Float64(300.0))]),
+                    prev_values: Some(HashMap::from([("total".into(), Value::Float64(200.0))])),
+                }],
+            )]),
+            perf: vec![],
         };
 
         let buf = encode_batch_to_msgpack(&batch);
@@ -455,6 +488,7 @@ mod tests {
             finalized_head: None,
             latest_head: None,
             tables: HashMap::new(),
+            perf: vec![],
         };
 
         let buf = encode_batch_to_msgpack(&batch);

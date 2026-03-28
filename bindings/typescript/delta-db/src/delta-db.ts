@@ -27,11 +27,21 @@ export interface DeltaRecord {
   prevValues: Record<string, any> | null
 }
 
+export type PerfNodeKind = 'pipeline' | 'raw_table' | 'reducer' | 'mv' | 'parallel'
+
+export interface PerfNode {
+  kind: PerfNodeKind
+  name: string
+  durationMs: number
+  children: PerfNode[]
+}
+
 export interface DeltaBatch {
   sequence: number
   finalizedHead: DeltaDbCursor | null
   latestHead: DeltaDbCursor | null
   tables: Record<string, DeltaRecord[]>
+  perf: PerfNode[]
 }
 
 export interface IngestInput {

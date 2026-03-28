@@ -125,13 +125,13 @@ interface BenchResult {
   rowsPerSec: number
 }
 
-function runBenchmark(name: string, db: DeltaDb, rows: Trade[], batchSize: number): BenchResult {
+async function runBenchmark(name: string, db: DeltaDb, rows: Trade[], batchSize: number): Promise<BenchResult> {
   const totalRows = rows.length
 
   const start = performance.now()
   for (let block = 0; block * batchSize < totalRows; block++) {
     const batch = rows.slice(block * batchSize, (block + 1) * batchSize)
-    db.ingest({
+    await db.ingest({
       data: { trades: batch },
       finalizedHead: { number: block, hash: `0x${block}` },
     })
@@ -158,6 +158,8 @@ const TOTAL_ROWS = 100_000
 const BATCH_SIZE = 50
 const NUM_USERS = 100
 
+async function main() {
+
 console.log(
   `\n=== Reducer Benchmark (${TOTAL_ROWS} rows, ${NUM_USERS} users, batch=${BATCH_SIZE}) ===\n`,
 )
@@ -167,14 +169,14 @@ const trades = generateTrades(TOTAL_ROWS, NUM_USERS)
 // 1. Event Rules
 {
   const db = DeltaDb.open({ schema: TABLE_SCHEMA + EVENT_RULES_REDUCER + MV_SCHEMA })
-  const r = runBenchmark('Full pipeline — Event Rules', db, trades, BATCH_SIZE)
+  const r = await runBenchmark('Full pipeline — Event Rules', db, trades, BATCH_SIZE)
   printResult(r)
 }
 
 // 2. Lua
 {
   const db = DeltaDb.open({ schema: TABLE_SCHEMA + LUA_REDUCER + MV_SCHEMA })
-  const r = runBenchmark('Full pipeline — Lua', db, trades, BATCH_SIZE)
+  const r = await runBenchmark('Full pipeline — Lua', db, trades, BATCH_SIZE)
   printResult(r)
 }
 
@@ -218,8 +220,11 @@ const trades = generateTrades(TOTAL_ROWS, NUM_USERS)
     },
   })
 
-  const r = runBenchmark('Full pipeline — External (JS callback)', db, trades, BATCH_SIZE)
+  const r = await runBenchmark('Full pipeline — External (JS callback)', db, trades, BATCH_SIZE)
   printResult(r)
 }
 
 console.log()
+
+} // end main
+main()
