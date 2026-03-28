@@ -5,9 +5,9 @@ use crate::delta::DeltaBuffer;
 use crate::engine::dag::DeltaEngine;
 use crate::error::{Error, Result};
 use crate::schema::parser::parse_schema;
-use crate::storage::{StorageBackend, StorageWriteBatch};
 use crate::storage::memory::MemoryBackend;
 use crate::storage::rocks::RocksDbBackend;
+use crate::storage::{StorageBackend, StorageWriteBatch};
 use crate::types::{BlockCursor, BlockNumber, DeltaBatch, RowMap, Value};
 
 /// Configuration for opening a DeltaDb instance.
@@ -99,22 +99,24 @@ impl DeltaDb {
 
         // Restore persisted state
         if let Some(bytes) = storage.get_meta(META_LATEST_BLOCK)? {
-            let block = u64::from_be_bytes(bytes.try_into().map_err(|_| {
-                Error::Storage("corrupt latest_block metadata".into())
-            })?);
+            let block = u64::from_be_bytes(
+                bytes
+                    .try_into()
+                    .map_err(|_| Error::Storage("corrupt latest_block metadata".into()))?,
+            );
             engine.set_latest_block(block);
         }
         if let Some(bytes) = storage.get_meta(META_FINALIZED_BLOCK)? {
-            let block = u64::from_be_bytes(bytes.try_into().map_err(|_| {
-                Error::Storage("corrupt finalized_block metadata".into())
-            })?);
+            let block = u64::from_be_bytes(
+                bytes
+                    .try_into()
+                    .map_err(|_| Error::Storage("corrupt finalized_block metadata".into()))?,
+            );
             engine.set_finalized_block(block);
         }
         if let Some(bytes) = storage.get_meta(META_BLOCK_HASHES)? {
-            let hashes: BTreeMap<BlockNumber, String> =
-                serde_json::from_slice(&bytes).map_err(|e| {
-                    Error::Storage(format!("corrupt block_hashes metadata: {e}"))
-                })?;
+            let hashes: BTreeMap<BlockNumber, String> = serde_json::from_slice(&bytes)
+                .map_err(|e| Error::Storage(format!("corrupt block_hashes metadata: {e}")))?;
             engine.restore_block_hashes(hashes);
         }
 
@@ -135,7 +137,11 @@ impl DeltaDb {
     }
 
     /// Replace the runtime for a named reducer (for External/FnReducer injection).
-    pub fn set_reducer_runtime(&mut self, name: &str, runtime: Box<dyn crate::reducer_runtime::ReducerRuntime>) {
+    pub fn set_reducer_runtime(
+        &mut self,
+        name: &str,
+        runtime: Box<dyn crate::reducer_runtime::ReducerRuntime>,
+    ) {
         self.engine.set_reducer_runtime(name, runtime);
     }
 
@@ -292,7 +298,10 @@ impl DeltaDb {
 
             for (block, block_rows) in by_block {
                 let deltas = self.engine.process_batch_deferred(
-                    &table, block, block_rows, &mut write_batch,
+                    &table,
+                    block,
+                    block_rows,
+                    &mut write_batch,
                 )?;
                 self.buffer.push(
                     deltas,
@@ -302,28 +311,27 @@ impl DeltaDb {
             }
         }
 
-        // 2. Store rollback chain hashes
-        let chain: Vec<(BlockNumber, String)> = input
+        // 2. Store rollback chain hashes (including finalized head)
+        let mut chain: Vec<(BlockNumber, String)> = input
             .rollback_chain
             .iter()
             .map(|c| (c.number, c.hash.clone()))
             .collect();
-        self.engine.set_rollback_chain(&chain);
-
-        // 3. Store finalized head hash and finalize atomically
-        self.engine.set_rollback_chain(&[(
+        chain.push((
             input.finalized_head.number,
             input.finalized_head.hash.clone(),
-        )]);
-        self.engine.finalize(input.finalized_head.number, &mut write_batch);
+        ));
+        self.engine.set_rollback_chain(&chain);
+
+        // 3. Finalize atomically
+        self.engine
+            .finalize(input.finalized_head.number, &mut write_batch);
         self.append_meta_to_batch(&mut write_batch)?;
         self.storage.commit(&write_batch)?;
 
         // 4. Update buffer heads with correct cursors (hashes now stored)
-        self.buffer.set_heads(
-            self.engine.finalized_cursor(),
-            self.engine.latest_cursor(),
-        );
+        self.buffer
+            .set_heads(self.engine.finalized_cursor(), self.engine.latest_cursor());
 
         // 5. Flush
         let batch = self.buffer.flush();
@@ -334,17 +342,13 @@ impl DeltaDb {
     /// Append engine metadata (latest_block, finalized_block, block_hashes)
     /// to a write batch for atomic commit.
     fn append_meta_to_batch(&self, batch: &mut StorageWriteBatch) -> Result<()> {
-        batch.put_meta(
-            META_LATEST_BLOCK,
-            &self.engine.latest_block().to_be_bytes(),
-        );
+        batch.put_meta(META_LATEST_BLOCK, &self.engine.latest_block().to_be_bytes());
         batch.put_meta(
             META_FINALIZED_BLOCK,
             &self.engine.finalized_block().to_be_bytes(),
         );
-        let hashes_json = serde_json::to_vec(self.engine.block_hashes()).map_err(|e| {
-            Error::Storage(format!("failed to serialize block_hashes: {e}"))
-        })?;
+        let hashes_json = serde_json::to_vec(self.engine.block_hashes())
+            .map_err(|e| Error::Storage(format!("failed to serialize block_hashes: {e}")))?;
         batch.put_meta(META_BLOCK_HASHES, &hashes_json);
         Ok(())
     }
@@ -442,10 +446,12 @@ mod tests {
     fn simple_ingest_and_flush() {
         let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
-        db.process_batch("swaps", 1000, vec![
-            make_swap("ETH/USDC", 100.0),
-            make_swap("ETH/USDC", 200.0),
-        ]).unwrap();
+        db.process_batch(
+            "swaps",
+            1000,
+            vec![make_swap("ETH/USDC", 100.0), make_swap("ETH/USDC", 200.0)],
+        )
+        .unwrap();
 
         let batch = db.flush().unwrap();
         assert_eq!(batch.sequence, 1);
@@ -454,36 +460,44 @@ mod tests {
         // 2 raw inserts + 1 MV insert = 3 records
         assert_eq!(batch.record_count(), 3);
 
-        let mv_records: Vec<_> = batch.records_for("pool_volume").iter()
-            .collect();
+        let mv_records: Vec<_> = batch.records_for("pool_volume").iter().collect();
         assert_eq!(mv_records.len(), 1);
         assert_eq!(mv_records[0].operation, DeltaOperation::Insert);
-        assert_eq!(mv_records[0].values.get("total_volume"), Some(&Value::Float64(300.0)));
+        assert_eq!(
+            mv_records[0].values.get("total_volume"),
+            Some(&Value::Float64(300.0))
+        );
     }
 
     #[test]
     fn multiple_blocks_merge_in_buffer() {
         let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
-        db.process_batch("swaps", 1000, vec![make_swap("ETH/USDC", 100.0)]).unwrap();
-        db.process_batch("swaps", 1001, vec![make_swap("ETH/USDC", 200.0)]).unwrap();
+        db.process_batch("swaps", 1000, vec![make_swap("ETH/USDC", 100.0)])
+            .unwrap();
+        db.process_batch("swaps", 1001, vec![make_swap("ETH/USDC", 200.0)])
+            .unwrap();
 
         let batch = db.flush().unwrap();
 
         // MV records should be merged: Insert + Update -> Insert with latest values
-        let mv_records: Vec<_> = batch.records_for("pool_volume").iter()
-            .collect();
+        let mv_records: Vec<_> = batch.records_for("pool_volume").iter().collect();
         assert_eq!(mv_records.len(), 1);
         assert_eq!(mv_records[0].operation, DeltaOperation::Insert);
-        assert_eq!(mv_records[0].values.get("total_volume"), Some(&Value::Float64(300.0)));
+        assert_eq!(
+            mv_records[0].values.get("total_volume"),
+            Some(&Value::Float64(300.0))
+        );
     }
 
     #[test]
     fn rollback_produces_compensating_deltas() {
         let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
-        db.process_batch("swaps", 1000, vec![make_swap("ETH/USDC", 100.0)]).unwrap();
-        db.process_batch("swaps", 1001, vec![make_swap("ETH/USDC", 200.0)]).unwrap();
+        db.process_batch("swaps", 1000, vec![make_swap("ETH/USDC", 100.0)])
+            .unwrap();
+        db.process_batch("swaps", 1001, vec![make_swap("ETH/USDC", 200.0)])
+            .unwrap();
 
         // Flush and clear buffer
         db.flush();
@@ -494,11 +508,13 @@ mod tests {
         let batch = db.flush().unwrap();
 
         // Should have MV update (back to 100) and raw delete
-        let mv_records: Vec<_> = batch.records_for("pool_volume").iter()
-            .collect();
+        let mv_records: Vec<_> = batch.records_for("pool_volume").iter().collect();
         assert_eq!(mv_records.len(), 1);
         assert_eq!(mv_records[0].operation, DeltaOperation::Update);
-        assert_eq!(mv_records[0].values.get("total_volume"), Some(&Value::Float64(100.0)));
+        assert_eq!(
+            mv_records[0].values.get("total_volume"),
+            Some(&Value::Float64(100.0))
+        );
 
         assert_eq!(db.latest_block(), 1000);
     }
@@ -507,9 +523,12 @@ mod tests {
     fn finalize_and_rollback() {
         let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
-        db.process_batch("swaps", 1000, vec![make_swap("ETH/USDC", 100.0)]).unwrap();
-        db.process_batch("swaps", 1001, vec![make_swap("ETH/USDC", 200.0)]).unwrap();
-        db.process_batch("swaps", 1002, vec![make_swap("ETH/USDC", 300.0)]).unwrap();
+        db.process_batch("swaps", 1000, vec![make_swap("ETH/USDC", 100.0)])
+            .unwrap();
+        db.process_batch("swaps", 1001, vec![make_swap("ETH/USDC", 200.0)])
+            .unwrap();
+        db.process_batch("swaps", 1002, vec![make_swap("ETH/USDC", 300.0)])
+            .unwrap();
         db.flush();
 
         // Finalize up to 1001
@@ -520,11 +539,13 @@ mod tests {
         db.rollback(1001).unwrap();
 
         let batch = db.flush().unwrap();
-        let mv_records: Vec<_> = batch.records_for("pool_volume").iter()
-            .collect();
+        let mv_records: Vec<_> = batch.records_for("pool_volume").iter().collect();
         assert_eq!(mv_records.len(), 1);
         // total should be 100 + 200 = 300
-        assert_eq!(mv_records[0].values.get("total_volume"), Some(&Value::Float64(300.0)));
+        assert_eq!(
+            mv_records[0].values.get("total_volume"),
+            Some(&Value::Float64(300.0))
+        );
     }
 
     #[test]
@@ -532,28 +553,44 @@ mod tests {
         let mut db = DeltaDb::open(Config::new(DEX_SCHEMA)).unwrap();
 
         // Block 1000: alice buys 10 @ 2000
-        db.process_batch("trades", 1000, vec![
-            make_trade("alice", "buy", 10.0, 2000.0),
-        ]).unwrap();
+        db.process_batch(
+            "trades",
+            1000,
+            vec![make_trade("alice", "buy", 10.0, 2000.0)],
+        )
+        .unwrap();
 
         // Block 1001: alice sells 5 @ 2200
-        db.process_batch("trades", 1001, vec![
-            make_trade("alice", "sell", 5.0, 2200.0),
-        ]).unwrap();
+        db.process_batch(
+            "trades",
+            1001,
+            vec![make_trade("alice", "sell", 5.0, 2200.0)],
+        )
+        .unwrap();
 
         let batch = db.flush().unwrap();
 
-        let mv_records: Vec<_> = batch.records_for("position_summary").iter()
-            .collect();
+        let mv_records: Vec<_> = batch.records_for("position_summary").iter().collect();
         assert_eq!(mv_records.len(), 1);
 
         // trade_count should be 2
-        assert_eq!(mv_records[0].values.get("trade_count"), Some(&Value::UInt64(2)));
+        assert_eq!(
+            mv_records[0].values.get("trade_count"),
+            Some(&Value::UInt64(2))
+        );
         // current_position = last(position_size) = 5.0
-        assert_eq!(mv_records[0].values.get("current_position"), Some(&Value::Float64(5.0)));
+        assert_eq!(
+            mv_records[0].values.get("current_position"),
+            Some(&Value::Float64(5.0))
+        );
 
         // total_pnl: trade 1 = 0 (buy), trade 2 = 5*(2200-2000) = 1000
-        let total_pnl = mv_records[0].values.get("total_pnl").unwrap().as_f64().unwrap();
+        let total_pnl = mv_records[0]
+            .values
+            .get("total_pnl")
+            .unwrap()
+            .as_f64()
+            .unwrap();
         assert!((total_pnl - 1000.0).abs() < 0.01);
     }
 
@@ -561,9 +598,24 @@ mod tests {
     fn full_pipeline_rollback_and_reingest() {
         let mut db = DeltaDb::open(Config::new(DEX_SCHEMA)).unwrap();
 
-        db.process_batch("trades", 1000, vec![make_trade("alice", "buy", 10.0, 2000.0)]).unwrap();
-        db.process_batch("trades", 1001, vec![make_trade("alice", "buy", 5.0, 2100.0)]).unwrap();
-        db.process_batch("trades", 1002, vec![make_trade("alice", "sell", 8.0, 2200.0)]).unwrap();
+        db.process_batch(
+            "trades",
+            1000,
+            vec![make_trade("alice", "buy", 10.0, 2000.0)],
+        )
+        .unwrap();
+        db.process_batch(
+            "trades",
+            1001,
+            vec![make_trade("alice", "buy", 5.0, 2100.0)],
+        )
+        .unwrap();
+        db.process_batch(
+            "trades",
+            1002,
+            vec![make_trade("alice", "sell", 8.0, 2200.0)],
+        )
+        .unwrap();
         db.flush();
 
         // Rollback block 1002 (the sell)
@@ -571,29 +623,40 @@ mod tests {
         db.flush();
 
         // Re-ingest with different sell
-        db.process_batch("trades", 1002, vec![make_trade("alice", "sell", 3.0, 2300.0)]).unwrap();
+        db.process_batch(
+            "trades",
+            1002,
+            vec![make_trade("alice", "sell", 3.0, 2300.0)],
+        )
+        .unwrap();
 
         let batch = db.flush().unwrap();
-        let mv_records: Vec<_> = batch.records_for("position_summary").iter()
-            .collect();
+        let mv_records: Vec<_> = batch.records_for("position_summary").iter().collect();
         assert_eq!(mv_records.len(), 1);
-        assert_eq!(mv_records[0].values.get("trade_count"), Some(&Value::UInt64(3)));
+        assert_eq!(
+            mv_records[0].values.get("trade_count"),
+            Some(&Value::UInt64(3))
+        );
 
         // position_size after: 10 + 5 - 3 = 12
-        assert_eq!(mv_records[0].values.get("current_position"), Some(&Value::Float64(12.0)));
+        assert_eq!(
+            mv_records[0].values.get("current_position"),
+            Some(&Value::Float64(12.0))
+        );
     }
 
     #[test]
     fn backpressure_signal() {
-        let mut db = DeltaDb::open(
-            Config::new(SIMPLE_SCHEMA).max_buffer_size(3),
-        ).unwrap();
+        let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA).max_buffer_size(3)).unwrap();
 
         // First batch: 2 raw + 1 MV = 3 records → buffer full
-        let full = db.process_batch("swaps", 1000, vec![
-            make_swap("ETH/USDC", 100.0),
-            make_swap("ETH/USDC", 200.0),
-        ]).unwrap();
+        let full = db
+            .process_batch(
+                "swaps",
+                1000,
+                vec![make_swap("ETH/USDC", 100.0), make_swap("ETH/USDC", 200.0)],
+            )
+            .unwrap();
 
         assert!(full);
         assert!(db.is_backpressured());
@@ -620,10 +683,12 @@ mod tests {
     fn sequence_numbers_increment() {
         let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
-        db.process_batch("swaps", 1000, vec![make_swap("ETH/USDC", 100.0)]).unwrap();
+        db.process_batch("swaps", 1000, vec![make_swap("ETH/USDC", 100.0)])
+            .unwrap();
         let b1 = db.flush().unwrap();
 
-        db.process_batch("swaps", 1001, vec![make_swap("ETH/USDC", 200.0)]).unwrap();
+        db.process_batch("swaps", 1001, vec![make_swap("ETH/USDC", 200.0)])
+            .unwrap();
         let b2 = db.flush().unwrap();
 
         assert_eq!(b1.sequence, 1);
@@ -652,21 +717,29 @@ mod tests {
         let mut db = DeltaDb::open(Config::new(schema)).unwrap();
 
         // Block 1000: alice appears for the first time
-        db.process_batch("transfers", 1000, vec![
-            HashMap::from([
+        db.process_batch(
+            "transfers",
+            1000,
+            vec![HashMap::from([
                 ("wallet".to_string(), Value::String("alice".to_string())),
                 ("amount".to_string(), Value::Float64(500.0)),
-            ]),
-        ]).unwrap();
+            ])],
+        )
+        .unwrap();
 
         let batch = db.flush().unwrap();
 
         // Verify Insert was emitted for alice's MV group
-        let mv_inserts: Vec<_> = batch.records_for("wallet_volume").iter()
+        let mv_inserts: Vec<_> = batch
+            .records_for("wallet_volume")
+            .iter()
             .filter(|r| r.operation == DeltaOperation::Insert)
             .collect();
         assert_eq!(mv_inserts.len(), 1);
-        assert_eq!(mv_inserts[0].values.get("total_volume"), Some(&Value::Float64(500.0)));
+        assert_eq!(
+            mv_inserts[0].values.get("total_volume"),
+            Some(&Value::Float64(500.0))
+        );
 
         // Rollback block 1000 — alice's only block
         db.rollback(999).unwrap();
@@ -674,10 +747,16 @@ mod tests {
         let batch = db.flush().unwrap();
 
         // The MV group for alice should be deleted since she has no data left
-        let mv_deletes: Vec<_> = batch.records_for("wallet_volume").iter()
+        let mv_deletes: Vec<_> = batch
+            .records_for("wallet_volume")
+            .iter()
             .filter(|r| r.operation == DeltaOperation::Delete)
             .collect();
-        assert_eq!(mv_deletes.len(), 1, "expected Delete delta for fully rolled-back MV group");
+        assert_eq!(
+            mv_deletes.len(),
+            1,
+            "expected Delete delta for fully rolled-back MV group"
+        );
         assert_eq!(
             mv_deletes[0].key.get("wallet"),
             Some(&Value::String("alice".to_string()))
@@ -688,28 +767,39 @@ mod tests {
     fn ingest_groups_rows_by_block_number() {
         let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA)).unwrap();
 
-        let batch = db.ingest(IngestInput {
-            data: std::collections::HashMap::from([(
-                "swaps".to_string(),
-                vec![
-                    HashMap::from([
-                        ("pool".to_string(), Value::String("ETH/USDC".into())),
-                        ("amount".to_string(), Value::Float64(100.0)),
-                        ("block_number".to_string(), Value::UInt64(1001)),
-                    ]),
-                    HashMap::from([
-                        ("pool".to_string(), Value::String("ETH/USDC".into())),
-                        ("amount".to_string(), Value::Float64(200.0)),
-                        ("block_number".to_string(), Value::UInt64(1000)),
-                    ]),
+        let batch = db
+            .ingest(IngestInput {
+                data: std::collections::HashMap::from([(
+                    "swaps".to_string(),
+                    vec![
+                        HashMap::from([
+                            ("pool".to_string(), Value::String("ETH/USDC".into())),
+                            ("amount".to_string(), Value::Float64(100.0)),
+                            ("block_number".to_string(), Value::UInt64(1001)),
+                        ]),
+                        HashMap::from([
+                            ("pool".to_string(), Value::String("ETH/USDC".into())),
+                            ("amount".to_string(), Value::Float64(200.0)),
+                            ("block_number".to_string(), Value::UInt64(1000)),
+                        ]),
+                    ],
+                )]),
+                rollback_chain: vec![
+                    BlockCursor {
+                        number: 1000,
+                        hash: "0xa".into(),
+                    },
+                    BlockCursor {
+                        number: 1001,
+                        hash: "0xb".into(),
+                    },
                 ],
-            )]),
-            rollback_chain: vec![
-                BlockCursor { number: 1000, hash: "0xa".into() },
-                BlockCursor { number: 1001, hash: "0xb".into() },
-            ],
-            finalized_head: BlockCursor { number: 999, hash: "0xf".into() },
-        }).unwrap();
+                finalized_head: BlockCursor {
+                    number: 999,
+                    hash: "0xf".into(),
+                },
+            })
+            .unwrap();
 
         let batch = batch.unwrap();
         assert_eq!(batch.record_count(), 3); // 2 raw inserts + 1 MV insert
@@ -730,11 +820,16 @@ mod tests {
                     ("block_number".to_string(), Value::UInt64(1000)),
                 ])],
             )]),
-            rollback_chain: vec![
-                BlockCursor { number: 1000, hash: "0xabc".into() },
-            ],
-            finalized_head: BlockCursor { number: 999, hash: "0xfin".into() },
-        }).unwrap();
+            rollback_chain: vec![BlockCursor {
+                number: 1000,
+                hash: "0xabc".into(),
+            }],
+            finalized_head: BlockCursor {
+                number: 999,
+                hash: "0xfin".into(),
+            },
+        })
+        .unwrap();
 
         // Cursor should have the latest block's hash
         let cursor = db.latest_cursor().unwrap();
@@ -756,7 +851,10 @@ mod tests {
                 ])],
             )]),
             rollback_chain: vec![],
-            finalized_head: BlockCursor { number: 0, hash: "0x0".into() },
+            finalized_head: BlockCursor {
+                number: 0,
+                hash: "0x0".into(),
+            },
         });
 
         assert!(result.is_err());
@@ -769,9 +867,8 @@ mod tests {
 
         // Ingest some data
         {
-            let mut db = DeltaDb::open(
-                Config::with_data_dir(schema, dir.path().to_str().unwrap()),
-            ).unwrap();
+            let mut db =
+                DeltaDb::open(Config::with_data_dir(schema, dir.path().to_str().unwrap())).unwrap();
 
             db.ingest(IngestInput {
                 data: std::collections::HashMap::from([(
@@ -782,18 +879,22 @@ mod tests {
                         ("block_number".to_string(), Value::UInt64(1000)),
                     ])],
                 )]),
-                rollback_chain: vec![
-                    BlockCursor { number: 1000, hash: "0xabc".into() },
-                ],
-                finalized_head: BlockCursor { number: 999, hash: "0xfin".into() },
-            }).unwrap();
+                rollback_chain: vec![BlockCursor {
+                    number: 1000,
+                    hash: "0xabc".into(),
+                }],
+                finalized_head: BlockCursor {
+                    number: 999,
+                    hash: "0xfin".into(),
+                },
+            })
+            .unwrap();
         }
 
         // Reopen and verify state was restored
         {
-            let db = DeltaDb::open(
-                Config::with_data_dir(schema, dir.path().to_str().unwrap()),
-            ).unwrap();
+            let db =
+                DeltaDb::open(Config::with_data_dir(schema, dir.path().to_str().unwrap())).unwrap();
 
             assert_eq!(db.latest_block(), 1000);
             assert_eq!(db.finalized_block(), 999);
@@ -825,11 +926,21 @@ mod tests {
                 ],
             )]),
             rollback_chain: vec![
-                BlockCursor { number: 100, hash: "0xa".into() },
-                BlockCursor { number: 101, hash: "0xb".into() },
+                BlockCursor {
+                    number: 100,
+                    hash: "0xa".into(),
+                },
+                BlockCursor {
+                    number: 101,
+                    hash: "0xb".into(),
+                },
             ],
-            finalized_head: BlockCursor { number: 99, hash: "0xf".into() },
-        }).unwrap();
+            finalized_head: BlockCursor {
+                number: 99,
+                hash: "0xf".into(),
+            },
+        })
+        .unwrap();
 
         // Portal says block 101 has different hash, but 100 matches
         let previous_blocks = vec![(101, "0xdifferent"), (100, "0xa")];
@@ -868,18 +979,24 @@ mod tests {
 
         let mut db = DeltaDb::open(Config::new(schema)).unwrap();
 
-        db.process_batch("transfers", 1000, vec![
-            HashMap::from([
+        db.process_batch(
+            "transfers",
+            1000,
+            vec![HashMap::from([
                 ("wallet".to_string(), Value::String("alice".to_string())),
                 ("amount".to_string(), Value::Float64(100.0)),
-            ]),
-        ]).unwrap();
-        db.process_batch("transfers", 1001, vec![
-            HashMap::from([
+            ])],
+        )
+        .unwrap();
+        db.process_batch(
+            "transfers",
+            1001,
+            vec![HashMap::from([
                 ("wallet".to_string(), Value::String("alice".to_string())),
                 ("amount".to_string(), Value::Float64(200.0)),
-            ]),
-        ]).unwrap();
+            ])],
+        )
+        .unwrap();
         db.flush();
 
         // Rollback only block 1001
@@ -887,12 +1004,17 @@ mod tests {
 
         let batch = db.flush().unwrap();
 
-        let mv_records: Vec<_> = batch.records_for("wallet_volume").iter()
-            .collect();
+        let mv_records: Vec<_> = batch.records_for("wallet_volume").iter().collect();
         assert_eq!(mv_records.len(), 1);
         assert_eq!(mv_records[0].operation, DeltaOperation::Update);
-        assert_eq!(mv_records[0].values.get("total_volume"), Some(&Value::Float64(100.0)));
-        assert_eq!(mv_records[0].values.get("tx_count"), Some(&Value::UInt64(1)));
+        assert_eq!(
+            mv_records[0].values.get("total_volume"),
+            Some(&Value::Float64(100.0))
+        );
+        assert_eq!(
+            mv_records[0].values.get("tx_count"),
+            Some(&Value::UInt64(1))
+        );
     }
 
     #[test]
@@ -904,9 +1026,11 @@ mod tests {
 
         // Phase 1: ingest blocks 1000-1002, finalize up to 1000
         {
-            let mut db = DeltaDb::open(
-                Config::with_data_dir(DEX_SCHEMA, dir.path().to_str().unwrap()),
-            ).unwrap();
+            let mut db = DeltaDb::open(Config::with_data_dir(
+                DEX_SCHEMA,
+                dir.path().to_str().unwrap(),
+            ))
+            .unwrap();
 
             db.ingest(IngestInput {
                 data: std::collections::HashMap::from([(
@@ -933,12 +1057,25 @@ mod tests {
                     ],
                 )]),
                 rollback_chain: vec![
-                    BlockCursor { number: 1000, hash: "0xa".into() },
-                    BlockCursor { number: 1001, hash: "0xb".into() },
-                    BlockCursor { number: 1002, hash: "0xc".into() },
+                    BlockCursor {
+                        number: 1000,
+                        hash: "0xa".into(),
+                    },
+                    BlockCursor {
+                        number: 1001,
+                        hash: "0xb".into(),
+                    },
+                    BlockCursor {
+                        number: 1002,
+                        hash: "0xc".into(),
+                    },
                 ],
-                finalized_head: BlockCursor { number: 1000, hash: "0xa".into() },
-            }).unwrap();
+                finalized_head: BlockCursor {
+                    number: 1000,
+                    hash: "0xa".into(),
+                },
+            })
+            .unwrap();
 
             assert_eq!(db.latest_block(), 1002);
             assert_eq!(db.finalized_block(), 1000);
@@ -947,9 +1084,11 @@ mod tests {
 
         // Phase 2: reopen and verify state was rebuilt
         {
-            let mut db = DeltaDb::open(
-                Config::with_data_dir(DEX_SCHEMA, dir.path().to_str().unwrap()),
-            ).unwrap();
+            let mut db = DeltaDb::open(Config::with_data_dir(
+                DEX_SCHEMA,
+                dir.path().to_str().unwrap(),
+            ))
+            .unwrap();
 
             assert_eq!(db.latest_block(), 1002);
             assert_eq!(db.finalized_block(), 1000);
@@ -959,24 +1098,37 @@ mod tests {
             //   qty = 10 + 5 + 3 = 18, cost = 20000 + 10500 + 6600 = 37100
             //   avg_cost = 37100/18 ≈ 2061.11
             //   pnl = 5 * (2300 - 2061.11) = 1194.44
-            db.process_batch("trades", 1003, vec![
-                make_trade("alice", "sell", 5.0, 2300.0),
-            ]).unwrap();
+            db.process_batch(
+                "trades",
+                1003,
+                vec![make_trade("alice", "sell", 5.0, 2300.0)],
+            )
+            .unwrap();
 
             let batch = db.flush().unwrap();
 
-            let mv_records: Vec<_> = batch.records_for("position_summary").iter()
-                .collect();
+            let mv_records: Vec<_> = batch.records_for("position_summary").iter().collect();
             assert_eq!(mv_records.len(), 1);
 
             // trade_count: 3 replayed + 1 new = 4
-            assert_eq!(mv_records[0].values.get("trade_count"), Some(&Value::UInt64(4)));
+            assert_eq!(
+                mv_records[0].values.get("trade_count"),
+                Some(&Value::UInt64(4))
+            );
 
             // current_position: 18 - 5 = 13
-            assert_eq!(mv_records[0].values.get("current_position"), Some(&Value::Float64(13.0)));
+            assert_eq!(
+                mv_records[0].values.get("current_position"),
+                Some(&Value::Float64(13.0))
+            );
 
             // total_pnl: 0 + 0 + 0 + 5*(2300 - 37100/18) ≈ 1194.44
-            let total_pnl = mv_records[0].values.get("total_pnl").unwrap().as_f64().unwrap();
+            let total_pnl = mv_records[0]
+                .values
+                .get("total_pnl")
+                .unwrap()
+                .as_f64()
+                .unwrap();
             assert!((total_pnl - 1194.44).abs() < 1.0);
         }
     }
@@ -1016,8 +1168,14 @@ mod tests {
             let side = row.get("side").and_then(|v| v.as_str()).unwrap_or("");
             let amount = row.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let price = row.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let qty = state.get("quantity").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let cost = state.get("cost_basis").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let qty = state
+                .get("quantity")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let cost = state
+                .get("cost_basis")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
 
             let mut emit = HashMap::new();
             if side == "buy" {
@@ -1026,11 +1184,20 @@ mod tests {
                 emit.insert("trade_pnl".into(), Value::Float64(0.0));
             } else {
                 let avg_cost = if qty > 0.0 { cost / qty } else { 0.0 };
-                emit.insert("trade_pnl".into(), Value::Float64(amount * (price - avg_cost)));
+                emit.insert(
+                    "trade_pnl".into(),
+                    Value::Float64(amount * (price - avg_cost)),
+                );
                 state.insert("quantity".into(), Value::Float64(qty - amount));
-                state.insert("cost_basis".into(), Value::Float64(cost - amount * avg_cost));
+                state.insert(
+                    "cost_basis".into(),
+                    Value::Float64(cost - amount * avg_cost),
+                );
             }
-            let new_qty = state.get("quantity").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let new_qty = state
+                .get("quantity")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
             emit.insert("position_size".into(), Value::Float64(new_qty));
             vec![emit]
         })
@@ -1046,18 +1213,27 @@ mod tests {
     fn external_reducer_full_pipeline() {
         let mut db = open_with_fn_reducer();
 
-        db.process_batch("trades", 1000, vec![
-            make_trade("alice", "buy", 10.0, 2000.0),
-        ]).unwrap();
-        db.process_batch("trades", 1001, vec![
-            make_trade("alice", "sell", 5.0, 2200.0),
-        ]).unwrap();
+        db.process_batch(
+            "trades",
+            1000,
+            vec![make_trade("alice", "buy", 10.0, 2000.0)],
+        )
+        .unwrap();
+        db.process_batch(
+            "trades",
+            1001,
+            vec![make_trade("alice", "sell", 5.0, 2200.0)],
+        )
+        .unwrap();
 
         let batch = db.flush().unwrap();
         let mv = batch.records_for("position_summary");
         assert_eq!(mv.len(), 1);
         assert_eq!(mv[0].values.get("trade_count"), Some(&Value::UInt64(2)));
-        assert_eq!(mv[0].values.get("current_position"), Some(&Value::Float64(5.0)));
+        assert_eq!(
+            mv[0].values.get("current_position"),
+            Some(&Value::Float64(5.0))
+        );
 
         let pnl = mv[0].values.get("total_pnl").unwrap().as_f64().unwrap();
         assert!((pnl - 1000.0).abs() < 0.01); // 5*(2200-2000)
@@ -1067,26 +1243,38 @@ mod tests {
     fn external_reducer_rollback() {
         let mut db = open_with_fn_reducer();
 
-        db.process_batch("trades", 1000, vec![
-            make_trade("alice", "buy", 10.0, 2000.0),
-        ]).unwrap();
-        db.process_batch("trades", 1001, vec![
-            make_trade("alice", "buy", 5.0, 2100.0),
-        ]).unwrap();
+        db.process_batch(
+            "trades",
+            1000,
+            vec![make_trade("alice", "buy", 10.0, 2000.0)],
+        )
+        .unwrap();
+        db.process_batch(
+            "trades",
+            1001,
+            vec![make_trade("alice", "buy", 5.0, 2100.0)],
+        )
+        .unwrap();
         db.flush();
 
         db.rollback(1000).unwrap();
 
         // Re-ingest different trade
-        db.process_batch("trades", 1001, vec![
-            make_trade("alice", "sell", 3.0, 2200.0),
-        ]).unwrap();
+        db.process_batch(
+            "trades",
+            1001,
+            vec![make_trade("alice", "sell", 3.0, 2200.0)],
+        )
+        .unwrap();
 
         let batch = db.flush().unwrap();
         let mv = batch.records_for("position_summary");
         assert_eq!(mv.len(), 1);
         assert_eq!(mv[0].values.get("trade_count"), Some(&Value::UInt64(2)));
-        assert_eq!(mv[0].values.get("current_position"), Some(&Value::Float64(7.0)));
+        assert_eq!(
+            mv[0].values.get("current_position"),
+            Some(&Value::Float64(7.0))
+        );
     }
 
     #[test]
@@ -1106,7 +1294,9 @@ mod tests {
         ];
 
         er_db.process_batch("trades", 1000, trades.clone()).unwrap();
-        er_db.process_batch("trades", 1001, trades2.clone()).unwrap();
+        er_db
+            .process_batch("trades", 1001, trades2.clone())
+            .unwrap();
         let er_batch = er_db.flush().unwrap();
 
         fn_db.process_batch("trades", 1000, trades).unwrap();
@@ -1119,12 +1309,17 @@ mod tests {
 
         for er_rec in er_mv.iter() {
             let key = er_rec.key.get("user").unwrap();
-            let fn_rec = fn_mv.iter().find(|r| r.key.get("user") == Some(key)).unwrap();
+            let fn_rec = fn_mv
+                .iter()
+                .find(|r| r.key.get("user") == Some(key))
+                .unwrap();
 
             let er_pnl = er_rec.values.get("total_pnl").unwrap().as_f64().unwrap();
             let fn_pnl = fn_rec.values.get("total_pnl").unwrap().as_f64().unwrap();
-            assert!((er_pnl - fn_pnl).abs() < 0.01,
-                "PnL mismatch for {key:?}: EventRules={er_pnl}, FnReducer={fn_pnl}");
+            assert!(
+                (er_pnl - fn_pnl).abs() < 0.01,
+                "PnL mismatch for {key:?}: EventRules={er_pnl}, FnReducer={fn_pnl}"
+            );
 
             assert_eq!(
                 er_rec.values.get("current_position"),
@@ -1143,14 +1338,24 @@ mod tests {
     fn external_reducer_multi_group_rollback() {
         let mut db = open_with_fn_reducer();
 
-        db.process_batch("trades", 1000, vec![
-            make_trade("alice", "buy", 10.0, 2000.0),
-            make_trade("bob", "buy", 5.0, 3000.0),
-        ]).unwrap();
-        db.process_batch("trades", 1001, vec![
-            make_trade("alice", "sell", 5.0, 2200.0),
-            make_trade("bob", "sell", 3.0, 3100.0),
-        ]).unwrap();
+        db.process_batch(
+            "trades",
+            1000,
+            vec![
+                make_trade("alice", "buy", 10.0, 2000.0),
+                make_trade("bob", "buy", 5.0, 3000.0),
+            ],
+        )
+        .unwrap();
+        db.process_batch(
+            "trades",
+            1001,
+            vec![
+                make_trade("alice", "sell", 5.0, 2200.0),
+                make_trade("bob", "sell", 3.0, 3100.0),
+            ],
+        )
+        .unwrap();
         db.flush();
 
         // Rollback block 1001
@@ -1160,12 +1365,24 @@ mod tests {
         let mv = batch.records_for("position_summary");
         assert_eq!(mv.len(), 2);
 
-        let alice = mv.iter().find(|r| r.key.get("user") == Some(&Value::String("alice".into()))).unwrap();
-        let bob = mv.iter().find(|r| r.key.get("user") == Some(&Value::String("bob".into()))).unwrap();
+        let alice = mv
+            .iter()
+            .find(|r| r.key.get("user") == Some(&Value::String("alice".into())))
+            .unwrap();
+        let bob = mv
+            .iter()
+            .find(|r| r.key.get("user") == Some(&Value::String("bob".into())))
+            .unwrap();
 
         // After rollback: only block 1000 data remains
-        assert_eq!(alice.values.get("current_position"), Some(&Value::Float64(10.0)));
-        assert_eq!(bob.values.get("current_position"), Some(&Value::Float64(5.0)));
+        assert_eq!(
+            alice.values.get("current_position"),
+            Some(&Value::Float64(10.0))
+        );
+        assert_eq!(
+            bob.values.get("current_position"),
+            Some(&Value::Float64(5.0))
+        );
         assert_eq!(alice.values.get("trade_count"), Some(&Value::UInt64(1)));
         assert_eq!(bob.values.get("trade_count"), Some(&Value::UInt64(1)));
     }
@@ -1175,14 +1392,15 @@ mod tests {
         use crate::storage::memory::MemoryBackend;
 
         let storage = Arc::new(MemoryBackend::new());
-        let mut db = DeltaDb::open(
-            Config::new(SIMPLE_SCHEMA).storage(storage.clone()),
-        ).unwrap();
+        let mut db = DeltaDb::open(Config::new(SIMPLE_SCHEMA).storage(storage.clone())).unwrap();
 
         // Process blocks 1-3
-        db.process_batch("swaps", 1, vec![make_swap("ETH", 10.0)]).unwrap();
-        db.process_batch("swaps", 2, vec![make_swap("ETH", 20.0)]).unwrap();
-        db.process_batch("swaps", 3, vec![make_swap("ETH", 30.0)]).unwrap();
+        db.process_batch("swaps", 1, vec![make_swap("ETH", 10.0)])
+            .unwrap();
+        db.process_batch("swaps", 2, vec![make_swap("ETH", 20.0)])
+            .unwrap();
+        db.process_batch("swaps", 3, vec![make_swap("ETH", 30.0)])
+            .unwrap();
         db.finalize(1).unwrap();
 
         // Rollback to block 1
@@ -1201,7 +1419,10 @@ mod tests {
 
         // Verify raw rows for blocks 2,3 are deleted
         let rows_after = storage.get_raw_rows("swaps", 2, 3).unwrap();
-        assert!(rows_after.is_empty(), "raw rows for rolled-back blocks should be deleted");
+        assert!(
+            rows_after.is_empty(),
+            "raw rows for rolled-back blocks should be deleted"
+        );
     }
 
     #[test]
@@ -1212,12 +1433,14 @@ mod tests {
 
         // Phase 1: process and finalize
         {
-            let mut db = DeltaDb::open(
-                Config::new(SIMPLE_SCHEMA).storage(storage.clone()),
-            ).unwrap();
-            db.process_batch("swaps", 1, vec![make_swap("ETH", 10.0)]).unwrap();
-            db.process_batch("swaps", 2, vec![make_swap("ETH", 20.0)]).unwrap();
-            db.process_batch("swaps", 3, vec![make_swap("ETH", 30.0)]).unwrap();
+            let mut db =
+                DeltaDb::open(Config::new(SIMPLE_SCHEMA).storage(storage.clone())).unwrap();
+            db.process_batch("swaps", 1, vec![make_swap("ETH", 10.0)])
+                .unwrap();
+            db.process_batch("swaps", 2, vec![make_swap("ETH", 20.0)])
+                .unwrap();
+            db.process_batch("swaps", 3, vec![make_swap("ETH", 30.0)])
+                .unwrap();
             db.finalize(1).unwrap();
 
             // Rollback to block 1
@@ -1227,15 +1450,15 @@ mod tests {
 
         // Phase 2: "restart" — open from same storage
         {
-            let mut db = DeltaDb::open(
-                Config::new(SIMPLE_SCHEMA).storage(storage.clone()),
-            ).unwrap();
+            let mut db =
+                DeltaDb::open(Config::new(SIMPLE_SCHEMA).storage(storage.clone())).unwrap();
 
             // latest_block should be 1 (not 3 — the ghost head)
             assert_eq!(db.latest_block(), 1);
 
             // Process block 2 with new data — should work correctly
-            db.process_batch("swaps", 2, vec![make_swap("BTC", 50.0)]).unwrap();
+            db.process_batch("swaps", 2, vec![make_swap("BTC", 50.0)])
+                .unwrap();
             let batch = db.flush().unwrap();
 
             // Should have MV update with the new data
@@ -1260,10 +1483,18 @@ mod tests {
                 ])],
             )]),
             rollback_chain: vec![],
-            finalized_head: BlockCursor { number: 0, hash: "0x0".into() },
+            finalized_head: BlockCursor {
+                number: 0,
+                hash: "0x0".into(),
+            },
         });
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("invalid block_number type"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid block_number type")
+        );
     }
 
     #[test]
@@ -1281,9 +1512,17 @@ mod tests {
                 ])],
             )]),
             rollback_chain: vec![],
-            finalized_head: BlockCursor { number: 0, hash: "0x0".into() },
+            finalized_head: BlockCursor {
+                number: 0,
+                hash: "0x0".into(),
+            },
         });
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("invalid block_number type"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid block_number type")
+        );
     }
 }

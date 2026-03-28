@@ -68,30 +68,38 @@ impl DeltaBuffer {
             return None;
         }
 
-        // Merge records by hash(table, key) in a single pass.
-        // Uses hash-only index (no table string clone). Collision probability
-        // for N records with 64-bit hash is ~N²/2^65, negligible in practice.
-        let mut index: HashMap<u64, usize> =
-            HashMap::with_capacity(self.pending.len());
+        // Merge records by (table, key) identity in a single pass.
+        // Hash is used for fast lookup; key equality is verified to prevent collisions.
+        // Vec<usize> handles the rare case of 3+ records with the same hash but different keys.
+        let mut index: HashMap<u64, Vec<usize>> = HashMap::with_capacity(self.pending.len());
         let mut merged: Vec<DeltaRecord> = Vec::with_capacity(self.pending.len());
 
         for record in self.pending.drain(..) {
             let key_hash = hash_delta_key(&record.table, &record.key);
 
-            if let Some(&idx) = index.get(&key_hash) {
-                // In-place merge: mutate existing record, move fields from incoming.
-                // Avoids cloning table, key, values, and prev_values HashMaps.
+            let match_idx = index.get(&key_hash).and_then(|bucket| {
+                bucket
+                    .iter()
+                    .copied()
+                    .find(|&idx| merged[idx].table == record.table && merged[idx].key == record.key)
+            });
+
+            if let Some(idx) = match_idx {
                 if !merge_in_place(&mut merged[idx], record) {
-                    // Records cancel out — mark as cancelled and remove from index
-                    // so that a subsequent Insert for the same key is treated as fresh.
+                    // Records cancel out — mark as cancelled and remove from bucket
                     merged[idx].operation = DeltaOperation::Delete;
                     merged[idx].prev_values = None;
                     merged[idx].values.clear();
-                    index.remove(&key_hash);
+                    if let Some(bucket) = index.get_mut(&key_hash) {
+                        bucket.retain(|&i| i != idx);
+                        if bucket.is_empty() {
+                            index.remove(&key_hash);
+                        }
+                    }
                 }
             } else {
                 let idx = merged.len();
-                index.insert(key_hash, idx);
+                index.entry(key_hash).or_default().push(idx);
                 merged.push(record);
             }
         }
@@ -184,13 +192,13 @@ fn hash_delta_key(table: &str, key: &HashMap<String, Value>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     table.hash(&mut hasher);
-    // Commutative hash: wrapping_add of per-field hashes (order-independent, no allocation)
+    // Order-independent hash: XOR + rotate to avoid commutative collisions
     let mut combined: u64 = 0;
     for (k, v) in key {
         let mut field_hasher = std::collections::hash_map::DefaultHasher::new();
         k.hash(&mut field_hasher);
         v.hash(&mut field_hasher);
-        combined = combined.wrapping_add(field_hasher.finish());
+        combined ^= field_hasher.finish().rotate_left(5);
     }
     hasher.write_u64(combined);
     hasher.finish()
@@ -217,7 +225,10 @@ mod tests {
             operation: DeltaOperation::Update,
             key: HashMap::from([("id".to_string(), Value::String(key_val.to_string()))]),
             values: HashMap::from([("data".to_string(), Value::String(data.to_string()))]),
-            prev_values: Some(HashMap::from([("data".to_string(), Value::String(prev.to_string()))])),
+            prev_values: Some(HashMap::from([(
+                "data".to_string(),
+                Value::String(prev.to_string()),
+            )])),
         }
     }
 
@@ -227,7 +238,10 @@ mod tests {
             operation: DeltaOperation::Delete,
             key: HashMap::from([("id".to_string(), Value::String(key_val.to_string()))]),
             values: HashMap::new(),
-            prev_values: Some(HashMap::from([("data".to_string(), Value::String("old".to_string()))])),
+            prev_values: Some(HashMap::from([(
+                "data".to_string(),
+                Value::String("old".to_string()),
+            )])),
         }
     }
 
@@ -241,7 +255,10 @@ mod tests {
         if n == 0 {
             None
         } else {
-            Some(BlockCursor { number: n, hash: format!("0x{n:x}") })
+            Some(BlockCursor {
+                number: n,
+                hash: format!("0x{n:x}"),
+            })
         }
     }
 
@@ -277,7 +294,11 @@ mod tests {
     fn merge_insert_then_update() {
         let mut buffer = DeltaBuffer::new(100);
         buffer.push(vec![make_insert("t", "1", "a")], cursor(0), cursor(1000));
-        buffer.push(vec![make_update("t", "1", "b", "a")], cursor(0), cursor(1001));
+        buffer.push(
+            vec![make_update("t", "1", "b", "a")],
+            cursor(0),
+            cursor(1001),
+        );
 
         let batch = buffer.flush().unwrap();
         let records = batch.records_for("t");
@@ -301,7 +322,10 @@ mod tests {
                 operation: DeltaOperation::Delete,
                 key: HashMap::from([("id".to_string(), Value::String("1".to_string()))]),
                 values: HashMap::new(),
-                prev_values: Some(HashMap::from([("data".to_string(), Value::String("a".to_string()))])),
+                prev_values: Some(HashMap::from([(
+                    "data".to_string(),
+                    Value::String("a".to_string()),
+                )])),
             }],
             cursor(0),
             cursor(1001),
@@ -315,14 +339,25 @@ mod tests {
     #[test]
     fn merge_update_then_update() {
         let mut buffer = DeltaBuffer::new(100);
-        buffer.push(vec![make_update("t", "1", "b", "a")], cursor(0), cursor(1000));
-        buffer.push(vec![make_update("t", "1", "c", "b")], cursor(0), cursor(1001));
+        buffer.push(
+            vec![make_update("t", "1", "b", "a")],
+            cursor(0),
+            cursor(1000),
+        );
+        buffer.push(
+            vec![make_update("t", "1", "c", "b")],
+            cursor(0),
+            cursor(1001),
+        );
 
         let batch = buffer.flush().unwrap();
         let records = batch.records_for("t");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].operation, DeltaOperation::Update);
-        assert_eq!(records[0].values.get("data"), Some(&Value::String("c".into())));
+        assert_eq!(
+            records[0].values.get("data"),
+            Some(&Value::String("c".into()))
+        );
         // prev_values should be from the first update
         assert_eq!(
             records[0].prev_values.as_ref().unwrap().get("data"),
@@ -341,7 +376,10 @@ mod tests {
         assert_eq!(records.len(), 1);
         // Delete then Insert = Update
         assert_eq!(records[0].operation, DeltaOperation::Update);
-        assert_eq!(records[0].values.get("data"), Some(&Value::String("new".into())));
+        assert_eq!(
+            records[0].values.get("data"),
+            Some(&Value::String("new".into()))
+        );
     }
 
     /// Issue #1: Delete→Insert merge must preserve the original prev_values from the Delete,
@@ -358,11 +396,20 @@ mod tests {
         let records = batch.records_for("t");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].operation, DeltaOperation::Update);
-        assert_eq!(records[0].values.get("data"), Some(&Value::String("new".into())));
+        assert_eq!(
+            records[0].values.get("data"),
+            Some(&Value::String("new".into()))
+        );
         // prev_values must be the original deleted row's data, NOT empty
-        let prev = records[0].prev_values.as_ref().expect("prev_values must be Some");
-        assert_eq!(prev.get("data"), Some(&Value::String("old".into())),
-            "prev_values should contain the original deleted row data, not an empty map");
+        let prev = records[0]
+            .prev_values
+            .as_ref()
+            .expect("prev_values must be Some");
+        assert_eq!(
+            prev.get("data"),
+            Some(&Value::String("old".into())),
+            "prev_values should contain the original deleted row data, not an empty map"
+        );
     }
 
     /// Issue #2: Insert→Delete→Insert for the same key should produce a net Insert,
@@ -371,13 +418,20 @@ mod tests {
     fn insert_delete_insert_produces_insert_not_update() {
         let mut buffer = DeltaBuffer::new(100);
         buffer.push(vec![make_insert("t", "1", "a")], cursor(0), cursor(1000));
-        buffer.push(vec![DeltaRecord {
-            table: "t".to_string(),
-            operation: DeltaOperation::Delete,
-            key: HashMap::from([("id".to_string(), Value::String("1".to_string()))]),
-            values: HashMap::new(),
-            prev_values: Some(HashMap::from([("data".to_string(), Value::String("a".to_string()))])),
-        }], cursor(0), cursor(1001));
+        buffer.push(
+            vec![DeltaRecord {
+                table: "t".to_string(),
+                operation: DeltaOperation::Delete,
+                key: HashMap::from([("id".to_string(), Value::String("1".to_string()))]),
+                values: HashMap::new(),
+                prev_values: Some(HashMap::from([(
+                    "data".to_string(),
+                    Value::String("a".to_string()),
+                )])),
+            }],
+            cursor(0),
+            cursor(1001),
+        );
         // Re-insert same key with new data
         buffer.push(vec![make_insert("t", "1", "b")], cursor(0), cursor(1002));
 
@@ -385,11 +439,46 @@ mod tests {
         let records = batch.records_for("t");
         assert_eq!(records.len(), 1);
         // The row never existed before this batch, so net effect should be Insert
-        assert_eq!(records[0].operation, DeltaOperation::Insert,
-            "Insert→Delete→Insert should produce a net Insert, not Update");
-        assert_eq!(records[0].values.get("data"), Some(&Value::String("b".into())));
-        assert!(records[0].prev_values.is_none(),
-            "A net Insert should have no prev_values");
+        assert_eq!(
+            records[0].operation,
+            DeltaOperation::Insert,
+            "Insert→Delete→Insert should produce a net Insert, not Update"
+        );
+        assert_eq!(
+            records[0].values.get("data"),
+            Some(&Value::String("b".into()))
+        );
+        assert!(
+            records[0].prev_values.is_none(),
+            "A net Insert should have no prev_values"
+        );
+    }
+
+    /// Three records for the same key must all merge correctly (A+B+C).
+    /// Tests the Vec<usize> bucket handles repeated same-key merges.
+    #[test]
+    fn three_way_merge_same_key() {
+        let mut buffer = DeltaBuffer::new(100);
+        buffer.push(vec![make_insert("t", "1", "a")], cursor(0), cursor(1000));
+        buffer.push(
+            vec![make_update("t", "1", "b", "a")],
+            cursor(0),
+            cursor(1001),
+        );
+        buffer.push(
+            vec![make_update("t", "1", "c", "b")],
+            cursor(0),
+            cursor(1002),
+        );
+
+        let batch = buffer.flush().unwrap();
+        let records = batch.records_for("t");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].operation, DeltaOperation::Insert);
+        assert_eq!(
+            records[0].values.get("data"),
+            Some(&Value::String("c".into()))
+        );
     }
 
     #[test]
@@ -425,7 +514,11 @@ mod tests {
         let mut buffer = DeltaBuffer::new(2);
         assert!(!buffer.is_full());
 
-        buffer.push(vec![make_insert("t", "1", "a"), make_insert("t", "2", "b")], cursor(0), cursor(1000));
+        buffer.push(
+            vec![make_insert("t", "1", "a"), make_insert("t", "2", "b")],
+            cursor(0),
+            cursor(1000),
+        );
         assert!(buffer.is_full());
 
         buffer.flush();
