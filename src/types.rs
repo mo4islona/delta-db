@@ -141,8 +141,23 @@ impl Row {
 
 impl PartialEq for Row {
     fn eq(&self, other: &Self) -> bool {
-        // Compare the non-null entries as maps
-        self.to_map() == other.to_map()
+        if Arc::ptr_eq(&self.registry, &other.registry) {
+            // Same registry: direct value comparison
+            return self.values == other.values;
+        }
+        // Different registries: compare non-null fields by name
+        let self_count = self.values.iter().filter(|v| !v.is_null()).count();
+        let other_count = other.values.iter().filter(|v| !v.is_null()).count();
+        if self_count != other_count {
+            return false;
+        }
+        for (name, val) in self.iter() {
+            match other.get(name) {
+                Some(other_val) if val == other_val => {}
+                _ => return false,
+            }
+        }
+        true
     }
 }
 
@@ -281,6 +296,22 @@ impl Value {
 
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
+    }
+
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Value::UInt64(_) => "UInt64",
+            Value::Int64(_) => "Int64",
+            Value::Float64(_) => "Float64",
+            Value::String(_) => "String",
+            Value::DateTime(_) => "DateTime",
+            Value::Boolean(_) => "Boolean",
+            Value::Null => "Null",
+            Value::Bytes(_) => "Bytes",
+            Value::Uint256(_) => "Uint256",
+            Value::Base58(_) => "Base58",
+            Value::JSON(_) => "JSON",
+        }
     }
 
     pub fn is_truthy(&self) -> bool {
