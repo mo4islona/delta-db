@@ -73,6 +73,11 @@ impl StorageBackend for MemoryBackend {
     }
 
     fn delete_raw_rows_after(&self, table: &str, after_block: BlockNumber) -> Result<()> {
+        // Guard: after_block + 1 would overflow u64::MAX to 0, scanning the entire map.
+        // MAX is a valid no-op: nothing can exist after the maximum block.
+        if after_block == BlockNumber::MAX {
+            return Ok(());
+        }
         let mut inner = self.inner.lock().unwrap();
         let keys_to_remove: Vec<_> = inner
             .raw
@@ -91,6 +96,11 @@ impl StorageBackend for MemoryBackend {
         table: &str,
         after_block: BlockNumber,
     ) -> Result<Vec<(BlockNumber, Vec<u8>)>> {
+        // Guard: after_block + 1 would overflow u64::MAX to 0, scanning the entire map.
+        // MAX is a valid no-op: nothing can exist after the maximum block.
+        if after_block == BlockNumber::MAX {
+            return Ok(Vec::new());
+        }
         let mut inner = self.inner.lock().unwrap();
         let keys_to_remove: Vec<_> = inner
             .raw
@@ -155,6 +165,11 @@ impl StorageBackend for MemoryBackend {
         group_key: &[u8],
         after_block: BlockNumber,
     ) -> Result<()> {
+        // Guard: after_block + 1 would overflow u64::MAX to 0, scanning the entire map.
+        // MAX is a valid no-op: nothing can exist after the maximum block.
+        if after_block == BlockNumber::MAX {
+            return Ok(());
+        }
         let mut inner = self.inner.lock().unwrap();
         let start = (reducer.to_string(), group_key.to_vec(), after_block + 1);
         let keys_to_remove: Vec<_> = inner
@@ -553,6 +568,61 @@ mod tests {
 
         let keys = backend.list_reducer_group_keys("other").unwrap();
         assert!(keys.is_empty());
+    }
+
+    /// Issue #6: delete_raw_rows_after with u64::MAX must not overflow and delete everything.
+    #[test]
+    fn delete_raw_rows_after_u64_max_is_noop() {
+        let backend = MemoryBackend::new();
+        let reg = Arc::new(ColumnRegistry::new(vec!["b".to_string()]));
+        for block in 100..105 {
+            let mut row = Row::new(reg.clone());
+            row.set("b", Value::UInt64(block));
+            backend.put_raw_rows("t", block, &encode_rows(&[row])).unwrap();
+        }
+
+        // u64::MAX means "nothing is after this block", should be a no-op
+        backend.delete_raw_rows_after("t", BlockNumber::MAX).unwrap();
+
+        let result = backend.get_raw_rows("t", 100, 110).unwrap();
+        assert_eq!(result.len(), 5, "All rows should be preserved");
+    }
+
+    /// Issue #6: take_raw_rows_after with u64::MAX must not overflow and take everything.
+    #[test]
+    fn take_raw_rows_after_u64_max_is_noop() {
+        let backend = MemoryBackend::new();
+        let reg = Arc::new(ColumnRegistry::new(vec!["b".to_string()]));
+        for block in 100..105 {
+            let mut row = Row::new(reg.clone());
+            row.set("b", Value::UInt64(block));
+            backend.put_raw_rows("t", block, &encode_rows(&[row])).unwrap();
+        }
+
+        let taken = backend.take_raw_rows_after("t", BlockNumber::MAX).unwrap();
+        assert!(taken.is_empty(), "Nothing should be taken");
+
+        let result = backend.get_raw_rows("t", 100, 110).unwrap();
+        assert_eq!(result.len(), 5, "All rows should be preserved");
+    }
+
+    /// Issue #6: delete_reducer_states_after with u64::MAX must not overflow.
+    #[test]
+    fn delete_reducer_states_after_u64_max_is_noop() {
+        let backend = MemoryBackend::new();
+        let gk = encode_group_key(&[Value::String("alice".into())]);
+
+        for block in 1000..1005 {
+            let state = encode_state(&[("qty".to_string(), Value::Float64(block as f64))].into());
+            backend.put_reducer_state("r", &gk, block, &state).unwrap();
+        }
+
+        backend.delete_reducer_states_after("r", &gk, BlockNumber::MAX).unwrap();
+
+        for block in 1000..1005 {
+            assert!(backend.get_reducer_state("r", &gk, block).unwrap().is_some(),
+                "Block {block} state should be preserved");
+        }
     }
 
     #[test]

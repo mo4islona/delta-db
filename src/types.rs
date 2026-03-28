@@ -65,7 +65,9 @@ impl Row {
 
     /// Create a Row from a pre-built values vector (must match registry length).
     pub fn from_values(registry: Arc<ColumnRegistry>, values: Vec<Value>) -> Self {
-        debug_assert_eq!(values.len(), registry.len());
+        assert_eq!(values.len(), registry.len(),
+            "Row::from_values: values length {} != registry length {}",
+            values.len(), registry.len());
         Self { registry, values }
     }
 
@@ -124,6 +126,15 @@ impl Row {
             .iter()
             .zip(self.values.iter())
             .filter(|(_, v)| !v.is_null())
+            .map(|(n, v)| (n.as_str(), v))
+    }
+
+    /// Iterate over all (name, value) pairs, including Nulls.
+    pub fn iter_all(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.registry
+            .names
+            .iter()
+            .zip(self.values.iter())
             .map(|(n, v)| (n.as_str(), v))
     }
 }

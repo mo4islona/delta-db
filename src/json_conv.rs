@@ -14,6 +14,8 @@ pub fn json_to_value(v: &serde_json::Value) -> Value {
                 } else {
                     Value::Int64(i)
                 }
+            } else if let Some(u) = n.as_u64() {
+                Value::UInt64(u)
             } else if let Some(f) = n.as_f64() {
                 Value::Float64(f)
             } else {
@@ -86,6 +88,21 @@ mod tests {
         assert_eq!(json_to_value(&serde_json::json!(42)), Value::UInt64(42));
         assert_eq!(json_to_value(&serde_json::json!(-5)), Value::Int64(-5));
         assert_eq!(json_to_value(&serde_json::json!(0)), Value::UInt64(0));
+    }
+
+    /// Issue #9: u64 values > i64::MAX must not be demoted to lossy f64 or Null.
+    #[test]
+    fn json_large_u64_to_value() {
+        let large: u64 = u64::MAX; // 18446744073709551615
+        let json = serde_json::json!(large);
+        let val = json_to_value(&json);
+        assert_eq!(val, Value::UInt64(large));
+
+        // Also test a value just above i64::MAX
+        let above_i64: u64 = (i64::MAX as u64) + 1;
+        let json = serde_json::json!(above_i64);
+        let val = json_to_value(&json);
+        assert_eq!(val, Value::UInt64(above_i64));
     }
 
     #[test]

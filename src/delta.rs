@@ -82,10 +82,12 @@ impl DeltaBuffer {
                 // In-place merge: mutate existing record, move fields from incoming.
                 // Avoids cloning table, key, values, and prev_values HashMaps.
                 if !merge_in_place(&mut merged[idx], record) {
-                    // Records cancel out — mark as cancelled
+                    // Records cancel out — mark as cancelled and remove from index
+                    // so that a subsequent Insert for the same key is treated as fresh.
                     merged[idx].operation = DeltaOperation::Delete;
                     merged[idx].prev_values = None;
                     merged[idx].values.clear();
+                    index.remove(&key_hash);
                 }
             } else {
                 let idx = merged.len();
@@ -156,9 +158,8 @@ fn merge_in_place(existing: &mut DeltaRecord, incoming: DeltaRecord) -> bool {
             true
         }
 
-        // Delete then Insert: net Update (prev = old delete values)
+        // Delete then Insert: net Update (prev_values already set from the Delete)
         (DeltaOperation::Delete, DeltaOperation::Insert) => {
-            existing.prev_values = Some(std::mem::take(&mut existing.values));
             existing.operation = DeltaOperation::Update;
             existing.values = incoming.values;
             true
@@ -341,6 +342,54 @@ mod tests {
         // Delete then Insert = Update
         assert_eq!(records[0].operation, DeltaOperation::Update);
         assert_eq!(records[0].values.get("data"), Some(&Value::String("new".into())));
+    }
+
+    /// Issue #1: Delete→Insert merge must preserve the original prev_values from the Delete,
+    /// not overwrite them with the Delete's empty `values` map.
+    #[test]
+    fn delete_insert_merge_preserves_prev_values() {
+        let mut buffer = DeltaBuffer::new(100);
+        // Delete record has prev_values = {"data": "old"} and values = {}
+        buffer.push(vec![make_delete("t", "1")], cursor(0), cursor(1000));
+        // Insert record brings new values
+        buffer.push(vec![make_insert("t", "1", "new")], cursor(0), cursor(1001));
+
+        let batch = buffer.flush().unwrap();
+        let records = batch.records_for("t");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].operation, DeltaOperation::Update);
+        assert_eq!(records[0].values.get("data"), Some(&Value::String("new".into())));
+        // prev_values must be the original deleted row's data, NOT empty
+        let prev = records[0].prev_values.as_ref().expect("prev_values must be Some");
+        assert_eq!(prev.get("data"), Some(&Value::String("old".into())),
+            "prev_values should contain the original deleted row data, not an empty map");
+    }
+
+    /// Issue #2: Insert→Delete→Insert for the same key should produce a net Insert,
+    /// not an Update (the row never existed before this batch).
+    #[test]
+    fn insert_delete_insert_produces_insert_not_update() {
+        let mut buffer = DeltaBuffer::new(100);
+        buffer.push(vec![make_insert("t", "1", "a")], cursor(0), cursor(1000));
+        buffer.push(vec![DeltaRecord {
+            table: "t".to_string(),
+            operation: DeltaOperation::Delete,
+            key: HashMap::from([("id".to_string(), Value::String("1".to_string()))]),
+            values: HashMap::new(),
+            prev_values: Some(HashMap::from([("data".to_string(), Value::String("a".to_string()))])),
+        }], cursor(0), cursor(1001));
+        // Re-insert same key with new data
+        buffer.push(vec![make_insert("t", "1", "b")], cursor(0), cursor(1002));
+
+        let batch = buffer.flush().unwrap();
+        let records = batch.records_for("t");
+        assert_eq!(records.len(), 1);
+        // The row never existed before this batch, so net effect should be Insert
+        assert_eq!(records[0].operation, DeltaOperation::Insert,
+            "Insert→Delete→Insert should produce a net Insert, not Update");
+        assert_eq!(records[0].values.get("data"), Some(&Value::String("b".into())));
+        assert!(records[0].prev_values.is_none(),
+            "A net Insert should have no prev_values");
     }
 
     #[test]

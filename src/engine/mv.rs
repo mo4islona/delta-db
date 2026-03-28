@@ -283,6 +283,11 @@ impl MVEngine {
     /// Roll back all blocks after fork_point.
     /// Returns compensating delta records.
     pub fn rollback(&mut self, fork_point: BlockNumber) -> Vec<DeltaRecord> {
+        // Guard: fork_point + 1 would overflow u64::MAX to 0, causing split_off(&0)
+        // to remove the entire map. MAX is a valid no-op: nothing exists after it.
+        if fork_point == BlockNumber::MAX {
+            return Vec::new();
+        }
         // Use BTreeMap range to efficiently find blocks > fork_point
         let rolled_back = self.block_groups.split_off(&(fork_point + 1));
 
