@@ -214,10 +214,9 @@ impl StorageBackend for RocksDbBackend {
         let ub = upper_bound(&prefix);
 
         let mut opts = ReadOptions::default();
-        opts.set_iterate_upper_bound(ub);
+        opts.set_iterate_upper_bound(ub.clone());
 
         let mut result = Vec::new();
-        let mut keys_to_delete = Vec::new();
 
         let iter =
             self.db
@@ -226,14 +225,11 @@ impl StorageBackend for RocksDbBackend {
             let (k, v) = item.map_err(to_err)?;
             let block = BlockNumber::from_be_bytes(k[prefix.len()..].try_into().unwrap());
             result.push((block, v.to_vec()));
-            keys_to_delete.push(k);
         }
 
-        if !keys_to_delete.is_empty() {
+        if !result.is_empty() {
             let mut batch = WriteBatch::default();
-            for k in &keys_to_delete {
-                batch.delete_cf(cf, k);
-            }
+            batch.delete_range_cf(cf, &start, &ub);
             self.db.write(batch).map_err(to_err)?;
         }
         Ok(result)

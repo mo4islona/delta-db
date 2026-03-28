@@ -239,20 +239,19 @@ impl MVEngine {
         for row in rows {
             let group_key = self.compute_group_key(row);
 
-            // Snapshot prev output before first mutation of this group in this call
-            if !touched_keys.contains(&group_key) {
+            // Snapshot prev output before first mutation of this group in this call.
+            // `insert` returns true if newly inserted, combining contains + insert in one lookup.
+            if touched_keys.insert(group_key.clone()) {
                 let prev = self.compute_output(&group_key);
                 if let Some(prev) = prev {
                     self.prev_output.insert(group_key.clone(), prev);
                 }
-                touched_keys.insert(group_key.clone());
             }
 
-            // Ensure group exists
-            if !self.groups.contains_key(&group_key) {
-                self.groups.insert(group_key.clone(), self.create_agg_vec());
-            }
-            let aggs = self.groups.get_mut(&group_key).unwrap();
+            // Ensure group exists using entry API (avoids separate contains + get_mut lookups).
+            // create_agg_vec() is always called eagerly; this is cheap after #28 optimization.
+            let new_aggs = self.create_agg_vec();
+            let aggs = self.groups.entry(group_key.clone()).or_insert(new_aggs);
 
             // Feed values to each aggregation using pre-computed agg info
             for feed in &self.agg_feeds {
@@ -552,26 +551,7 @@ impl MVEngine {
     }
 
     fn create_agg_vec(&self) -> Vec<Box<dyn AggregationFunc>> {
-        let mut aggs = Vec::with_capacity(self.agg_count);
-        for col in &self.output_columns {
-            if let OutputColumn::Agg { .. } = col {
-                let agg_func = &self.def.select.iter().find_map(|item| {
-                    if let SelectExpr::Agg(func, _) = &item.expr {
-                        let name = resolve_output_name(item);
-                        let matching = self.output_columns.iter().any(|c| {
-                            matches!(c, OutputColumn::Agg { output_name, agg_index, .. }
-                                     if *output_name == name && *agg_index == aggs.len())
-                        });
-                        if matching {
-                            return Some(func.clone());
-                        }
-                    }
-                    None
-                }).expect("agg func must exist");
-                aggs.push(create_agg(agg_func));
-            }
-        }
-        aggs
+        self.agg_funcs.iter().map(create_agg).collect()
     }
 }
 

@@ -227,7 +227,7 @@ impl ReducerEngine {
             let state = self.state_cache.get_mut(&group_key_bytes).unwrap();
 
             // Call the runtime
-            let emits = self.runtime.process(state, row);
+            let emits = self.runtime.process(state, row)?;
 
             // Track touched key for deferred snapshot
             touched_keys.insert(group_key_bytes);

@@ -79,15 +79,23 @@ impl DeltaBuffer {
             let key_hash = hash_delta_key(&record.table, &record.key);
 
             if let Some(&idx) = index.get(&key_hash) {
-                // In-place merge: mutate existing record, move fields from incoming.
-                // Avoids cloning table, key, values, and prev_values HashMaps.
-                if !merge_in_place(&mut merged[idx], record) {
-                    // Records cancel out — mark as cancelled and remove from index
-                    // so that a subsequent Insert for the same key is treated as fresh.
-                    merged[idx].operation = DeltaOperation::Delete;
-                    merged[idx].prev_values = None;
-                    merged[idx].values.clear();
-                    index.remove(&key_hash);
+                // Confirm key equality to guard against hash collisions
+                if merged[idx].table == record.table && merged[idx].key == record.key {
+                    // In-place merge: mutate existing record, move fields from incoming.
+                    // Avoids cloning table, key, values, and prev_values HashMaps.
+                    if !merge_in_place(&mut merged[idx], record) {
+                        // Records cancel out — mark as cancelled and remove from index
+                        // so that a subsequent Insert for the same key is treated as fresh.
+                        merged[idx].operation = DeltaOperation::Delete;
+                        merged[idx].prev_values = None;
+                        merged[idx].values.clear();
+                        index.remove(&key_hash);
+                    }
+                } else {
+                    // Hash collision with a different key — treat as a new record.
+                    let new_idx = merged.len();
+                    index.insert(key_hash, new_idx);
+                    merged.push(record);
                 }
             } else {
                 let idx = merged.len();
@@ -184,13 +192,17 @@ fn hash_delta_key(table: &str, key: &HashMap<String, Value>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     table.hash(&mut hasher);
-    // Commutative hash: wrapping_add of per-field hashes (order-independent, no allocation)
+    // Commutative hash: XOR of per-field hashes with Fibonacci multiplicative mixing.
+    // XOR is commutative so iteration order of the HashMap doesn't matter.
+    // Multiplying by the Fibonacci constant before XOR reduces collision clustering
+    // vs plain wrapping_add, without introducing order dependency.
     let mut combined: u64 = 0;
     for (k, v) in key {
         let mut field_hasher = std::collections::hash_map::DefaultHasher::new();
         k.hash(&mut field_hasher);
         v.hash(&mut field_hasher);
-        combined = combined.wrapping_add(field_hasher.finish());
+        let field_hash = field_hasher.finish();
+        combined ^= field_hash.wrapping_mul(0x9e3779b97f4a7c15);
     }
     hasher.write_u64(combined);
     hasher.finish()

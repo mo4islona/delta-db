@@ -33,6 +33,8 @@ pub struct LuaRuntime {
     /// Used to filter row.iter() — only matching fields are marshalled to Lua.
     /// Empty = no filtering (all non-null fields are set).
     accessed_fields: HashSet<String>,
+    /// Opt-out of Sync: the Lua VM must not be accessed concurrently.
+    _not_sync: std::marker::PhantomData<*mut ()>,
 }
 
 // Safety: Each LuaRuntime is owned by exactly one ReducerEngine.
@@ -41,7 +43,6 @@ pub struct LuaRuntime {
 // The Lua VM is a self-contained C state that is safe to move between
 // threads as long as it is not accessed concurrently.
 unsafe impl Send for LuaRuntime {}
-unsafe impl Sync for LuaRuntime {}
 
 impl LuaRuntime {
     /// Create a new LuaRuntime without state field or source column optimization.
@@ -187,12 +188,13 @@ impl LuaRuntime {
             state_fields: state_fields.to_vec(),
             state_types: state_types.iter().cloned().collect(),
             accessed_fields,
+            _not_sync: std::marker::PhantomData,
         }
     }
 }
 
 impl ReducerRuntime for LuaRuntime {
-    fn process(&self, state: &mut HashMap<String, Value>, row: &Row) -> Vec<RowMap> {
+    fn process(&self, state: &mut HashMap<String, Value>, row: &Row) -> crate::error::Result<Vec<RowMap>> {
         // Update persistent row table in-place (no table allocation).
         // Only fields the script actually references are marshalled.
         let row_table: mlua::Table = self
@@ -242,7 +244,9 @@ impl ReducerRuntime for LuaRuntime {
             }
 
             let (multi_count, emits_array, emit_table): (i64, mlua::Table, mlua::Table) =
-                call.call(()).expect("Lua script execution failed");
+                call.call(()).map_err(|e| {
+                    crate::error::Error::Reducer(format!("Lua script execution failed: {e}"))
+                })?;
 
             for (k, v) in state.iter_mut() {
                 let lua_val: LuaValue = state_table
@@ -251,7 +255,7 @@ impl ReducerRuntime for LuaRuntime {
                 *v = lua_to_value_typed(&lua_val, self.state_types.get(k));
             }
 
-            collect_emits(multi_count, &emits_array, &emit_table)
+            Ok(collect_emits(multi_count, &emits_array, &emit_table))
         } else {
             // Specialized path: state passed as positional args, returned as extra values.
             // Build args: state values in field order
@@ -261,7 +265,9 @@ impl ReducerRuntime for LuaRuntime {
                 args.push_back(value_to_lua(&self.lua, v).unwrap());
             }
 
-            let result: MultiValue = call.call(args).expect("Lua script execution failed");
+            let result: MultiValue = call.call(args).map_err(|e| {
+                crate::error::Error::Reducer(format!("Lua script execution failed: {e}"))
+            })?;
 
             // Unpack: first 3 values are (multi_count, emits, emit), rest are state values
             let mut iter = result.into_vec().into_iter();
@@ -272,11 +278,15 @@ impl ReducerRuntime for LuaRuntime {
             };
             let emits_array = match iter.next() {
                 Some(LuaValue::Table(t)) => t,
-                _ => panic!("expected _emits table"),
+                _ => return Err(crate::error::Error::Reducer(
+                    "expected _emits table from Lua wrapper".into(),
+                )),
             };
             let emit_table = match iter.next() {
                 Some(LuaValue::Table(t)) => t,
-                _ => panic!("expected emit table"),
+                _ => return Err(crate::error::Error::Reducer(
+                    "expected emit table from Lua wrapper".into(),
+                )),
             };
 
             // Read back state values from remaining return values
@@ -288,7 +298,7 @@ impl ReducerRuntime for LuaRuntime {
                 }
             }
 
-            collect_emits(multi_count, &emits_array, &emit_table)
+            Ok(collect_emits(multi_count, &emits_array, &emit_table))
         }
     }
 }
@@ -621,14 +631,14 @@ mod tests {
         let row = Row::from(RowMap::new());
 
         let out1 = runtime
-            .process(&mut state, &row)
+            .process(&mut state, &row).unwrap()
             .into_iter()
             .next()
             .unwrap();
         assert_eq!(out1.get("total"), Some(&Value::Float64(1.0)));
 
         let out2 = runtime
-            .process(&mut state, &row)
+            .process(&mut state, &row).unwrap()
             .into_iter()
             .next()
             .unwrap();
@@ -647,7 +657,7 @@ mod tests {
         let row = Row::from(HashMap::from([("amount".to_string(), Value::Float64(5.0))]));
 
         let out = runtime
-            .process(&mut state, &row)
+            .process(&mut state, &row).unwrap()
             .into_iter()
             .next()
             .unwrap();
@@ -681,6 +691,7 @@ mod tests {
         // BUY 10 @ 2000
         let out1 = runtime
             .process(&mut state, &make_trade("buy", 10.0, 2000.0))
+            .unwrap()
             .into_iter()
             .next()
             .unwrap();
@@ -690,6 +701,7 @@ mod tests {
         // BUY 5 @ 2100
         let out2 = runtime
             .process(&mut state, &make_trade("buy", 5.0, 2100.0))
+            .unwrap()
             .into_iter()
             .next()
             .unwrap();
@@ -698,6 +710,7 @@ mod tests {
         // SELL 8 @ 2200
         let out3 = runtime
             .process(&mut state, &make_trade("sell", 8.0, 2200.0))
+            .unwrap()
             .into_iter()
             .next()
             .unwrap();
@@ -744,6 +757,7 @@ mod tests {
         // BUY 10 @ 100
         let out1 = runtime
             .process(&mut state, &make_trade("buy", 10.0, 100.0))
+            .unwrap()
             .into_iter()
             .next()
             .unwrap();
@@ -753,6 +767,7 @@ mod tests {
         // BUY 5 @ 200
         let out2 = runtime
             .process(&mut state, &make_trade("buy", 5.0, 200.0))
+            .unwrap()
             .into_iter()
             .next()
             .unwrap();
@@ -761,6 +776,7 @@ mod tests {
         // SELL 12 @ 150 (FIFO: 10 @ cost=100, 2 @ cost=200)
         let out3 = runtime
             .process(&mut state, &make_trade("sell", 12.0, 150.0))
+            .unwrap()
             .into_iter()
             .next()
             .unwrap();
@@ -776,7 +792,7 @@ mod tests {
         let runtime = LuaRuntime::new("-- do nothing");
         let mut state = HashMap::new();
         let row = Row::from(RowMap::new());
-        assert!(runtime.process(&mut state, &row).is_empty());
+        assert!(runtime.process(&mut state, &row).unwrap().is_empty());
     }
 
     #[test]
@@ -791,7 +807,7 @@ mod tests {
         let mut state = HashMap::new();
         let row = Row::from(RowMap::new());
         let out = runtime
-            .process(&mut state, &row)
+            .process(&mut state, &row).unwrap()
             .into_iter()
             .next()
             .unwrap();
@@ -810,7 +826,7 @@ mod tests {
         );
         let mut state = HashMap::new();
         let row = Row::from(RowMap::new());
-        let out = runtime.process(&mut state, &row).into_iter().next().unwrap();
+        let out = runtime.process(&mut state, &row).unwrap().into_iter().next().unwrap();
         assert_eq!(out.get("sandboxed"), Some(&Value::Int64(1)));
     }
 
@@ -828,7 +844,7 @@ mod tests {
         let mut state = HashMap::new();
         let row = Row::from(HashMap::from([("side".to_string(), Value::String("buy".to_string()))]));
         let out = runtime
-            .process(&mut state, &row)
+            .process(&mut state, &row).unwrap()
             .into_iter()
             .next()
             .unwrap();
@@ -855,7 +871,7 @@ mod tests {
             ),
         )]));
 
-        let results = runtime.process(&mut state, &row);
+        let results = runtime.process(&mut state, &row).unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].get("name"), Some(&Value::String("a".into())));
         assert_eq!(results[0].get("value"), Some(&Value::Int64(1)));
@@ -878,7 +894,7 @@ mod tests {
         let mut state = HashMap::new();
         let row = Row::from(RowMap::new());
 
-        let results = runtime.process(&mut state, &row);
+        let results = runtime.process(&mut state, &row).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].get("x"), Some(&Value::Int64(1)));
         assert_eq!(results[1].get("x"), Some(&Value::Int64(2)));
@@ -892,7 +908,7 @@ mod tests {
         let mut state = HashMap::new();
         let row = Row::from(RowMap::new());
 
-        let results = runtime.process(&mut state, &row);
+        let results = runtime.process(&mut state, &row).unwrap();
         assert!(results.is_empty());
     }
 
@@ -940,7 +956,7 @@ mod tests {
             ("token".to_string(), Value::String("A".into())),
             ("volume".to_string(), Value::Float64(100.0)),
         ]));
-        let out1 = runtime.process(&mut state, &row1);
+        let out1 = runtime.process(&mut state, &row1).unwrap();
         assert_eq!(out1.len(), 1);
         assert_eq!(out1[0].get("token"), Some(&Value::String("A".into())));
         assert_eq!(out1[0].get("total_volume"), Some(&Value::Float64(100.0)));
@@ -960,7 +976,7 @@ mod tests {
             ("token".to_string(), Value::String("A".into())),
             ("volume".to_string(), Value::Float64(50.0)),
         ]));
-        let out2 = runtime.process(&mut state, &row2);
+        let out2 = runtime.process(&mut state, &row2).unwrap();
         assert_eq!(out2[0].get("total_volume"), Some(&Value::Float64(150.0)));
         assert_eq!(out2[0].get("total_trades").unwrap().as_f64(), Some(2.0));
 
@@ -969,7 +985,7 @@ mod tests {
             ("token".to_string(), Value::String("B".into())),
             ("volume".to_string(), Value::Float64(200.0)),
         ]));
-        let out3 = runtime.process(&mut state, &row3);
+        let out3 = runtime.process(&mut state, &row3).unwrap();
         assert_eq!(out3[0].get("total_volume"), Some(&Value::Float64(200.0)));
 
         // State should have both tokens
@@ -1019,14 +1035,14 @@ mod tests {
         ]);
 
         // BUY 10 @ 100
-        let out1 = runtime.process(&mut state, &make_trade("buy", 10.0, 100.0));
+        let out1 = runtime.process(&mut state, &make_trade("buy", 10.0, 100.0)).unwrap();
         assert_eq!(out1[0].get("pnl"), Some(&Value::Int64(0)));
 
         // BUY 5 @ 200
-        runtime.process(&mut state, &make_trade("buy", 5.0, 200.0));
+        runtime.process(&mut state, &make_trade("buy", 5.0, 200.0)).unwrap();
 
         // SELL 12 @ 150 (FIFO: 10@100, 2@200)
-        let out3 = runtime.process(&mut state, &make_trade("sell", 12.0, 150.0));
+        let out3 = runtime.process(&mut state, &make_trade("sell", 12.0, 150.0)).unwrap();
         let pnl = out3[0].get("pnl").unwrap().as_f64().unwrap();
         // 10*(150-100) + 2*(150-200) = 500 + (-100) = 400
         assert!((pnl - 400.0).abs() < 0.01);
@@ -1112,12 +1128,12 @@ mod tests {
         let mut state = HashMap::from([("total".to_string(), Value::Float64(0.0))]);
         let row = Row::from(HashMap::from([("value".to_string(), Value::Float64(5.0))]));
 
-        let out = runtime.process(&mut state, &row);
+        let out = runtime.process(&mut state, &row).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].get("result"), Some(&Value::Float64(10.0)));
 
         let row2 = Row::from(HashMap::from([("value".to_string(), Value::Float64(3.0))]));
-        let out2 = runtime.process(&mut state, &row2);
+        let out2 = runtime.process(&mut state, &row2).unwrap();
         assert_eq!(out2[0].get("result"), Some(&Value::Float64(16.0)));
     }
 
@@ -1135,7 +1151,7 @@ mod tests {
         let row = Row::from(HashMap::from([
             ("big".to_string(), Value::Int64(big)),
         ]));
-        let out = runtime.process(&mut state, &row).into_iter().next().unwrap();
+        let out = runtime.process(&mut state, &row).unwrap().into_iter().next().unwrap();
         assert_eq!(out.get("result"), Some(&Value::Int64(big)),
             "Int64 value should roundtrip through Lua without precision loss");
     }
@@ -1159,12 +1175,12 @@ mod tests {
         let row1 = Row::from(HashMap::from([
             ("optional".to_string(), Value::String("present".into())),
         ]));
-        let out1 = runtime.process(&mut state, &row1).into_iter().next().unwrap();
+        let out1 = runtime.process(&mut state, &row1).unwrap().into_iter().next().unwrap();
         assert_eq!(out1.get("saw"), Some(&Value::String("present".into())));
 
         // Row 2: does NOT have "optional" field — it must be nil, not "present"
         let row2 = Row::from(HashMap::new());
-        let out2 = runtime.process(&mut state, &row2).into_iter().next().unwrap();
+        let out2 = runtime.process(&mut state, &row2).unwrap().into_iter().next().unwrap();
         assert_eq!(out2.get("saw"), Some(&Value::String("nil".into())),
             "Null field should be nil in Lua, not stale value from previous row");
     }

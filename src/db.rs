@@ -155,18 +155,18 @@ impl DeltaDb {
     /// Delta records are buffered internally.
     /// Returns true if backpressure should be applied (buffer is full).
     ///
-    /// **Warning:** This method writes raw rows to storage immediately but does
-    /// not persist `latest_block` metadata until the next `finalize()`. A crash
-    /// between these two operations leaves orphaned raw rows in storage that are
-    /// never replayed into reducer/MV state on recovery. For crash-safe ingestion,
-    /// use `ingest()` which commits all writes atomically.
+    /// All writes (raw rows + metadata) are committed atomically via a single
+    /// write batch, making this crash-safe.
     pub fn process_batch(
         &mut self,
         table: &str,
         block: BlockNumber,
         rows: Vec<RowMap>,
     ) -> Result<bool> {
-        let deltas = self.engine.process_batch(table, block, rows)?;
+        let mut write_batch = StorageWriteBatch::new();
+        let deltas = self.engine.process_batch_deferred(table, block, rows, &mut write_batch)?;
+        self.append_meta_to_batch(&mut write_batch)?;
+        self.storage.commit(&write_batch)?;
 
         self.buffer.push(
             deltas,
@@ -275,10 +275,13 @@ impl DeltaDb {
             for row in rows {
                 let block = row
                     .get("block_number")
-                    .and_then(|v| v.as_u64())
+                    .and_then(|v| match v {
+                        crate::types::Value::UInt64(n) => Some(*n),
+                        _ => None,
+                    })
                     .ok_or_else(|| {
                         Error::InvalidOperation(format!(
-                            "row in table '{table}' missing block_number"
+                            "row in table '{table}' missing block_number (must be UInt64)"
                         ))
                     })?;
                 by_block.entry(block).or_default().push(row);
@@ -305,10 +308,10 @@ impl DeltaDb {
         self.engine.set_rollback_chain(&chain);
 
         // 3. Store finalized head hash and finalize atomically
-        self.engine.set_rollback_chain(&[(
+        self.engine.set_finalized_head(
             input.finalized_head.number,
             input.finalized_head.hash.clone(),
-        )]);
+        );
         self.engine.finalize(input.finalized_head.number, &mut write_batch);
         self.append_meta_to_batch(&mut write_batch)?;
         self.storage.commit(&write_batch)?;

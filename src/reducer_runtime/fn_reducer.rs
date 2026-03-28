@@ -26,7 +26,7 @@ impl FnReducerRuntime {
 }
 
 impl ReducerRuntime for FnReducerRuntime {
-    fn process(&self, state: &mut State, row: &Row) -> Vec<RowMap> {
-        (self.process_fn)(state, row)
+    fn process(&self, state: &mut State, row: &Row) -> crate::error::Result<Vec<RowMap>> {
+        Ok((self.process_fn)(state, row))
     }
 }

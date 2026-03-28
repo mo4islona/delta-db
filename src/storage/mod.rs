@@ -194,74 +194,104 @@ fn encode_value(buf: &mut Vec<u8>, val: &Value) {
     }
 }
 
-fn decode_value(bytes: &[u8], pos: &mut usize) -> Value {
+fn decode_value(bytes: &[u8], pos: &mut usize) -> crate::error::Result<Value> {
+    if *pos >= bytes.len() {
+        return Err(crate::error::Error::Storage("unexpected end of row data".into()));
+    }
     let tag = bytes[*pos];
     *pos += 1;
     match tag {
-        TAG_NULL => Value::Null,
+        TAG_NULL => Ok(Value::Null),
         TAG_UINT64 => {
-            let v = u64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
-            *pos += 8;
-            Value::UInt64(v)
+            let end = *pos + 8;
+            if end > bytes.len() { return Err(crate::error::Error::Storage("truncated UInt64".into())); }
+            let v = u64::from_le_bytes(bytes[*pos..end].try_into().unwrap());
+            *pos = end;
+            Ok(Value::UInt64(v))
         }
         TAG_INT64 => {
-            let v = i64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
-            *pos += 8;
-            Value::Int64(v)
+            let end = *pos + 8;
+            if end > bytes.len() { return Err(crate::error::Error::Storage("truncated Int64".into())); }
+            let v = i64::from_le_bytes(bytes[*pos..end].try_into().unwrap());
+            *pos = end;
+            Ok(Value::Int64(v))
         }
         TAG_FLOAT64 => {
-            let v = f64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
-            *pos += 8;
-            Value::Float64(v)
+            let end = *pos + 8;
+            if end > bytes.len() { return Err(crate::error::Error::Storage("truncated Float64".into())); }
+            let v = f64::from_le_bytes(bytes[*pos..end].try_into().unwrap());
+            *pos = end;
+            Ok(Value::Float64(v))
         }
         TAG_STRING => {
-            let len = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap()) as usize;
-            *pos += 4;
-            let s = std::str::from_utf8(&bytes[*pos..*pos + len])
-                .expect("invalid utf8 in stored string")
+            let end = *pos + 4;
+            if end > bytes.len() { return Err(crate::error::Error::Storage("truncated String length".into())); }
+            let len = u32::from_le_bytes(bytes[*pos..end].try_into().unwrap()) as usize;
+            *pos = end;
+            let str_end = *pos + len;
+            if str_end > bytes.len() { return Err(crate::error::Error::Storage("truncated String data".into())); }
+            let s = std::str::from_utf8(&bytes[*pos..str_end])
+                .map_err(|_| crate::error::Error::Storage("invalid UTF-8 in stored string".into()))?
                 .to_string();
-            *pos += len;
-            Value::String(s)
+            *pos = str_end;
+            Ok(Value::String(s))
         }
         TAG_DATETIME => {
-            let v = i64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
-            *pos += 8;
-            Value::DateTime(v)
+            let end = *pos + 8;
+            if end > bytes.len() { return Err(crate::error::Error::Storage("truncated DateTime".into())); }
+            let v = i64::from_le_bytes(bytes[*pos..end].try_into().unwrap());
+            *pos = end;
+            Ok(Value::DateTime(v))
         }
         TAG_BOOLEAN => {
+            if *pos >= bytes.len() { return Err(crate::error::Error::Storage("truncated Boolean".into())); }
             let v = bytes[*pos] != 0;
             *pos += 1;
-            Value::Boolean(v)
+            Ok(Value::Boolean(v))
         }
         TAG_BYTES => {
-            let len = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap()) as usize;
-            *pos += 4;
-            let v = bytes[*pos..*pos + len].to_vec();
-            *pos += len;
-            Value::Bytes(v)
+            let end = *pos + 4;
+            if end > bytes.len() { return Err(crate::error::Error::Storage("truncated Bytes length".into())); }
+            let len = u32::from_le_bytes(bytes[*pos..end].try_into().unwrap()) as usize;
+            *pos = end;
+            let data_end = *pos + len;
+            if data_end > bytes.len() { return Err(crate::error::Error::Storage("truncated Bytes data".into())); }
+            let v = bytes[*pos..data_end].to_vec();
+            *pos = data_end;
+            Ok(Value::Bytes(v))
         }
         TAG_UINT256 => {
-            let v: [u8; 32] = bytes[*pos..*pos + 32].try_into().unwrap();
-            *pos += 32;
-            Value::Uint256(v)
+            let end = *pos + 32;
+            if end > bytes.len() { return Err(crate::error::Error::Storage("truncated Uint256".into())); }
+            let v: [u8; 32] = bytes[*pos..end].try_into().unwrap();
+            *pos = end;
+            Ok(Value::Uint256(v))
         }
         TAG_BASE58 => {
-            let len = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap()) as usize;
-            *pos += 4;
-            let v = bytes[*pos..*pos + len].to_vec();
-            *pos += len;
-            Value::Base58(v)
+            let end = *pos + 4;
+            if end > bytes.len() { return Err(crate::error::Error::Storage("truncated Base58 length".into())); }
+            let len = u32::from_le_bytes(bytes[*pos..end].try_into().unwrap()) as usize;
+            *pos = end;
+            let data_end = *pos + len;
+            if data_end > bytes.len() { return Err(crate::error::Error::Storage("truncated Base58 data".into())); }
+            let v = bytes[*pos..data_end].to_vec();
+            *pos = data_end;
+            Ok(Value::Base58(v))
         }
         TAG_JSON => {
-            let len = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap()) as usize;
-            *pos += 4;
-            let s = std::str::from_utf8(&bytes[*pos..*pos + len])
-                .expect("invalid utf8 in stored json");
+            let end = *pos + 4;
+            if end > bytes.len() { return Err(crate::error::Error::Storage("truncated JSON length".into())); }
+            let len = u32::from_le_bytes(bytes[*pos..end].try_into().unwrap()) as usize;
+            *pos = end;
+            let str_end = *pos + len;
+            if str_end > bytes.len() { return Err(crate::error::Error::Storage("truncated JSON data".into())); }
+            let s = std::str::from_utf8(&bytes[*pos..str_end])
+                .map_err(|_| crate::error::Error::Storage("invalid UTF-8 in stored JSON".into()))?;
             let v = serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
-            *pos += len;
-            Value::JSON(v)
+            *pos = str_end;
+            Ok(Value::JSON(v))
         }
-        _ => panic!("unknown value type tag: {tag}"),
+        _ => Err(crate::error::Error::Storage(format!("unknown value type tag: {tag}"))),
     }
 }
 
@@ -312,8 +342,11 @@ pub fn encode_rows(rows: &[Row]) -> Vec<u8> {
 }
 
 /// Decode rows from bytes, wrapping each with the given registry.
-pub fn decode_rows(bytes: &[u8], registry: &Arc<ColumnRegistry>) -> Vec<Row> {
+pub fn decode_rows(bytes: &[u8], registry: &Arc<ColumnRegistry>) -> crate::error::Result<Vec<Row>> {
     let mut pos = 0;
+    if bytes.len() < 6 {
+        return Err(crate::error::Error::Storage("row data too short".into()));
+    }
     let num_rows = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
     let num_cols = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
@@ -323,11 +356,11 @@ pub fn decode_rows(bytes: &[u8], registry: &Arc<ColumnRegistry>) -> Vec<Row> {
     for _ in 0..num_rows {
         let mut values = Vec::with_capacity(num_cols);
         for _ in 0..num_cols {
-            values.push(decode_value(bytes, &mut pos));
+            values.push(decode_value(bytes, &mut pos)?);
         }
         rows.push(Row::from_values(registry.clone(), values));
     }
-    rows
+    Ok(rows)
 }
 
 /// Storage backend trait for Delta DB persistence.

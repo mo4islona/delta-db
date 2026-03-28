@@ -43,6 +43,8 @@ pub struct DeltaEngine {
     direct_mvs: Vec<String>,
     /// Independent reducer→MV branches. When len() >= 2, processed in parallel.
     branches: Vec<PipelineBranch>,
+    /// O(1) lookup: reducer_name → index in `branches`.
+    branch_index: HashMap<String, usize>,
     /// Sequence number for delta batches.
     sequence: u64,
     /// Latest processed block number (for ordering/rollback logic).
@@ -128,6 +130,12 @@ impl DeltaEngine {
             })
             .collect();
 
+        let branch_index: HashMap<String, usize> = branches
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.reducer_name.clone(), i))
+            .collect();
+
         Self {
             raw_tables,
             reducers,
@@ -136,6 +144,7 @@ impl DeltaEngine {
             pipeline,
             direct_mvs,
             branches,
+            branch_index,
             sequence: 0,
             latest_block: None,
             finalized_block: 0,
@@ -182,11 +191,13 @@ impl DeltaEngine {
             .collect();
 
         // Add as a new branch
+        let branch_idx = self.branches.len();
         self.branches.push(PipelineBranch {
             reducer_name: name.clone(),
             reducer: engine,
             mv_entries,
         });
+        self.branch_index.insert(name.clone(), branch_idx);
 
         // Add to pipeline
         self.pipeline.push(PipelineNode::Reducer(name));
@@ -360,9 +371,8 @@ impl DeltaEngine {
                 match node {
                     PipelineNode::RawTable(_) => {} // Already processed in Phase 1
                     PipelineNode::Reducer(name) => {
-                        let enriched = if let Some(branch) =
-                            self.branches.iter_mut().find(|b| b.reducer_name == *name)
-                        {
+                        let enriched = if let Some(&idx) = self.branch_index.get(name.as_str()) {
+                            let branch = &mut self.branches[idx];
                             let source = branch.reducer.source().to_string();
                             if let Some(source_rows) = output_rows.get(&source) {
                                 branch.reducer.process_block_maps(block, source_rows)?
@@ -461,9 +471,8 @@ impl DeltaEngine {
                             // Skip — rows already in storage
                         }
                         PipelineNode::Reducer(name) => {
-                            let enriched = if let Some(branch) =
-                                self.branches.iter_mut().find(|b| b.reducer_name == *name)
-                            {
+                            let enriched = if let Some(&idx) = self.branch_index.get(name.as_str()) {
+                                let branch = &mut self.branches[idx];
                                 let source = branch.reducer.source().to_string();
                                 if let Some(source_rows) = row_cache.get(&source) {
                                     branch.reducer.process_block(block, source_rows)?
@@ -496,6 +505,10 @@ impl DeltaEngine {
                                     let source = mv.source().to_string();
                                     if let Some(source_rows) = output_rows.get(&source) {
                                         mv.process_block(block, source_rows);
+                                    } else if let Some(cache_rows) = row_cache.get(&source) {
+                                        let maps: Vec<RowMap> =
+                                            cache_rows.iter().map(|r| r.to_map()).collect();
+                                        mv.process_block(block, &maps);
                                     }
                                     found = true;
                                     break;
@@ -506,6 +519,10 @@ impl DeltaEngine {
                                 let source = mv.source().to_string();
                                 if let Some(source_rows) = output_rows.get(&source) {
                                     mv.process_block(block, source_rows);
+                                } else if let Some(cache_rows) = row_cache.get(&source) {
+                                    let maps: Vec<RowMap> =
+                                        cache_rows.iter().map(|r| r.to_map()).collect();
+                                    mv.process_block(block, &maps);
                                 }
                             }
                         }
@@ -559,10 +576,9 @@ impl DeltaEngine {
                     }
                 }
                 PipelineNode::Reducer(name) => {
-                    // Check branches first, then HashMap
-                    if let Some(branch) = self.branches.iter_mut().find(|b| b.reducer_name == *name)
-                    {
-                        branch.reducer.rollback(fork_point)?;
+                    // Check branches first via index, then HashMap
+                    if let Some(&idx) = self.branch_index.get(name.as_str()) {
+                        self.branches[idx].reducer.rollback(fork_point)?;
                     } else {
                         let reducer = self.reducers.get_mut(name).unwrap();
                         reducer.rollback(fork_point)?;
@@ -596,9 +612,8 @@ impl DeltaEngine {
         for node in &self.pipeline {
             match node {
                 PipelineNode::Reducer(name) => {
-                    if let Some(branch) = self.branches.iter_mut().find(|b| b.reducer_name == *name)
-                    {
-                        branch.reducer.finalize(block, batch);
+                    if let Some(&idx) = self.branch_index.get(name.as_str()) {
+                        self.branches[idx].reducer.finalize(block, batch);
                     } else {
                         let reducer = self.reducers.get_mut(name).unwrap();
                         reducer.finalize(block, batch);
@@ -700,6 +715,13 @@ impl DeltaEngine {
         for (number, hash) in chain {
             self.block_hashes.insert(*number, hash.clone());
         }
+    }
+
+    /// Store the hash of the finalized head block.
+    /// Unlike `set_rollback_chain`, this is specifically for the finalized head
+    /// and does not touch unfinalized block hashes.
+    pub fn set_finalized_head(&mut self, block: BlockNumber, hash: String) {
+        self.block_hashes.insert(block, hash);
     }
 
     /// Find the highest block in `previous_blocks` whose hash matches

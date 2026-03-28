@@ -54,34 +54,63 @@ pub trait AggregationFunc: Send + Sync {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SumAgg {
     finalized: f64,
+    #[serde(default)]
+    finalized_int: i128,
     blocks: BTreeMap<BlockNumber, f64>,
+    #[serde(default)]
+    blocks_int: BTreeMap<BlockNumber, i128>,
     /// Whether any block has ever been finalized (prevents false deletion on zero-sum groups).
     #[serde(default)]
     has_finalized: bool,
+    /// Whether any Float64 values have been added. Used to decide output type.
+    #[serde(default)]
+    has_float_data: bool,
 }
 
 impl SumAgg {
     pub fn new() -> Self {
         Self {
             finalized: 0.0,
+            finalized_int: 0,
             blocks: BTreeMap::new(),
+            blocks_int: BTreeMap::new(),
             has_finalized: false,
+            has_float_data: false,
         }
     }
 }
 
 impl AggregationFunc for SumAgg {
     fn add_block(&mut self, block: BlockNumber, values: &[Value]) {
-        let partial: f64 = values.iter().filter_map(|v| v.as_f64()).sum();
-        *self.blocks.entry(block).or_insert(0.0) += partial;
+        let mut int_sum: i128 = 0;
+        let mut float_sum: f64 = 0.0;
+        let mut has_int = false;
+        let mut has_float = false;
+        for v in values {
+            match v {
+                Value::UInt64(u) => { int_sum += *u as i128; has_int = true; }
+                Value::Int64(i) => { int_sum += *i as i128; has_int = true; }
+                Value::Float64(f) => { float_sum += f; has_float = true; }
+                _ => {}
+            }
+        }
+        if has_int {
+            *self.blocks_int.entry(block).or_insert(0) += int_sum;
+        }
+        if has_float {
+            *self.blocks.entry(block).or_insert(0.0) += float_sum;
+            self.has_float_data = true;
+        }
     }
 
     fn remove_block(&mut self, block: BlockNumber) {
         self.blocks.remove(&block);
+        self.blocks_int.remove(&block);
     }
 
     fn remove_blocks_after(&mut self, fork_point: BlockNumber) {
         let _ = self.blocks.split_off(&(fork_point + 1));
+        let _ = self.blocks_int.split_off(&(fork_point + 1));
     }
 
     fn finalize_up_to(&mut self, block: BlockNumber) {
@@ -90,22 +119,39 @@ impl AggregationFunc for SumAgg {
             .range(..=block)
             .map(|(&b, &v)| (b, v))
             .collect();
-        if !to_finalize.is_empty() {
+        let to_finalize_int: Vec<_> = self
+            .blocks_int
+            .range(..=block)
+            .map(|(&b, &v)| (b, v))
+            .collect();
+        if !to_finalize.is_empty() || !to_finalize_int.is_empty() {
             self.has_finalized = true;
         }
         for (b, v) in to_finalize {
             self.finalized += v;
             self.blocks.remove(&b);
         }
+        for (b, v) in to_finalize_int {
+            self.finalized_int += v;
+            self.blocks_int.remove(&b);
+        }
     }
 
     fn current_value(&self) -> Value {
-        let total = self.finalized + self.blocks.values().sum::<f64>();
-        Value::Float64(total)
+        let int_total: i128 =
+            self.finalized_int + self.blocks_int.values().sum::<i128>();
+        let float_total: f64 = self.finalized + self.blocks.values().sum::<f64>();
+
+        // If no float data was ever added, return an integer result for precision
+        if !self.has_float_data {
+            return Value::Int64(int_total as i64);
+        }
+        // Float data present: combine integer sum into float result
+        Value::Float64(float_total + int_total as f64)
     }
 
     fn has_data(&self) -> bool {
-        self.has_finalized || !self.blocks.is_empty()
+        self.has_finalized || !self.blocks.is_empty() || !self.blocks_int.is_empty()
     }
 
     fn to_bytes(&self) -> Vec<u8> {
@@ -115,6 +161,7 @@ impl AggregationFunc for SumAgg {
     fn to_finalized_bytes(&self) -> Vec<u8> {
         let mut copy = self.clone();
         copy.blocks.clear();
+        copy.blocks_int.clear();
         rmp_serde::to_vec(&copy).unwrap()
     }
 
@@ -123,7 +170,9 @@ impl AggregationFunc for SumAgg {
     }
 
     fn block_numbers(&self) -> Vec<BlockNumber> {
-        self.blocks.keys().copied().collect()
+        let mut blocks: std::collections::BTreeSet<BlockNumber> = self.blocks.keys().copied().collect();
+        blocks.extend(self.blocks_int.keys().copied());
+        blocks.into_iter().collect()
     }
 }
 
@@ -399,11 +448,18 @@ impl AvgAgg {
 
 impl AggregationFunc for AvgAgg {
     fn add_block(&mut self, block: BlockNumber, values: &[Value]) {
-        let nums: Vec<f64> = values.iter().filter_map(|v| v.as_f64()).collect();
-        if !nums.is_empty() {
+        let mut sum = 0.0f64;
+        let mut count = 0u64;
+        for v in values {
+            if let Some(f) = v.as_f64() {
+                sum += f;
+                count += 1;
+            }
+        }
+        if count > 0 {
             let entry = self.blocks.entry(block).or_insert((0.0, 0));
-            entry.0 += nums.iter().sum::<f64>();
-            entry.1 += nums.len() as u64;
+            entry.0 += sum;
+            entry.1 += count;
         }
     }
 
@@ -727,7 +783,7 @@ mod tests {
     fn sum_with_integers() {
         let mut agg = SumAgg::new();
         agg.add_block(100, &[Value::UInt64(10), Value::Int64(5)]);
-        assert_eq!(agg.current_value(), Value::Float64(15.0));
+        assert_eq!(agg.current_value(), Value::Int64(15));
     }
 
     #[test]

@@ -129,7 +129,7 @@ impl RawTableEngine {
 
         let mut deltas = Vec::new();
         for (block, data) in rolled_back {
-            let rows = storage::decode_rows(&data, &self.registry);
+            let rows = storage::decode_rows(&data, &self.registry)?;
             for (idx, row) in rows.into_iter().enumerate() {
                 let mut key = HashMap::new();
                 key.insert("block_number".to_string(), Value::UInt64(block));
@@ -170,7 +170,7 @@ impl RawTableEngine {
 
         let mut deltas = Vec::new();
         for (block, data) in rolled_back {
-            let rows = storage::decode_rows(&data, &self.registry);
+            let rows = storage::decode_rows(&data, &self.registry)?;
             for (idx, row) in rows.into_iter().enumerate() {
                 let mut key = HashMap::new();
                 key.insert("block_number".to_string(), Value::UInt64(block));
@@ -198,10 +198,12 @@ impl RawTableEngine {
         let raw = self
             .storage
             .get_raw_rows(&self.def.name, from_block, to_block)?;
-        Ok(raw
-            .into_iter()
-            .map(|(block, data)| (block, storage::decode_rows(&data, &self.registry)))
-            .collect())
+        raw.into_iter()
+            .map(|(block, data)| {
+                let rows = storage::decode_rows(&data, &self.registry)?;
+                Ok((block, rows))
+            })
+            .collect()
     }
 }
 

@@ -141,8 +141,25 @@ impl Row {
 
 impl PartialEq for Row {
     fn eq(&self, other: &Self) -> bool {
-        // Compare the non-null entries as maps
-        self.to_map() == other.to_map()
+        if self.registry.len() != other.registry.len() {
+            return false;
+        }
+        // Fast path: same registry Arc — positional comparison with no allocation
+        if Arc::ptr_eq(&self.registry, &other.registry) {
+            return self.values == other.values;
+        }
+        // Slow path: different registries — compare by name without allocating HashMaps
+        for (name, id) in &self.registry.indices {
+            let v1 = &self.values[*id as usize];
+            let v2 = match other.registry.get_id(name) {
+                Some(id2) => &other.values[id2 as usize],
+                None => &Value::Null,
+            };
+            if v1 != v2 {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -348,9 +365,25 @@ impl Hash for Value {
             Value::Boolean(v) => v.hash(state),
             Value::Bytes(v) => v.hash(state),
             Value::Base58(v) => v.hash(state),
-            Value::JSON(v) => v.to_string().hash(state),
+            Value::JSON(v) => {
+                // Hash JSON bytes directly without allocating an intermediate String
+                serde_json::to_writer(HashWriter(state), v).ok();
+            }
             Value::Null => {}
         }
+    }
+}
+
+/// Adapter that writes bytes directly to a `Hasher`, avoiding String allocation.
+struct HashWriter<'a, H: Hasher>(&'a mut H);
+
+impl<H: Hasher> std::io::Write for HashWriter<'_, H> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

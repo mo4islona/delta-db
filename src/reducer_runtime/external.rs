@@ -292,11 +292,11 @@ impl ExternalRuntime {
 }
 
 impl ReducerRuntime for ExternalRuntime {
-    fn process(&self, _state: &mut HashMap<String, Value>, _row: &Row) -> Vec<RowMap> {
-        panic!(
+    fn process(&self, _state: &mut HashMap<String, Value>, _row: &Row) -> crate::error::Result<Vec<RowMap>> {
+        Err(crate::error::Error::Reducer(
             "ExternalRuntime::process() should not be called directly; \
-             use_batched_processing() returns true"
-        )
+             use_batched_processing() returns true".into()
+        ))
     }
 
     fn use_batched_processing(&self) -> bool {

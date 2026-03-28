@@ -380,8 +380,8 @@ mod tests {
 
         let result = backend.get_raw_rows("swaps", 100, 101).unwrap();
         assert_eq!(result.len(), 2);
-        let decoded0 = decode_rows(&result[0].1, &reg);
-        let decoded1 = decode_rows(&result[1].1, &reg);
+        let decoded0 = decode_rows(&result[0].1, &reg).unwrap();
+        let decoded1 = decode_rows(&result[1].1, &reg).unwrap();
         assert_eq!(result[0].0, 100);
         assert_eq!(decoded0.len(), 1);
         assert_eq!(result[1].0, 101);
