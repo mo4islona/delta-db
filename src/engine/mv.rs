@@ -267,7 +267,7 @@ impl MVEngine {
         for row in rows {
             let group_key = self.compute_group_key(row);
 
-            // Snapshot prev output before first mutation of this group in this call
+            // Snapshot prev output before first mutation of this group
             if !touched_keys.contains(&group_key) {
                 let prev = self.compute_output(&group_key);
                 if let Some(prev) = prev {
