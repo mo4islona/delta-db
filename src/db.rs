@@ -175,12 +175,13 @@ impl DeltaDb {
         block: BlockNumber,
         rows: Vec<RowMap>,
     ) -> Result<bool> {
-        let deltas = self.engine.process_batch(table, block, rows)?;
+        let (deltas, perf_node) = self.engine.process_batch(table, block, rows)?;
 
         self.buffer.push(
             deltas,
             self.engine.finalized_cursor(),
             self.engine.latest_cursor(),
+            vec![perf_node],
         );
 
         Ok(self.buffer.is_full())
@@ -201,6 +202,7 @@ impl DeltaDb {
             deltas,
             self.engine.finalized_cursor(),
             self.engine.latest_cursor(),
+            vec![],
         );
 
         Ok(())
@@ -300,7 +302,7 @@ impl DeltaDb {
             }
 
             for (block, block_rows) in by_block {
-                let deltas = self.engine.process_batch_deferred(
+                let (deltas, perf_node) = self.engine.process_batch_deferred(
                     &table,
                     block,
                     block_rows,
@@ -310,6 +312,7 @@ impl DeltaDb {
                     deltas,
                     self.engine.finalized_cursor(),
                     self.engine.latest_cursor(),
+                    vec![perf_node],
                 );
             }
         }
