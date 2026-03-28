@@ -5,6 +5,7 @@ pub mod lua;
 
 use std::collections::HashMap;
 
+use crate::error::Result;
 use crate::types::{Row, RowMap, Value};
 
 /// A batch of rows for a single group key, used by `process_grouped`.
@@ -30,7 +31,7 @@ pub trait ReducerRuntime: Send + Sync {
     /// - `row`: the input row from the source table (indexed access via ColumnRegistry)
     ///
     /// Returns zero or more output rows (the emitted columns).
-    fn process(&self, state: &mut HashMap<String, Value>, row: &Row) -> Vec<RowMap>;
+    fn process(&self, state: &mut HashMap<String, Value>, row: &Row) -> Result<Vec<RowMap>>;
 
     /// Whether this runtime benefits from grouped/batched processing.
     ///
@@ -48,12 +49,13 @@ pub trait ReducerRuntime: Send + Sync {
     ///
     /// Only called when `use_batched_processing()` returns true.
     /// External (host-language) reducers override this for batch callbacks.
-    fn process_grouped(&self, groups: &mut [GroupBatch]) {
+    fn process_grouped(&self, groups: &mut [GroupBatch]) -> Result<()> {
         for group in groups.iter_mut() {
             for row in &group.rows {
-                let emits = self.process(&mut group.state, row);
+                let emits = self.process(&mut group.state, row)?;
                 group.emits.extend(emits);
             }
         }
+        Ok(())
     }
 }

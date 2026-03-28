@@ -227,7 +227,7 @@ impl ReducerEngine {
             let state = self.state_cache.get_mut(&group_key_bytes).unwrap();
 
             // Call the runtime
-            let emits = self.runtime.process(state, row);
+            let emits = self.runtime.process(state, row)?;
 
             // Track touched key for deferred snapshot
             touched_keys.insert(group_key_bytes);
@@ -302,7 +302,7 @@ impl ReducerEngine {
             .collect();
 
         // Phase 2: Single batch call
-        self.runtime.process_grouped(&mut batches);
+        self.runtime.process_grouped(&mut batches)?;
 
         // Phase 3: Collect results — restore states, save snapshots, enrich emits
         let mut output_maps: Vec<RowMap> = Vec::new();

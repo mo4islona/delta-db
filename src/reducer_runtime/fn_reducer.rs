@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::error::Result;
 use crate::types::{Row, RowMap, Value};
 
 use super::ReducerRuntime;
@@ -26,7 +27,7 @@ impl FnReducerRuntime {
 }
 
 impl ReducerRuntime for FnReducerRuntime {
-    fn process(&self, state: &mut State, row: &Row) -> Vec<RowMap> {
-        (self.process_fn)(state, row)
+    fn process(&self, state: &mut State, row: &Row) -> Result<Vec<RowMap>> {
+        Ok((self.process_fn)(state, row))
     }
 }

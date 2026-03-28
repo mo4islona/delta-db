@@ -292,7 +292,7 @@ impl ExternalRuntime {
 }
 
 impl ReducerRuntime for ExternalRuntime {
-    fn process(&self, _state: &mut HashMap<String, Value>, _row: &Row) -> Vec<RowMap> {
+    fn process(&self, _state: &mut HashMap<String, Value>, _row: &Row) -> crate::error::Result<Vec<RowMap>> {
         panic!(
             "ExternalRuntime::process() should not be called directly; \
              use_batched_processing() returns true"
@@ -303,7 +303,7 @@ impl ReducerRuntime for ExternalRuntime {
         true
     }
 
-    fn process_grouped(&self, groups: &mut [GroupBatch]) {
+    fn process_grouped(&self, groups: &mut [GroupBatch]) -> crate::error::Result<()> {
         #[cfg(feature = "napi")]
         {
             napi_bridge::call_js_batch(&self.reducer_id, groups);
@@ -313,5 +313,6 @@ impl ReducerRuntime for ExternalRuntime {
             let _ = groups;
             panic!("ExternalRuntime requires the 'napi' feature");
         }
+        Ok(())
     }
 }
