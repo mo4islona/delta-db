@@ -65,9 +65,13 @@ impl Row {
 
     /// Create a Row from a pre-built values vector (must match registry length).
     pub fn from_values(registry: Arc<ColumnRegistry>, values: Vec<Value>) -> Self {
-        assert_eq!(values.len(), registry.len(),
+        assert_eq!(
+            values.len(),
+            registry.len(),
             "Row::from_values: values length {} != registry length {}",
-            values.len(), registry.len());
+            values.len(),
+            registry.len()
+        );
         Self { registry, values }
     }
 
@@ -84,11 +88,7 @@ impl Row {
     pub fn get(&self, name: &str) -> Option<&Value> {
         let id = self.registry.get_id(name)?;
         let val = &self.values[id as usize];
-        if val.is_null() {
-            None
-        } else {
-            Some(val)
-        }
+        if val.is_null() { None } else { Some(val) }
     }
 
     /// Set a column value by name. No-op if the column is not in the registry.
@@ -379,8 +379,42 @@ impl Hash for Value {
             Value::Boolean(v) => v.hash(state),
             Value::Bytes(v) => v.hash(state),
             Value::Base58(v) => v.hash(state),
-            Value::JSON(v) => v.to_string().hash(state),
+            Value::JSON(v) => hash_json(v, state),
             Value::Null => {}
+        }
+    }
+}
+
+/// Hash a serde_json::Value without allocating a String.
+fn hash_json<H: Hasher>(v: &serde_json::Value, state: &mut H) {
+    match v {
+        serde_json::Value::Null => 0u8.hash(state),
+        serde_json::Value::Bool(b) => {
+            1u8.hash(state);
+            b.hash(state);
+        }
+        serde_json::Value::Number(n) => {
+            2u8.hash(state);
+            n.hash(state);
+        }
+        serde_json::Value::String(s) => {
+            3u8.hash(state);
+            s.hash(state);
+        }
+        serde_json::Value::Array(arr) => {
+            4u8.hash(state);
+            arr.len().hash(state);
+            for item in arr {
+                hash_json(item, state);
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            5u8.hash(state);
+            obj.len().hash(state);
+            for (k, v) in obj {
+                k.hash(state);
+                hash_json(v, state);
+            }
         }
     }
 }
@@ -531,7 +565,10 @@ mod tests {
         assert!(Value::Float64(1.0) < Value::Float64(2.0));
         assert!(Value::String("a".into()) < Value::String("b".into()));
         // Cross-type comparison returns None
-        assert_eq!(Value::UInt64(1).partial_cmp(&Value::String("1".into())), None);
+        assert_eq!(
+            Value::UInt64(1).partial_cmp(&Value::String("1".into())),
+            None
+        );
     }
 
     #[test]
@@ -546,10 +583,19 @@ mod tests {
     fn column_type_defaults() {
         assert_eq!(ColumnType::UInt64.default_value(), Value::UInt64(0));
         assert_eq!(ColumnType::Float64.default_value(), Value::Float64(0.0));
-        assert_eq!(ColumnType::Uint256.default_value(), Value::Uint256([0u8; 32]));
-        assert_eq!(ColumnType::String.default_value(), Value::String(String::new()));
+        assert_eq!(
+            ColumnType::Uint256.default_value(),
+            Value::Uint256([0u8; 32])
+        );
+        assert_eq!(
+            ColumnType::String.default_value(),
+            Value::String(String::new())
+        );
         assert_eq!(ColumnType::Boolean.default_value(), Value::Boolean(false));
-        assert_eq!(ColumnType::Base58.default_value(), Value::Base58(Vec::new()));
+        assert_eq!(
+            ColumnType::Base58.default_value(),
+            Value::Base58(Vec::new())
+        );
     }
 
     #[test]
@@ -628,15 +674,24 @@ mod tests {
         let decoded: DeltaRecord = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(decoded.table, "swaps");
         assert_eq!(decoded.operation, DeltaOperation::Insert);
-        assert_eq!(decoded.values.get("user"), Some(&Value::String("alice".into())));
+        assert_eq!(
+            decoded.values.get("user"),
+            Some(&Value::String("alice".into()))
+        );
     }
 
     #[test]
     fn delta_batch_serde_roundtrip() {
         let batch = DeltaBatch {
             sequence: 1,
-            finalized_head: Some(BlockCursor { number: 900, hash: "0xabc".into() }),
-            latest_head: Some(BlockCursor { number: 1000, hash: "0xdef".into() }),
+            finalized_head: Some(BlockCursor {
+                number: 900,
+                hash: "0xabc".into(),
+            }),
+            latest_head: Some(BlockCursor {
+                number: 1000,
+                hash: "0xdef".into(),
+            }),
             tables: HashMap::new(),
         };
 
