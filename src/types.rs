@@ -489,11 +489,32 @@ pub struct DeltaRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfNodeKind {
+    Pipeline,
+    RawTable,
+    Reducer,
+    #[serde(rename = "mv")]
+    MV,
+    Parallel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfNode {
+    pub kind: PerfNodeKind,
+    pub name: String,
+    pub duration_ms: f64,
+    pub children: Vec<PerfNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeltaBatch {
     pub sequence: u64,
     pub finalized_head: Option<BlockCursor>,
     pub latest_head: Option<BlockCursor>,
     pub tables: HashMap<String, Vec<DeltaRecord>>,
+    #[serde(default)]
+    pub perf: Vec<PerfNode>,
 }
 
 impl DeltaBatch {
@@ -693,6 +714,7 @@ mod tests {
                 hash: "0xdef".into(),
             }),
             tables: HashMap::new(),
+            perf: vec![],
         };
 
         let json = serde_json::to_string(&batch).unwrap();

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::types::{BlockCursor, DeltaBatch, DeltaOperation, DeltaRecord, Value};
+use crate::types::{BlockCursor, DeltaBatch, DeltaOperation, DeltaRecord, PerfNode, Value};
 
 /// Buffers delta batches while downstream hasn't acknowledged.
 /// Records are appended on push; merging is deferred to flush time.
@@ -13,6 +13,8 @@ pub struct DeltaBuffer {
     finalized_head: Option<BlockCursor>,
     /// Latest cursor as of last push.
     latest_head: Option<BlockCursor>,
+    /// Pending perf nodes, accumulated per push.
+    pending_perf: Vec<PerfNode>,
     /// Max pending records before backpressure is applied.
     max_buffer_size: usize,
 }
@@ -24,6 +26,7 @@ impl DeltaBuffer {
             next_sequence: 1,
             finalized_head: None,
             latest_head: None,
+            pending_perf: Vec::new(),
             max_buffer_size,
         }
     }
@@ -55,16 +58,19 @@ impl DeltaBuffer {
         records: Vec<DeltaRecord>,
         finalized_head: Option<BlockCursor>,
         latest_head: Option<BlockCursor>,
+        perf: Vec<PerfNode>,
     ) {
         self.finalized_head = finalized_head;
         self.latest_head = latest_head;
         self.pending.extend(records);
+        self.pending_perf.extend(perf);
     }
 
     /// Flush: merge and drain all pending records into a DeltaBatch.
     /// Returns None if there are no pending records (or all cancel out).
     pub fn flush(&mut self) -> Option<DeltaBatch> {
         if self.pending.is_empty() {
+            self.pending_perf.clear();
             return None;
         }
 
@@ -116,6 +122,7 @@ impl DeltaBuffer {
         }
 
         if tables.is_empty() {
+            self.pending_perf.clear();
             return None;
         }
 
@@ -127,6 +134,7 @@ impl DeltaBuffer {
             finalized_head: self.finalized_head.clone(),
             latest_head: self.latest_head.clone(),
             tables,
+            perf: self.pending_perf.drain(..).collect(),
         })
     }
 
@@ -266,7 +274,12 @@ mod tests {
     #[test]
     fn flush_returns_batch_and_clears() {
         let mut buffer = DeltaBuffer::new(100);
-        buffer.push(vec![make_insert("t", "1", "a")], cursor(0), cursor(1000));
+        buffer.push(
+            vec![make_insert("t", "1", "a")],
+            cursor(0),
+            cursor(1000),
+            vec![],
+        );
 
         let batch = buffer.flush().unwrap();
         assert_eq!(batch.sequence, 1);
@@ -281,10 +294,20 @@ mod tests {
     fn sequence_numbers_increment() {
         let mut buffer = DeltaBuffer::new(100);
 
-        buffer.push(vec![make_insert("t", "1", "a")], cursor(0), cursor(1000));
+        buffer.push(
+            vec![make_insert("t", "1", "a")],
+            cursor(0),
+            cursor(1000),
+            vec![],
+        );
         let b1 = buffer.flush().unwrap();
 
-        buffer.push(vec![make_insert("t", "2", "b")], cursor(0), cursor(1001));
+        buffer.push(
+            vec![make_insert("t", "2", "b")],
+            cursor(0),
+            cursor(1001),
+            vec![],
+        );
         let b2 = buffer.flush().unwrap();
 
         assert_eq!(b1.sequence, 1);
@@ -294,11 +317,17 @@ mod tests {
     #[test]
     fn merge_insert_then_update() {
         let mut buffer = DeltaBuffer::new(100);
-        buffer.push(vec![make_insert("t", "1", "a")], cursor(0), cursor(1000));
+        buffer.push(
+            vec![make_insert("t", "1", "a")],
+            cursor(0),
+            cursor(1000),
+            vec![],
+        );
         buffer.push(
             vec![make_update("t", "1", "b", "a")],
             cursor(0),
             cursor(1001),
+            vec![],
         );
 
         let batch = buffer.flush().unwrap();
@@ -316,7 +345,12 @@ mod tests {
     #[test]
     fn merge_insert_then_delete_cancels() {
         let mut buffer = DeltaBuffer::new(100);
-        buffer.push(vec![make_insert("t", "1", "a")], cursor(0), cursor(1000));
+        buffer.push(
+            vec![make_insert("t", "1", "a")],
+            cursor(0),
+            cursor(1000),
+            vec![],
+        );
         buffer.push(
             vec![DeltaRecord {
                 table: "t".to_string(),
@@ -330,6 +364,7 @@ mod tests {
             }],
             cursor(0),
             cursor(1001),
+            vec![],
         );
 
         // The merged result should be None (cancelled), so flush returns None
@@ -344,11 +379,13 @@ mod tests {
             vec![make_update("t", "1", "b", "a")],
             cursor(0),
             cursor(1000),
+            vec![],
         );
         buffer.push(
             vec![make_update("t", "1", "c", "b")],
             cursor(0),
             cursor(1001),
+            vec![],
         );
 
         let batch = buffer.flush().unwrap();
@@ -369,8 +406,13 @@ mod tests {
     #[test]
     fn merge_delete_then_insert() {
         let mut buffer = DeltaBuffer::new(100);
-        buffer.push(vec![make_delete("t", "1")], cursor(0), cursor(1000));
-        buffer.push(vec![make_insert("t", "1", "new")], cursor(0), cursor(1001));
+        buffer.push(vec![make_delete("t", "1")], cursor(0), cursor(1000), vec![]);
+        buffer.push(
+            vec![make_insert("t", "1", "new")],
+            cursor(0),
+            cursor(1001),
+            vec![],
+        );
 
         let batch = buffer.flush().unwrap();
         let records = batch.records_for("t");
@@ -389,9 +431,14 @@ mod tests {
     fn delete_insert_merge_preserves_prev_values() {
         let mut buffer = DeltaBuffer::new(100);
         // Delete record has prev_values = {"data": "old"} and values = {}
-        buffer.push(vec![make_delete("t", "1")], cursor(0), cursor(1000));
+        buffer.push(vec![make_delete("t", "1")], cursor(0), cursor(1000), vec![]);
         // Insert record brings new values
-        buffer.push(vec![make_insert("t", "1", "new")], cursor(0), cursor(1001));
+        buffer.push(
+            vec![make_insert("t", "1", "new")],
+            cursor(0),
+            cursor(1001),
+            vec![],
+        );
 
         let batch = buffer.flush().unwrap();
         let records = batch.records_for("t");
@@ -418,7 +465,12 @@ mod tests {
     #[test]
     fn insert_delete_insert_produces_insert_not_update() {
         let mut buffer = DeltaBuffer::new(100);
-        buffer.push(vec![make_insert("t", "1", "a")], cursor(0), cursor(1000));
+        buffer.push(
+            vec![make_insert("t", "1", "a")],
+            cursor(0),
+            cursor(1000),
+            vec![],
+        );
         buffer.push(
             vec![DeltaRecord {
                 table: "t".to_string(),
@@ -432,9 +484,15 @@ mod tests {
             }],
             cursor(0),
             cursor(1001),
+            vec![],
         );
         // Re-insert same key with new data
-        buffer.push(vec![make_insert("t", "1", "b")], cursor(0), cursor(1002));
+        buffer.push(
+            vec![make_insert("t", "1", "b")],
+            cursor(0),
+            cursor(1002),
+            vec![],
+        );
 
         let batch = buffer.flush().unwrap();
         let records = batch.records_for("t");
@@ -460,16 +518,23 @@ mod tests {
     #[test]
     fn three_way_merge_same_key() {
         let mut buffer = DeltaBuffer::new(100);
-        buffer.push(vec![make_insert("t", "1", "a")], cursor(0), cursor(1000));
+        buffer.push(
+            vec![make_insert("t", "1", "a")],
+            cursor(0),
+            cursor(1000),
+            vec![],
+        );
         buffer.push(
             vec![make_update("t", "1", "b", "a")],
             cursor(0),
             cursor(1001),
+            vec![],
         );
         buffer.push(
             vec![make_update("t", "1", "c", "b")],
             cursor(0),
             cursor(1002),
+            vec![],
         );
 
         let batch = buffer.flush().unwrap();
@@ -489,6 +554,7 @@ mod tests {
             vec![make_insert("t", "1", "a"), make_insert("t", "2", "b")],
             cursor(0),
             cursor(1000),
+            vec![],
         );
 
         let batch = buffer.flush().unwrap();
@@ -502,6 +568,7 @@ mod tests {
             vec![make_insert("t1", "1", "a"), make_insert("t2", "1", "b")],
             cursor(0),
             cursor(1000),
+            vec![],
         );
 
         let batch = buffer.flush().unwrap();
@@ -519,6 +586,7 @@ mod tests {
             vec![make_insert("t", "1", "a"), make_insert("t", "2", "b")],
             cursor(0),
             cursor(1000),
+            vec![],
         );
         assert!(buffer.is_full());
 
@@ -530,11 +598,62 @@ mod tests {
     fn finalized_and_latest_cursor_tracking() {
         let mut buffer = DeltaBuffer::new(100);
 
-        buffer.push(vec![make_insert("t", "1", "a")], cursor(500), cursor(1000));
-        buffer.push(vec![make_insert("t", "2", "b")], cursor(600), cursor(1100));
+        buffer.push(
+            vec![make_insert("t", "1", "a")],
+            cursor(500),
+            cursor(1000),
+            vec![],
+        );
+        buffer.push(
+            vec![make_insert("t", "2", "b")],
+            cursor(600),
+            cursor(1100),
+            vec![],
+        );
 
         let batch = buffer.flush().unwrap();
         assert_eq!(batch.finalized_head.as_ref().unwrap().number, 600);
         assert_eq!(batch.latest_head.as_ref().unwrap().number, 1100);
+    }
+
+    /// pending_perf must not leak into future batches when flush returns None.
+    #[test]
+    fn perf_cleared_on_empty_flush() {
+        use crate::types::{PerfNode, PerfNodeKind};
+
+        let mut buffer = DeltaBuffer::new(100);
+        let node = PerfNode {
+            kind: PerfNodeKind::Pipeline,
+            name: "test".into(),
+            duration_ms: 1.0,
+            children: vec![],
+        };
+
+        // Push perf with no records — flush returns None
+        buffer.push(vec![], cursor(0), cursor(1000), vec![node.clone()]);
+        assert!(buffer.flush().is_none());
+
+        // Next batch should not contain stale perf
+        buffer.push(
+            vec![make_insert("t", "1", "a")],
+            cursor(0),
+            cursor(1001),
+            vec![],
+        );
+        let batch = buffer.flush().unwrap();
+        assert!(batch.perf.is_empty(), "stale perf should not leak");
+    }
+
+    /// PerfNodeKind serde uses snake_case.
+    #[test]
+    fn perf_node_kind_serde_snake_case() {
+        use crate::types::PerfNodeKind;
+
+        let json = serde_json::to_string(&PerfNodeKind::RawTable).unwrap();
+        assert_eq!(json, "\"raw_table\"");
+        let json = serde_json::to_string(&PerfNodeKind::MV).unwrap();
+        assert_eq!(json, "\"mv\"");
+        let json = serde_json::to_string(&PerfNodeKind::Pipeline).unwrap();
+        assert_eq!(json, "\"pipeline\"");
     }
 }

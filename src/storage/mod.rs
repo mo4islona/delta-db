@@ -315,6 +315,9 @@ pub fn encode_rows(rows: &[Row]) -> Vec<u8> {
 pub fn decode_rows(bytes: &[u8], registry: &Arc<ColumnRegistry>) -> Result<Vec<Row>> {
     let mut pos = 0;
     let num_rows = u32::from_le_bytes(read_bytes(bytes, &mut pos, 4)?.try_into().unwrap()) as usize;
+    if num_rows == 0 {
+        return Ok(Vec::new());
+    }
     let num_cols = u16::from_le_bytes(read_bytes(bytes, &mut pos, 2)?.try_into().unwrap()) as usize;
 
     if num_cols != registry.len() {
