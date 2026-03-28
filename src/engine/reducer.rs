@@ -271,14 +271,17 @@ impl ReducerEngine {
         for (row_idx, row) in rows.iter().enumerate() {
             let key = self.compute_group_key_bytes(row);
 
-            if !self.state_cache.contains_key(&key) {
-                let state = load_state_from(
+            // Single lookup: entry API with load on miss
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                self.state_cache.entry(key.clone())
+            {
+                let loaded = load_state_from(
                     self.storage.as_ref(),
                     &self.def.name,
-                    &key,
+                    e.key(),
                     &self.default_state,
                 )?;
-                self.state_cache.insert(key.clone(), state);
+                e.insert(loaded);
             }
 
             group_map
@@ -317,13 +320,12 @@ impl ReducerEngine {
             let key = &key_order[i];
             let (_, row_indices) = &group_map[key];
 
-            self.state_cache.insert(key.clone(), batch.state);
-
-            let state = self.state_cache.get(key).unwrap();
+            // Snapshot state before inserting into cache (avoids double lookup)
             self.block_snapshots
                 .entry(key.clone())
                 .or_default()
-                .insert(block, state.clone());
+                .insert(block, batch.state.clone());
+            self.state_cache.insert(key.clone(), batch.state);
             block_keys.insert(key.clone());
 
             let first_row = &rows[row_indices[0]];
