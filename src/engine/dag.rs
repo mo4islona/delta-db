@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::schema::ast::Schema;
 use crate::storage::StorageBackend;
 use crate::storage::StorageWriteBatch;
-use crate::types::{BlockCursor, BlockNumber, DeltaBatch, DeltaRecord, Row, RowMap};
+use crate::types::{BlockCursor, BlockNumber, ColumnType, DeltaBatch, DeltaRecord, Row, RowMap};
 
 use super::mv::MVEngine;
 use super::raw_table::RawTableEngine;
@@ -79,7 +79,12 @@ impl DeltaEngine {
                 // Source is a raw table — use its registry
                 reducers.insert(
                     reducer_def.name.clone(),
-                    ReducerEngine::new(reducer_def.clone(), storage.clone(), raw.registry(), &modules),
+                    ReducerEngine::new(
+                        reducer_def.clone(),
+                        storage.clone(),
+                        raw.registry(),
+                        &modules,
+                    ),
                 );
             } else {
                 // Source is another reducer — build registry dynamically per batch
@@ -90,10 +95,29 @@ impl DeltaEngine {
             }
         }
 
+        // Build column type maps for MV source resolution
+        let table_column_types: HashMap<String, HashMap<String, ColumnType>> = schema
+            .tables
+            .iter()
+            .map(|t| {
+                let cols: HashMap<String, ColumnType> = t
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.column_type.clone()))
+                    .collect();
+                (t.name.clone(), cols)
+            })
+            .collect();
+
         for mv_def in &schema.materialized_views {
+            // Resolve source column types: from table or reducer state fields
+            let source_col_types = table_column_types
+                .get(&mv_def.source)
+                .cloned()
+                .unwrap_or_default();
             mvs.insert(
                 mv_def.name.clone(),
-                MVEngine::new(mv_def.clone(), storage.clone()),
+                MVEngine::new(mv_def.clone(), storage.clone(), &source_col_types),
             );
         }
 
@@ -196,13 +220,16 @@ impl DeltaEngine {
 
     /// Check if a reducer with the given name exists in the engine.
     pub fn has_reducer(&self, name: &str) -> bool {
-        self.reducers.contains_key(name)
-            || self.branches.iter().any(|b| b.reducer_name == name)
+        self.reducers.contains_key(name) || self.branches.iter().any(|b| b.reducer_name == name)
     }
 
     /// Replace the runtime for a named reducer (used for External/FnReducer injection).
     /// Searches both branches and the reducers HashMap.
-    pub fn set_reducer_runtime(&mut self, name: &str, runtime: Box<dyn crate::reducer_runtime::ReducerRuntime>) {
+    pub fn set_reducer_runtime(
+        &mut self,
+        name: &str,
+        runtime: Box<dyn crate::reducer_runtime::ReducerRuntime>,
+    ) {
         for branch in &mut self.branches {
             if branch.reducer_name == name {
                 branch.reducer.set_runtime(runtime);
@@ -274,13 +301,9 @@ impl DeltaEngine {
         // - 2+ branches, all reducers source from raw tables (not from each other),
         //   and no external reducers (which require main-thread JS callbacks).
         let can_parallelize = self.branches.len() >= 2
-            && self
-                .branches
-                .iter()
-                .all(|b| {
-                    self.raw_tables.contains_key(b.reducer.source())
-                        && !b.reducer.is_external()
-                });
+            && self.branches.iter().all(|b| {
+                self.raw_tables.contains_key(b.reducer.source()) && !b.reducer.is_external()
+            });
 
         if can_parallelize {
             // Phase 2a: Process MVs that source directly from raw tables
@@ -654,11 +677,7 @@ impl DeltaEngine {
 
     pub fn latest_cursor(&self) -> Option<BlockCursor> {
         let block = self.latest_block?;
-        let hash = self
-            .block_hashes
-            .get(&block)
-            .cloned()
-            .unwrap_or_default();
+        let hash = self.block_hashes.get(&block).cloned().unwrap_or_default();
         Some(BlockCursor {
             number: block,
             hash,
@@ -1283,8 +1302,14 @@ mod tests {
             tables: vec![TableDef {
                 name: "events".to_string(),
                 columns: vec![
-                    ColumnDef { name: "user".to_string(), column_type: ColumnType::String },
-                    ColumnDef { name: "amount".to_string(), column_type: ColumnType::Float64 },
+                    ColumnDef {
+                        name: "user".to_string(),
+                        column_type: ColumnType::String,
+                    },
+                    ColumnDef {
+                        name: "amount".to_string(),
+                        column_type: ColumnType::Float64,
+                    },
                 ],
                 virtual_table: false,
             }],
@@ -1304,7 +1329,8 @@ mod tests {
                             state.total = state.total + row.amount
                             emit.user = row.user
                             emit.total = state.total
-                        "#.to_string(),
+                        "#
+                        .to_string(),
                     },
                 },
                 ReducerDef {
@@ -1317,7 +1343,8 @@ mod tests {
                         script: r#"
                             emit.user = row.user
                             emit.doubled = row.total * 2
-                        "#.to_string(),
+                        "#
+                        .to_string(),
                     },
                 },
             ],
@@ -1325,7 +1352,10 @@ mod tests {
                 name: "summary".to_string(),
                 source: "doubled".to_string(),
                 select: vec![
-                    SelectItem { expr: SelectExpr::Column("user".into()), alias: None },
+                    SelectItem {
+                        expr: SelectExpr::Column("user".into()),
+                        alias: None,
+                    },
                     SelectItem {
                         expr: SelectExpr::Agg(AggFunc::Last, Some("doubled".into())),
                         alias: Some("latest_doubled".into()),
@@ -1340,12 +1370,16 @@ mod tests {
         let mut engine = DeltaEngine::new(&schema, storage);
 
         // Block 1: alice deposits 10
-        let deltas = engine.process_batch("events", 1000, vec![
-            HashMap::from([
-                ("user".to_string(), Value::String("alice".into())),
-                ("amount".to_string(), Value::Float64(10.0)),
-            ]),
-        ]).unwrap();
+        let deltas = engine
+            .process_batch(
+                "events",
+                1000,
+                vec![HashMap::from([
+                    ("user".to_string(), Value::String("alice".into())),
+                    ("amount".to_string(), Value::Float64(10.0)),
+                ])],
+            )
+            .unwrap();
 
         // Should have: events insert + summary insert (doubled=20)
         let summary_deltas: Vec<_> = deltas.iter().filter(|d| d.table == "summary").collect();
@@ -1356,12 +1390,16 @@ mod tests {
         );
 
         // Block 2: alice deposits 5 more (total=15, doubled=30)
-        let deltas2 = engine.process_batch("events", 1001, vec![
-            HashMap::from([
-                ("user".to_string(), Value::String("alice".into())),
-                ("amount".to_string(), Value::Float64(5.0)),
-            ]),
-        ]).unwrap();
+        let deltas2 = engine
+            .process_batch(
+                "events",
+                1001,
+                vec![HashMap::from([
+                    ("user".to_string(), Value::String("alice".into())),
+                    ("amount".to_string(), Value::Float64(5.0)),
+                ])],
+            )
+            .unwrap();
 
         let summary2: Vec<_> = deltas2.iter().filter(|d| d.table == "summary").collect();
         assert_eq!(summary2.len(), 1);
@@ -1372,16 +1410,26 @@ mod tests {
 
         // Rollback block 1001
         let rollback_deltas = engine.rollback(1000).unwrap();
-        let summary_rb: Vec<_> = rollback_deltas.iter().filter(|d| d.table == "summary").collect();
-        assert!(!summary_rb.is_empty(), "rollback should produce summary deltas");
+        let summary_rb: Vec<_> = rollback_deltas
+            .iter()
+            .filter(|d| d.table == "summary")
+            .collect();
+        assert!(
+            !summary_rb.is_empty(),
+            "rollback should produce summary deltas"
+        );
 
         // Re-ingest block 1001: alice deposits 20 (total=30, doubled=60)
-        let deltas3 = engine.process_batch("events", 1001, vec![
-            HashMap::from([
-                ("user".to_string(), Value::String("alice".into())),
-                ("amount".to_string(), Value::Float64(20.0)),
-            ]),
-        ]).unwrap();
+        let deltas3 = engine
+            .process_batch(
+                "events",
+                1001,
+                vec![HashMap::from([
+                    ("user".to_string(), Value::String("alice".into())),
+                    ("amount".to_string(), Value::Float64(20.0)),
+                ])],
+            )
+            .unwrap();
 
         let summary3: Vec<_> = deltas3.iter().filter(|d| d.table == "summary").collect();
         assert_eq!(summary3.len(), 1);
