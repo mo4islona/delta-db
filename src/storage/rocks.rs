@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use rocksdb::{ColumnFamilyDescriptor, Direction, IteratorMode, Options, ReadOptions, WriteBatch, DB};
+use rocksdb::{
+    ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options, ReadOptions, WriteBatch,
+};
 
 use crate::error::{Error, Result};
 use crate::types::BlockNumber;
@@ -217,7 +219,7 @@ impl StorageBackend for RocksDbBackend {
         opts.set_iterate_upper_bound(ub);
 
         let mut result = Vec::new();
-        let mut keys_to_delete = Vec::new();
+        let mut batch = WriteBatch::default();
 
         let iter =
             self.db
@@ -226,14 +228,11 @@ impl StorageBackend for RocksDbBackend {
             let (k, v) = item.map_err(to_err)?;
             let block = BlockNumber::from_be_bytes(k[prefix.len()..].try_into().unwrap());
             result.push((block, v.to_vec()));
-            keys_to_delete.push(k);
+            batch.delete_cf(cf, k.as_ref());
         }
 
-        if !keys_to_delete.is_empty() {
-            let mut batch = WriteBatch::default();
-            for k in &keys_to_delete {
-                batch.delete_cf(cf, k);
-            }
+        // Build batch during iteration to avoid intermediate keys_to_delete Vec.
+        if !result.is_empty() {
             self.db.write(batch).map_err(to_err)?;
         }
         Ok(result)
@@ -328,23 +327,14 @@ impl StorageBackend for RocksDbBackend {
 
     // --- Reducer finalized state ---
 
-    fn get_reducer_finalized(
-        &self,
-        reducer: &str,
-        group_key: &[u8],
-    ) -> Result<Option<Vec<u8>>> {
+    fn get_reducer_finalized(&self, reducer: &str, group_key: &[u8]) -> Result<Option<Vec<u8>>> {
         let cf = self.db.cf_handle(CF_REDUCER_FIN).expect("reducer_fin CF");
         self.db
             .get_cf(cf, fin_key(reducer, group_key))
             .map_err(to_err)
     }
 
-    fn set_reducer_finalized(
-        &self,
-        reducer: &str,
-        group_key: &[u8],
-        state: &[u8],
-    ) -> Result<()> {
+    fn set_reducer_finalized(&self, reducer: &str, group_key: &[u8], state: &[u8]) -> Result<()> {
         let cf = self.db.cf_handle(CF_REDUCER_FIN).expect("reducer_fin CF");
         self.db
             .put_cf(cf, fin_key(reducer, group_key), state)
@@ -396,9 +386,7 @@ impl StorageBackend for RocksDbBackend {
 
     fn get_mv_state(&self, view: &str, group_key: &[u8]) -> Result<Option<Vec<u8>>> {
         let cf = self.db.cf_handle(CF_MV).expect("mv CF");
-        self.db
-            .get_cf(cf, kv_key(view, group_key))
-            .map_err(to_err)
+        self.db.get_cf(cf, kv_key(view, group_key)).map_err(to_err)
     }
 
     fn delete_mv_state(&self, view: &str, group_key: &[u8]) -> Result<()> {
@@ -434,9 +422,7 @@ impl StorageBackend for RocksDbBackend {
 
     fn put_meta(&self, key: &str, value: &[u8]) -> Result<()> {
         let cf = self.db.cf_handle(CF_META).expect("meta CF");
-        self.db
-            .put_cf(cf, key.as_bytes(), value)
-            .map_err(to_err)
+        self.db.put_cf(cf, key.as_bytes(), value).map_err(to_err)
     }
 
     fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -454,11 +440,19 @@ impl StorageBackend for RocksDbBackend {
                     let cf = self.db.cf_handle(CF_RAW).expect("raw CF");
                     wb.put_cf(cf, raw_key(table, *block), data);
                 }
-                BatchOp::SetReducerFinalized { reducer, group_key, state } => {
+                BatchOp::SetReducerFinalized {
+                    reducer,
+                    group_key,
+                    state,
+                } => {
                     let cf = self.db.cf_handle(CF_REDUCER_FIN).expect("reducer_fin CF");
                     wb.put_cf(cf, fin_key(reducer, group_key), state);
                 }
-                BatchOp::PutMvState { view, group_key, state } => {
+                BatchOp::PutMvState {
+                    view,
+                    group_key,
+                    state,
+                } => {
                     let cf = self.db.cf_handle(CF_MV).expect("mv CF");
                     wb.put_cf(cf, kv_key(view, group_key), state);
                 }
@@ -477,9 +471,11 @@ impl StorageBackend for RocksDbBackend {
                         let ub = upper_bound(&raw_table_prefix(table));
                         let mut opts = ReadOptions::default();
                         opts.set_iterate_upper_bound(ub);
-                        for item in self.db
-                            .iterator_cf_opt(cf, opts, IteratorMode::From(&start, Direction::Forward))
-                        {
+                        for item in self.db.iterator_cf_opt(
+                            cf,
+                            opts,
+                            IteratorMode::From(&start, Direction::Forward),
+                        ) {
                             let (k, _) = item.map_err(to_err)?;
                             wb.delete_cf(cf, &k);
                         }
@@ -504,11 +500,9 @@ impl StorageBackend for RocksDbBackend {
             let mut opts = ReadOptions::default();
             opts.set_iterate_upper_bound(ub.clone());
 
-            let iter = self.db.iterator_cf_opt(
-                cf,
-                opts,
-                IteratorMode::From(&prefix, Direction::Forward),
-            );
+            let iter =
+                self.db
+                    .iterator_cf_opt(cf, opts, IteratorMode::From(&prefix, Direction::Forward));
             for item in iter {
                 let (k, _) = item.map_err(to_err)?;
                 if !k.starts_with(&prefix) {
@@ -536,11 +530,9 @@ impl StorageBackend for RocksDbBackend {
             let mut opts = ReadOptions::default();
             opts.set_iterate_upper_bound(ub);
 
-            let iter = self.db.iterator_cf_opt(
-                cf,
-                opts,
-                IteratorMode::From(&prefix, Direction::Forward),
-            );
+            let iter =
+                self.db
+                    .iterator_cf_opt(cf, opts, IteratorMode::From(&prefix, Direction::Forward));
             for item in iter {
                 let (k, _) = item.map_err(to_err)?;
                 if !k.starts_with(&prefix) {
@@ -687,10 +679,11 @@ mod tests {
         assert_eq!(blk, 1000);
 
         // At-or-before nothing
-        assert!(b
-            .get_reducer_state_at_or_before("pnl", &gk, 999)
-            .unwrap()
-            .is_none());
+        assert!(
+            b.get_reducer_state_at_or_before("pnl", &gk, 999)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -733,8 +726,7 @@ mod tests {
         let gk1 = encode_group_key(&[Value::String("alice".into())]);
         let gk2 = encode_group_key(&[Value::String("bob".into())]);
 
-        b.put_reducer_state("r", &gk1, 100, b"alice_state")
-            .unwrap();
+        b.put_reducer_state("r", &gk1, 100, b"alice_state").unwrap();
         b.put_reducer_state("r", &gk2, 100, b"bob_state").unwrap();
 
         b.delete_reducer_states_after("r", &gk1, 99).unwrap();

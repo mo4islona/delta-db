@@ -24,7 +24,7 @@ pub struct GroupBatch {
 /// reading and mutating state, and producing output (emit) rows.
 ///
 /// Returns Vec<RowMap> since Lua reducers can emit multiple rows per input.
-pub trait ReducerRuntime: Send + Sync {
+pub trait ReducerRuntime: Send {
     /// Process one input row against the current state.
     ///
     /// - `state`: mutable reducer state (read + write)
