@@ -19,6 +19,7 @@ smallvec = { version = "1", features = ["serde"] }
 rayon = "1"
 napi = { version = "2", features = ["napi9", "serde-json"], optional = true }
 napi-derive = { version = "2", optional = true }
+ethnum = "1.5.2"
 
 [build-dependencies]
 napi-build = { version = "2", optional = true }

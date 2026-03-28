@@ -182,6 +182,15 @@ impl ReducerEngine {
         matches!(self.def.body, ReducerBody::External { .. })
     }
 
+    /// True when calling process would panic: the reducer uses LANGUAGE EXTERNAL,
+    /// the runtime hasn't been replaced (still ExternalRuntime), and no JS
+    /// context is installed on the current thread.
+    pub fn needs_host_callback(&self) -> bool {
+        self.is_external()
+            && self.runtime.use_batched_processing() // ExternalRuntime returns true, FnReducer returns false
+            && !crate::reducer_runtime::external::context_installed()
+    }
+
     /// Replace the runtime (used to inject external/fn runtimes after construction).
     pub fn set_runtime(&mut self, runtime: Box<dyn ReducerRuntime>) {
         self.runtime = runtime;
@@ -1056,5 +1065,35 @@ mod tests {
             .filter(|r| r.get("user") == Some(&Value::String("bob".into())))
             .collect();
         assert_eq!(bob_out[0].get("position_size"), Some(&Value::Float64(5.0)));
+    }
+
+    /// needs_host_callback() must be true for ExternalRuntime without JS context,
+    /// and false after set_runtime replaces it with FnReducer.
+    #[test]
+    fn needs_host_callback_tracks_runtime_and_context() {
+        let def = ReducerDef {
+            name: "ext".to_string(),
+            source: "t".to_string(),
+            group_by: vec![],
+            state: vec![],
+            requires: vec![],
+            body: ReducerBody::External {
+                id: "ext".to_string(),
+            },
+        };
+        let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let reg = ColumnRegistry::new(vec![]);
+        let mut engine = ReducerEngine::new(def, storage, &reg, &[]);
+
+        // ExternalRuntime + no JS context → needs callback (would panic)
+        assert!(engine.needs_host_callback());
+        assert!(engine.is_external());
+
+        // Replace with FnReducer → no longer needs callback
+        engine.set_runtime(Box::new(
+            crate::reducer_runtime::fn_reducer::FnReducerRuntime::new(|_state, _row| vec![]),
+        ));
+        assert!(!engine.needs_host_callback());
+        assert!(engine.is_external()); // def.body unchanged
     }
 }
