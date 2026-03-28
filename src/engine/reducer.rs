@@ -224,7 +224,6 @@ impl ReducerEngine {
                 let state = self.load_state(&group_key_bytes)?;
                 self.state_cache.insert(group_key_bytes.clone(), state);
             }
-
             let state = self.state_cache.get_mut(&group_key_bytes).unwrap();
 
             // Call the runtime
@@ -374,6 +373,11 @@ impl ReducerEngine {
     /// Restores state from in-memory block snapshots.
     /// Returns the number of groups affected.
     pub fn rollback(&mut self, fork_point: BlockNumber) -> Result<usize> {
+        // Guard: fork_point + 1 would overflow u64::MAX to 0, causing split_off(&0)
+        // to remove the entire map. MAX is a valid no-op: nothing exists after it.
+        if fork_point == BlockNumber::MAX {
+            return Ok(0);
+        }
         // Use BTreeMap split_off for O(log N) range extraction
         let rolled_back = self.block_groups.split_off(&(fork_point + 1));
 

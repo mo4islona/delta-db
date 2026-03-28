@@ -199,15 +199,22 @@ impl ReducerRuntime for LuaRuntime {
             .lua
             .registry_value(&self.row_key)
             .expect("failed to get row table");
+        // Clear all existing row fields to prevent stale values leaking across rows.
+        // Rows may have different registries, so iter_all() alone isn't sufficient.
+        for pair in row_table.clone().pairs::<mlua::String, LuaValue>() {
+            if let Ok((k, _)) = pair {
+                row_table
+                    .raw_set(k, LuaValue::Nil)
+                    .expect("failed to clear row field");
+            }
+        }
         if self.accessed_fields.is_empty() {
-            // No filtering: set all non-null fields
             for (k, v) in row.iter() {
                 row_table
                     .raw_set(k, value_to_lua(&self.lua, v).unwrap())
                     .expect("failed to set row field");
             }
         } else {
-            // Optimized: iterate all fields but skip C API calls for unused ones
             for (k, v) in row.iter() {
                 if self.accessed_fields.contains(k) {
                     row_table
@@ -381,6 +388,7 @@ fn sandbox(lua: &Lua) -> LuaResult<()> {
     // Remove dangerous modules/functions
     for name in &[
         "os", "io", "debug", "loadfile", "dofile", "load", "rawget", "rawset",
+        "require", "package",
     ] {
         globals.set(*name, mlua::Value::Nil)?;
     }
@@ -420,8 +428,15 @@ fn lua_table_to_value_map(table: &mlua::Table) -> LuaResult<HashMap<String, Valu
 
 fn value_to_lua(lua: &Lua, val: &Value) -> LuaResult<LuaValue> {
     match val {
-        Value::UInt64(v) => Ok(LuaValue::Number(*v as f64)),
-        Value::Int64(v) => Ok(LuaValue::Number(*v as f64)),
+        Value::UInt64(v) => {
+            if *v <= i64::MAX as u64 {
+                Ok(LuaValue::Integer(*v as i64))
+            } else {
+                // Values > i64::MAX cannot be represented as Lua integer; use f64 (lossy for > 2^53)
+                Ok(LuaValue::Number(*v as f64))
+            }
+        }
+        Value::Int64(v) => Ok(LuaValue::Integer(*v)),
         Value::Float64(v) => Ok(LuaValue::Number(*v)),
         Value::String(v) => Ok(LuaValue::String(lua.create_string(v)?)),
         Value::DateTime(v) => Ok(LuaValue::Number(*v as f64)),
@@ -539,7 +554,16 @@ fn json_value_to_lua(lua: &Lua, val: &serde_json::Value) -> LuaResult<LuaValue> 
     match val {
         serde_json::Value::Null => Ok(LuaValue::Nil),
         serde_json::Value::Bool(b) => Ok(LuaValue::Boolean(*b)),
-        serde_json::Value::Number(n) => Ok(LuaValue::Number(n.as_f64().unwrap_or(0.0))),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(LuaValue::Integer(i))
+            } else if let Some(f) = n.as_f64() {
+                Ok(LuaValue::Number(f))
+            } else {
+                // u64 > i64::MAX: lossy but better than silent 0.0
+                Ok(LuaValue::Number(n.as_u64().unwrap_or(0) as f64))
+            }
+        }
         serde_json::Value::String(s) => Ok(LuaValue::String(lua.create_string(s)?)),
         serde_json::Value::Array(arr) => {
             let table = lua.create_table()?;
@@ -774,6 +798,22 @@ mod tests {
         assert_eq!(out.get("sandboxed"), Some(&Value::Int64(1)));
     }
 
+    /// Issue #17: Sandbox must block require and package to prevent escaping.
+    #[test]
+    fn lua_sandbox_blocks_require_and_package() {
+        let runtime = LuaRuntime::new(
+            r#"
+            if require == nil and package == nil then
+                emit.sandboxed = 1
+            end
+            "#,
+        );
+        let mut state = HashMap::new();
+        let row = Row::from(RowMap::new());
+        let out = runtime.process(&mut state, &row).into_iter().next().unwrap();
+        assert_eq!(out.get("sandboxed"), Some(&Value::Int64(1)));
+    }
+
     #[test]
     fn lua_string_comparison() {
         let runtime = LuaRuntime::new(
@@ -818,11 +858,11 @@ mod tests {
         let results = runtime.process(&mut state, &row);
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].get("name"), Some(&Value::String("a".into())));
-        assert_eq!(results[0].get("value"), Some(&Value::Float64(1.0)));
+        assert_eq!(results[0].get("value"), Some(&Value::Int64(1)));
         assert_eq!(results[1].get("name"), Some(&Value::String("b".into())));
-        assert_eq!(results[1].get("value"), Some(&Value::Float64(2.0)));
+        assert_eq!(results[1].get("value"), Some(&Value::Int64(2)));
         assert_eq!(results[2].get("name"), Some(&Value::String("c".into())));
-        assert_eq!(results[2].get("value"), Some(&Value::Float64(3.0)));
+        assert_eq!(results[2].get("value"), Some(&Value::Int64(3)));
     }
 
     #[test]
@@ -1079,5 +1119,53 @@ mod tests {
         let row2 = Row::from(HashMap::from([("value".to_string(), Value::Float64(3.0))]));
         let out2 = runtime.process(&mut state, &row2);
         assert_eq!(out2[0].get("result"), Some(&Value::Float64(16.0)));
+    }
+
+    /// Issue #16: Int64 values must be passed as Lua integers, not lossy f64.
+    #[test]
+    fn lua_int64_precision() {
+        let runtime = LuaRuntime::new(
+            r#"
+            emit.result = row.big
+            "#,
+        );
+        let mut state = HashMap::new();
+        // 2^53 + 1 = 9007199254740993, loses precision as f64
+        let big: i64 = (1i64 << 53) + 1;
+        let row = Row::from(HashMap::from([
+            ("big".to_string(), Value::Int64(big)),
+        ]));
+        let out = runtime.process(&mut state, &row).into_iter().next().unwrap();
+        assert_eq!(out.get("result"), Some(&Value::Int64(big)),
+            "Int64 value should roundtrip through Lua without precision loss");
+    }
+
+    /// Issue #10: Null fields in a row must not retain stale values from previous rows.
+    #[test]
+    fn lua_null_row_fields_do_not_leak() {
+        let runtime = LuaRuntime::new(
+            r#"
+            if row.optional ~= nil then
+                emit.saw = row.optional
+            else
+                emit.saw = "nil"
+            end
+            "#,
+        );
+
+        let mut state = HashMap::new();
+
+        // Row 1: has "optional" field
+        let row1 = Row::from(HashMap::from([
+            ("optional".to_string(), Value::String("present".into())),
+        ]));
+        let out1 = runtime.process(&mut state, &row1).into_iter().next().unwrap();
+        assert_eq!(out1.get("saw"), Some(&Value::String("present".into())));
+
+        // Row 2: does NOT have "optional" field — it must be nil, not "present"
+        let row2 = Row::from(HashMap::new());
+        let out2 = runtime.process(&mut state, &row2).into_iter().next().unwrap();
+        assert_eq!(out2.get("saw"), Some(&Value::String("nil".into())),
+            "Null field should be nil in Lua, not stale value from previous row");
     }
 }
