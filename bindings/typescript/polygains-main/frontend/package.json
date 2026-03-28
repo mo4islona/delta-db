@@ -1,0 +1,27 @@
+{
+	"name": "polygains-frontend",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "bun --hot src/index.ts",
+		"build": "NODE_ENV=production BUN_PUBLIC_API_BASE_URL=https://api.polygains.com bun build.ts --outdir=./../public/dist --minify --sourcemap=linked",
+		"start": "NODE_ENV=production bun src/index.ts",
+		"lint": "biome lint .",
+		"lint:fix": "biome check --write --unsafe .",
+		"deploy": "bun run build && wrangler pages deploy ../public/dist --project-name=polygains"
+	},
+	"dependencies": {
+		"bun-plugin-tailwind": "^0.1.2",
+		"daisyui": "^5.5.18",
+		"preact": "^10.28.3",
+		"react": "npm:@preact/compat",
+		"react-dom": "npm:@preact/compat",
+		"swr": "^2.4.0",
+		"tailwindcss": "^4.1.11"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.3.15",
+		"@types/bun": "latest"
+	}
+}

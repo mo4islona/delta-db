@@ -1,0 +1,31 @@
+{
+	"$schema": "https://biomejs.dev/",
+	"linter": {
+		"enabled": true,
+		"rules": {
+			"recommended": true
+		}
+	},
+	"files": {
+		"ignoreUnknown": true,
+		"includes": [
+			"**",
+			"!**/dist",
+			"!**/node_modules",
+			"!**/build",
+			"!**/public",
+			"!**/dist",
+			"!**/tmp"
+		]
+	},
+	"javascript": {
+		"formatter": {
+			"quoteStyle": "double"
+		}
+	},
+	"css": {
+		"parser": {
+			"tailwindDirectives": true
+		}
+	}
+}

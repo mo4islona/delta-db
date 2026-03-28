@@ -1,0 +1,31 @@
+{
+  "name": "poly-sqd-ts",
+  "module": "src/main.ts",
+  "type": "module",
+  "scripts": {
+    "lint": "biome lint .",
+    "lint:fix": "biome check --write --unsafe .",
+    "start:api": "bun src/services/server.ts",
+    "start:markets": "bun src/services/markets.ts",
+    "start:pipeline": "bun src/main.ts",
+    "dev:api": "bun --watch src/services/server.ts",
+    "dev:markets": "bun --watch src/services/markets.ts",
+    "dev:pipeline": "bun --watch src/main.ts"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.3.15",
+    "@playwright/test": "^1.58.2",
+    "@types/bun": "latest",
+    "drizzle-kit": "^0.31.9",
+    "drizzle-orm": "^0.45.1",
+    "node-gyp": "^12.2.0"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@subsquid/pipes": "^0.1.0-beta.16",
+    "bloomfilter": "^1.0.0",
+    "heap-js": "^2.7.1"
+  }
+}

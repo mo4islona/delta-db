@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en" data-theme="terminal">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <title>PolyGains | Polymarket Insider & Whale Trading Terminal</title>
+  <meta name="description"
+    content="Real-time Polymarket insider trading detection, whale alerts, and advanced market analytics terminal. Track suspicious order flow, whale wallets, and high-conviction trades." />
+  <meta name="keywords"
+    content="Polymarket, prediction markets, insider trading, whale alerts, crypto analytics, trading terminal, Polygon, market analysis, real-time alerts" />
+  <meta name="author" content="PolyGains" />
+  <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1" />
+  <meta name="googlebot" content="index, follow" />
+  <meta name="revisit-after" content="1 days" />
+
+  <link rel="canonical" href="https://polygains.com/" />
+
+  <link rel="preconnect" href="/api" />
+
+  <link rel="icon" type="image/svg+xml"
+    href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='12' fill='%230a0a0c'/%3E%3Ctext x='50' y='68' font-size='55' text-anchor='middle' font-family='monospace' fill='%2310b981'%3E%E2%97%86%3C/text%3E%3C/svg%3E" />
+  <link rel="icon" type="image/x-icon" href="./../public/assets/favicon/favicon.ico" />
+  <link rel="icon" type="image/png" sizes="16x16" href="./../public/assets/favicon/favicon-16x16.png" />
+  <link rel="icon" type="image/png" sizes="32x32" href="./../public/assets/favicon/favicon-32x32.png" />
+  <link rel="apple-touch-icon" sizes="180x180" href="./../public/assets/favicon/apple-touch-icon.png" />
+
+  <meta name="theme-color" content="#0a0a0c" />
+  <meta name="msapplication-TileColor" content="#0a0a0c" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="PolyGains" />
+
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="PolyGains" />
+  <meta property="og:title" content="PolyGains - Polymarket Insider & Whale Alerts Terminal" />
+  <meta property="og:description"
+    content="Track suspicious Polymarket order flow, whale wallets, and high-conviction trades with real-time alerts and market analytics terminal." />
+  <meta property="og:url" content="https://polygains.com/" />
+  <meta property="og:image" content="https://polygains.com/assets/metacard.jpg" />
+  <meta property="og:image:type" content="image/jpeg" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt"
+    content="PolyGains - Real-time Polymarket analytics terminal for insider trading detection and whale alerts" />
+
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:site" content="@mevtools" />
+  <meta name="twitter:creator" content="@mevtools" />
+  <meta name="twitter:title" content="PolyGains - Polymarket Insider & Whale Alerts Terminal" />
+  <meta name="twitter:description"
+    content="Track suspicious Polymarket order flow, whale wallets, and high-conviction trades with real-time alerts and market analytics terminal." />
+  <meta name="twitter:image" content="https://polygains.com/assets/metacard.jpg" />
+  <meta name="twitter:image:alt" content="PolyGains - Real-time Polymarket analytics terminal" />
+
+  <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "Organization",
+      "name": "PolyGains",
+      "url": "https://polygains.com",
+      "logo": "https://polygains.com/assets/android-chrome-512x512.png",
+      "sameAs": [
+        "https://twitter.com/mevtools"
+      ]
+    }
+    </script>
+
+  <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "WebSite",
+      "name": "PolyGains",
+      "url": "https://polygains.com",
+      "potentialAction": {
+        "@type": "SearchAction",
+        "target": "https://polygains.com/?search={search_term_string}",
+        "query-input": "required name=search_term_string"
+      }
+    }
+    </script>
+
+  <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "WebApplication",
+      "name": "PolyGains",
+      "description": "Real-time Polymarket insider trading detection, whale alerts, and advanced market analytics terminal.",
+      "url": "https://polygains.com",
+      "applicationCategory": "FinanceApplication",
+      "operatingSystem": "Web Browser",
+      "browserRequirements": "Requires JavaScript. Requires HTML5.",
+      "offers": {
+        "@type": "Offer",
+        "price": "0",
+        "priceCurrency": "USD"
+      }
+    }
+    </script>
+
+  <style>
+    /* Base Terminal Theme */
+    html,
+    body {
+      background: #0a0a0c;
+      color: #e1e1e6;
+      margin: 0;
+      padding: 0;
+      font-family: monospace;
+    }
+
+    /* SEO Content Styling (Hidden once React mounts if desired, or replaced) */
+    .seo-content {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 3rem 1.5rem;
+    }
+
+    .seo-hero {
+      text-align: center;
+      margin-bottom: 3rem;
+    }
+
+    .seo-logo {
+      font-size: 2.5rem;
+      font-weight: 700;
+      margin-bottom: 1rem;
+      color: #10b981;
+      text-shadow: 0 0 20px rgba(16, 185, 129, 0.5);
+    }
+
+    .seo-title {
+      font-size: 1.75rem;
+      margin-bottom: 1rem;
+      color: #fff;
+    }
+
+    .seo-description {
+      font-size: 1.125rem;
+      color: #9ca3af;
+      max-width: 600px;
+      margin: 0 auto 2rem;
+    }
+
+    .seo-section {
+      margin-bottom: 2.5rem;
+    }
+
+    .seo-section h2 {
+      color: #10b981;
+      font-size: 1.25rem;
+      margin-bottom: 1rem;
+      border-bottom: 1px solid #10b981;
+      padding-bottom: 0.5rem;
+    }
+
+    .seo-section p {
+      color: #9ca3af;
+      margin-bottom: 1rem;
+      line-height: 1.6;
+    }
+
+    .seo-section ul {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+
+    .seo-section li {
+      padding: 0.5rem 0;
+      padding-left: 1.5rem;
+      position: relative;
+      color: #d1d5db;
+    }
+
+    .seo-section li::before {
+      content: "▸";
+      position: absolute;
+      left: 0;
+      color: #10b981;
+    }
+
+    .seo-cta {
+      background: rgba(16, 185, 129, 0.1);
+      border: 1px solid #10b981;
+      border-radius: 8px;
+      padding: 1.5rem;
+      text-align: center;
+      margin-top: 2rem;
+    }
+
+    .noscript-warning {
+      background: rgba(239, 68, 68, 0.1);
+      border: 1px solid #ef4444;
+      border-radius: 8px;
+      padding: 1rem;
+      margin-top: 2rem;
+      color: #ef4444;
+      text-align: center;
+    }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="root">
+    <main class="seo-content">
+      <article class="seo-hero">
+        <h1 class="seo-logo">Polygains</h1>
+        <h2 class="seo-title">Polymarket Insider & Whale Alerts in Real Time</h2>
+        <p class="seo-description">
+          Track suspicious Polymarket order flow, whale wallets, and high-conviction trades
+          with real-time alerts and market analytics.
+        </p>
+      </article>
+
+      <section class="seo-section">
+        <h2>Platform Features</h2>
+        <ul>
+          <li>Real-time insider trading detection on Polymarket prediction markets</li>
+          <li>Whale wallet tracking and position analytics</li>
+          <li>Live market statistics, odds, and liquidity monitoring</li>
+          <li>Historical trade data and fill-size analysis</li>
+          <li>Automated alerts for suspicious trading patterns</li>
+          <li>High-conviction trade signals from top performers</li>
+        </ul>
+      </section>
+
+      <section class="seo-section">
+        <h2>About Polymarket Analytics</h2>
+        <p>
+          Polymarket is the leading prediction market platform where users trade on the outcome
+          of real-world events. Polygains provides advanced analytics to identify unusual trading
+          activity, track large position holders (whales), and detect potential insider trading
+          patterns before they become public knowledge.
+        </p>
+        <p>
+          Our platform monitors the Polymarket CTF Exchange contract on Polygon, analyzing
+          every matched order to surface meaningful signals for traders and researchers.
+        </p>
+      </section>
+
+      <div class="seo-cta">
+        <h3>Initializing Terminal...</h3>
+        <p>Please enable JavaScript to access real-time dashboards and live alerts.</p>
+      </div>
+
+      <noscript>
+        <div class="noscript-warning">
+          <strong>JavaScript Required</strong>
+          <p>
+            This application requires JavaScript to display real-time market data, interactive charts,
+            and live trading alerts.
+          </p>
+        </div>
+      </noscript>
+    </main>
+  </div>
+
+  <a href="#root" class="sr-only">Skip to main content</a>
+
+  <script type="module" src="./frontend.tsx"></script>
+</body>
+
+</html>

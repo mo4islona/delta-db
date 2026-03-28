@@ -1,0 +1,14 @@
+export const START_BLOCK = 35_000_000;
+export const USDC_DENOMINATOR = 1_000_000n;
+export const BLOOM_SYNC_INTERVAL_MS = 15 * 60 * 1000;
+export const VOLUME_THRESHOLD = 4_000n * USDC_DENOMINATOR;
+export const CONTRACTS = Object.freeze({
+	EXCHANGE: "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
+	// NEG_RISK_EXCHANGE: "0xC5d563A36AE78145C45a50134d48A1215220f80a",
+	// CONDITIONAL_TOKENS: "0x4d97dcd97ec945f40cf65f87097ace5ea0476045",
+});
+export const FIFTEEN_MINUTES = 15 * 60; // 900 seconds
+export const MIN_PRICE = 0.95;
+export const BPS_SCALE = 10000n;
+export const MIN_PRICE_BPS = (10000n / 100n) * 95n;
+export const UPSERT_CHUNK_SIZE = 1_000;

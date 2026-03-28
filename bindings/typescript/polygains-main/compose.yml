@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: postgres:18
+    env_file:
+      - compose.env.local
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 7G
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    # TCP port bound to localhost only (not public)
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5469}:5432"
+    shm_size: '1gb'
+    volumes:
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - postgres_data:/var/lib/postgresql/data
+      - ./.pgsocket:/var/run/postgresql
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+ 
+
+volumes:
+  postgres_data:
