@@ -131,9 +131,11 @@ function runBenchmark(name: string, db: DeltaDb, rows: Trade[], batchSize: numbe
   const start = performance.now()
   for (let block = 0; block * batchSize < totalRows; block++) {
     const batch = rows.slice(block * batchSize, (block + 1) * batchSize)
-    db.processBatch('trades', block, batch)
+    db.ingest({
+      data: { trades: batch },
+      finalizedHead: { number: block, hash: `0x${block}` },
+    })
   }
-  db.flush()
   const elapsed = performance.now() - start
 
   return {

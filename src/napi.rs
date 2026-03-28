@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
+use napi::NapiRaw;
 use napi::bindgen_prelude::*;
 use napi::sys;
-use napi::NapiRaw;
 use napi_derive::napi;
 
 use crate::db::{Config, DeltaDb as DeltaDbInner, IngestInput as IngestInputInner};
-use crate::msgpack_conv::{decode_data_from_msgpack, decode_rows_from_msgpack, encode_batch_to_msgpack};
+use crate::msgpack_conv::{decode_data_from_msgpack, encode_batch_to_msgpack};
 use crate::reducer_runtime::external::install_context;
 use crate::schema::ast::{ReducerBody, ReducerDef, StateField};
 use crate::types::{BlockCursor, ColumnType};
@@ -94,9 +94,8 @@ impl DeltaDb {
             cfg = cfg.max_buffer_size(max as usize);
         }
 
-        let inner = DeltaDbInner::open(cfg).map_err(|e| {
-            Error::new(Status::GenericFailure, format!("{e}"))
-        })?;
+        let inner = DeltaDbInner::open(cfg)
+            .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;
 
         Ok(Self {
             inner,
@@ -120,14 +119,15 @@ impl DeltaDb {
     ) -> Result<()> {
         // Create a raw napi_ref to prevent GC of the callback
         let mut raw_ref: sys::napi_ref = std::ptr::null_mut();
-        let status = unsafe {
-            sys::napi_create_reference(env.raw(), callback.raw(), 1, &mut raw_ref)
-        };
+        let status =
+            unsafe { sys::napi_create_reference(env.raw(), callback.raw(), 1, &mut raw_ref) };
         if status != sys::Status::napi_ok {
-            return Err(Error::new(Status::GenericFailure, "failed to create callback reference"));
+            return Err(Error::new(
+                Status::GenericFailure,
+                "failed to create callback reference",
+            ));
         }
-        self.external_callbacks
-            .insert(config.name.clone(), raw_ref);
+        self.external_callbacks.insert(config.name.clone(), raw_ref);
 
         // If the reducer already exists in the engine (defined via SQL with
         // LANGUAGE EXTERNAL), we only need to store the callback — the
@@ -152,9 +152,7 @@ impl DeltaDb {
                 source: config.source,
                 group_by: config.group_by,
                 state: state_fields,
-                body: ReducerBody::External {
-                    id: config.name,
-                },
+                body: ReducerBody::External { id: config.name },
                 requires: vec![],
             };
 
@@ -167,53 +165,15 @@ impl DeltaDb {
     }
 
     /// Process a batch of rows for a raw table.
-    /// `rows` is a msgpack-encoded Buffer: `[{col: val, ...}, ...]`.
-    /// Returns true if backpressure should be applied.
-    #[napi]
-    pub fn process_batch(
-        &mut self,
-        env: Env,
-        table: String,
-        block: u32,
-        rows: Buffer,
-    ) -> Result<bool> {
-        let rows = decode_rows_from_msgpack(&rows)
-            .map_err(|e| Error::new(Status::InvalidArg, e))?;
-
-        // Install external callback context for the duration of this call
-        let _guard = if !self.external_callbacks.is_empty() {
-            Some(install_context(env, &self.external_callbacks))
-        } else {
-            None
-        };
-
-        self.inner
-            .process_batch(&table, block as u64, rows)
-            .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))
-    }
-
-    /// Roll back all state after fork_point.
-    #[napi]
-    pub fn rollback(&mut self, fork_point: u32) -> Result<()> {
-        self.inner
-            .rollback(fork_point as u64)
-            .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))
-    }
-
-    /// Finalize all state up to and including the given block.
-    #[napi]
-    pub fn finalize(&mut self, block: u32) -> Result<()> {
-        self.inner
-            .finalize(block as u64)
-            .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))
-    }
+    // process_batch, rollback, finalize removed from public API:
+    // not crash-safe individually. Use ingest() which handles all three atomically.
 
     /// Atomic ingest: process all tables, store rollback chain, finalize, flush.
     /// Returns a msgpack-encoded DeltaBatch buffer, or null if no records produced.
     #[napi]
     pub fn ingest(&mut self, env: Env, input: IngestInput) -> Result<Option<Buffer>> {
-        let data = decode_data_from_msgpack(&input.data)
-            .map_err(|e| Error::new(Status::InvalidArg, e))?;
+        let data =
+            decode_data_from_msgpack(&input.data).map_err(|e| Error::new(Status::InvalidArg, e))?;
 
         let rollback_chain = input
             .rollback_chain
