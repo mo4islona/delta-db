@@ -5,6 +5,7 @@ use rustc_hash::FxHashMap;
 
 use crate::error::Result;
 use crate::reducer_runtime::event_rules::EventRulesRuntime;
+#[cfg(feature = "lua")]
 use crate::reducer_runtime::lua::LuaRuntime;
 use crate::reducer_runtime::{GroupBatch, ReducerRuntime};
 use crate::schema::ast::{ReducerBody, ReducerDef};
@@ -84,6 +85,7 @@ impl ReducerEngine {
     ) -> Box<dyn ReducerRuntime> {
         match &def.body {
             ReducerBody::EventRules { .. } => Box::new(EventRulesRuntime::new(&def.body)),
+            #[cfg(feature = "lua")]
             ReducerBody::Lua { script } => {
                 let required_modules: Vec<(String, String)> = def
                     .requires
@@ -103,6 +105,12 @@ impl ReducerEngine {
                     source_registry.names(),
                     &required_modules,
                 ))
+            }
+            #[cfg(not(feature = "lua"))]
+            ReducerBody::Lua { .. } => {
+                // The schema parser already rejects Lua bodies when the lua feature is
+                // disabled, so this branch is unreachable in normal usage.
+                unreachable!("Lua reducer body reached without lua feature — schema parser should have rejected it");
             }
             ReducerBody::External { id } => Box::new(
                 crate::reducer_runtime::external::ExternalRuntime::new(id.clone()),

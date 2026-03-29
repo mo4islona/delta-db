@@ -39,6 +39,15 @@ impl From<BlockCursor> for DeltaDbCursor {
     }
 }
 
+/// Result of `handleFork()`.
+#[napi(object)]
+pub struct ForkResultJs {
+    /// The block to resume ingestion from (highest common ancestor).
+    pub cursor: DeltaDbCursor,
+    /// Compensating delta batch (msgpack-encoded), or null if nothing was rolled back.
+    pub batch: Option<Buffer>,
+}
+
 /// Input for the atomic `ingest()` method.
 #[napi(object)]
 pub struct IngestInput {
@@ -234,6 +243,45 @@ impl DeltaDb {
         blocks.sort_unstable_by_key(|(n, _)| std::cmp::Reverse(*n));
         let refs: Vec<(u64, &str)> = blocks.iter().map(|(n, h)| (*n, h.as_str())).collect();
         self.inner.resolve_fork_cursor(&refs).map(|c| c.into())
+    }
+
+    /// Atomically handle a fork (409 from Portal).
+    ///
+    /// Finds the common ancestor in `previousBlocks`, rolls back all state after
+    /// that point, and returns the cursor to resume from plus any compensating
+    /// delta batch (msgpack-encoded). Uses the internal finalized block — no need
+    /// to pass it in.
+    ///
+    /// Throws if no common ancestor is found (fork too deep / unrecoverable).
+    #[napi]
+    pub fn handle_fork(
+        &mut self,
+        env: Env,
+        previous_blocks: Vec<DeltaDbCursor>,
+    ) -> napi::Result<ForkResultJs> {
+        let mut chain: Vec<crate::types::BlockCursor> = previous_blocks
+            .into_iter()
+            .map(|c| crate::types::BlockCursor {
+                number: c.number as u64,
+                hash: c.hash,
+            })
+            .collect();
+        // Sort DESC so we find the HIGHEST common ancestor first
+        chain.sort_unstable_by_key(|c| std::cmp::Reverse(c.number));
+
+        let result = self
+            .inner
+            .handle_fork(chain)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+        let batch = result
+            .batch
+            .map(|b| Buffer::from(encode_batch_to_msgpack(&b)));
+
+        Ok(ForkResultJs {
+            cursor: result.cursor.into(),
+            batch,
+        })
     }
 
     /// Flush buffered deltas into a msgpack-encoded batch.
