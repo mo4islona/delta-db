@@ -58,6 +58,7 @@ export declare class DeltaDb {
    */
   registerReducer(config: ExternalReducerConfig, callback: (...args: any[]) => any): void
   /**
+   * Process a batch of rows for a raw table.
    * Atomic ingest: process all tables, store rollback chain, finalize, flush.
    * Returns a msgpack-encoded DeltaBatch buffer, or null if no records produced.
    */

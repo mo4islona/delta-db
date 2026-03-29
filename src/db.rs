@@ -6,6 +6,7 @@ use crate::engine::dag::DeltaEngine;
 use crate::error::{Error, Result};
 use crate::schema::parser::parse_schema;
 use crate::storage::memory::MemoryBackend;
+#[cfg(feature = "rocksdb")]
 use crate::storage::rocks::RocksDbBackend;
 use crate::storage::{StorageBackend, StorageWriteBatch};
 use crate::types::{BlockCursor, BlockNumber, DeltaBatch, DeltaRecord, PerfNode, RowMap, Value};
@@ -89,8 +90,17 @@ impl DeltaDb {
 
         let storage: Arc<dyn StorageBackend> = if let Some(s) = config.storage {
             s
-        } else if let Some(ref dir) = config.data_dir {
-            Arc::new(RocksDbBackend::open(dir)?)
+        } else if let Some(ref _dir) = config.data_dir {
+            #[cfg(feature = "rocksdb")]
+            {
+                Arc::new(RocksDbBackend::open(_dir)?)
+            }
+            #[cfg(not(feature = "rocksdb"))]
+            {
+                return Err(Error::InvalidOperation(
+                    "RocksDB requires the 'rocksdb' feature".into(),
+                ));
+            }
         } else {
             Arc::new(MemoryBackend::new())
         };
@@ -365,8 +375,9 @@ impl DeltaDb {
                     };
 
                     if fork_point < current_latest {
-                        let deltas =
-                            self.engine.rollback_to_batch(fork_point, &mut write_batch)?;
+                        let deltas = self
+                            .engine
+                            .rollback_to_batch(fork_point, &mut write_batch)?;
                         pending_deltas.push((deltas, vec![]));
                     }
                     fork_point
