@@ -67,6 +67,14 @@ pub struct IngestInput {
     pub finalized_head: BlockCursor,
 }
 
+/// Result of `handle_fork()`.
+pub struct ForkResult {
+    /// The block to resume ingestion from (highest common ancestor).
+    pub cursor: BlockCursor,
+    /// Compensating delta batch (rollback deltas), if any state was rolled back.
+    pub batch: Option<DeltaBatch>,
+}
+
 // Metadata keys for persistence
 const META_LATEST_BLOCK: &str = "latest_block";
 const META_FINALIZED_BLOCK: &str = "finalized_block";
@@ -319,6 +327,58 @@ impl DeltaDb {
         previous_blocks: &[(BlockNumber, &str)],
     ) -> Option<BlockCursor> {
         self.engine.resolve_fork_cursor(previous_blocks)
+    }
+
+    /// Atomically handle a fork (409 from Portal).
+    ///
+    /// Finds the highest common ancestor in `rollback_chain`, rolls back all
+    /// state after that point, commits compensating deltas and updated metadata
+    /// atomically, and returns the cursor to resume from plus any delta batch.
+    ///
+    /// Uses the current internal finalized block — no need to pass it in.
+    ///
+    /// Returns `Err` if no common ancestor is found (fork too deep / unrecoverable).
+    pub fn handle_fork(&mut self, rollback_chain: Vec<BlockCursor>) -> Result<ForkResult> {
+        let previous_blocks: Vec<(BlockNumber, &str)> = rollback_chain
+            .iter()
+            .map(|c| (c.number, c.hash.as_str()))
+            .collect();
+
+        let cursor = self
+            .engine
+            .resolve_fork_cursor(&previous_blocks)
+            .ok_or_else(|| {
+                Error::InvalidOperation(
+                    "Fork too deep: no common ancestor found in block hashes".into(),
+                )
+            })?;
+
+        let mut write_batch = StorageWriteBatch::new();
+        let deltas = self
+            .engine
+            .rollback_to_batch(cursor.number, &mut write_batch)?;
+
+        // Store the new rollback chain and persist atomically
+        let chain: Vec<(BlockNumber, String)> = rollback_chain
+            .iter()
+            .map(|c| (c.number, c.hash.clone()))
+            .collect();
+        self.engine.set_rollback_chain(&chain);
+
+        self.append_meta_to_batch(&mut write_batch)?;
+        self.storage.commit(&write_batch)?;
+
+        self.buffer.push(
+            deltas,
+            self.engine.finalized_cursor(),
+            self.engine.latest_cursor(),
+            vec![],
+        );
+        self.buffer
+            .set_heads(self.engine.finalized_cursor(), self.engine.latest_cursor());
+
+        let batch = self.buffer.flush();
+        Ok(ForkResult { cursor, batch })
     }
 
     /// Atomic ingest: process all tables, store rollback chain, finalize, flush.

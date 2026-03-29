@@ -52,8 +52,7 @@ impl DeltaDb {
         state: JsValue,
         callback: Function,
     ) -> Result<(), JsError> {
-        let group_by: Vec<String> =
-            serde_wasm_bindgen::from_value(group_by).map_err(to_js_err)?;
+        let group_by: Vec<String> = serde_wasm_bindgen::from_value(group_by).map_err(to_js_err)?;
         let state_fields: Vec<WasmStateField> =
             serde_wasm_bindgen::from_value(state).map_err(to_js_err)?;
 
@@ -78,7 +77,9 @@ impl DeltaDb {
                 source: source.to_string(),
                 group_by,
                 state,
-                body: ReducerBody::External { id: name.to_string() },
+                body: ReducerBody::External {
+                    id: name.to_string(),
+                },
                 requires: vec![],
             };
             self.inner.register_reducer(def).map_err(to_js_err)?;
@@ -90,8 +91,7 @@ impl DeltaDb {
     /// Atomic ingest: process all tables, finalize, and return delta batch.
     /// Input and output are plain JS objects — no msgpack encoding needed.
     pub fn ingest(&mut self, input: JsValue) -> Result<JsValue, JsError> {
-        let input: WasmIngestInput =
-            serde_wasm_bindgen::from_value(input).map_err(to_js_err)?;
+        let input: WasmIngestInput = serde_wasm_bindgen::from_value(input).map_err(to_js_err)?;
 
         // Convert plain JSON rows to typed RowMap — serde_wasm_bindgen gives us
         // serde_json::Value objects which json_object_to_row maps to our Value enum.
@@ -113,7 +113,10 @@ impl DeltaDb {
                 .rollback_chain
                 .unwrap_or_default()
                 .into_iter()
-                .map(|c| BlockCursor { number: c.number as u64, hash: c.hash })
+                .map(|c| BlockCursor {
+                    number: c.number as u64,
+                    hash: c.hash,
+                })
                 .collect(),
             finalized_head: BlockCursor {
                 number: input.finalized_head.number as u64,
@@ -160,7 +163,10 @@ impl DeltaDb {
     pub fn cursor(&self) -> JsValue {
         match self.inner.latest_cursor() {
             Some(c) => {
-                let cursor = WasmCursor { number: c.number as u32, hash: c.hash };
+                let cursor = WasmCursor {
+                    number: c.number as u32,
+                    hash: c.hash,
+                };
                 to_js(&cursor).unwrap_or(JsValue::NULL)
             }
             None => JsValue::NULL,
@@ -174,14 +180,62 @@ impl DeltaDb {
             serde_wasm_bindgen::from_value(previous_blocks).map_err(to_js_err)?;
         // Sort DESC so we return the highest common ancestor
         blocks.sort_unstable_by(|a, b| b.number.cmp(&a.number));
-        let refs: Vec<(u64, &str)> = blocks.iter().map(|c| (c.number as u64, c.hash.as_str())).collect();
+        let refs: Vec<(u64, &str)> = blocks
+            .iter()
+            .map(|c| (c.number as u64, c.hash.as_str()))
+            .collect();
         match self.inner.resolve_fork_cursor(&refs) {
             Some(c) => {
-                let cursor = WasmCursor { number: c.number as u32, hash: c.hash };
+                let cursor = WasmCursor {
+                    number: c.number as u32,
+                    hash: c.hash,
+                };
                 to_js(&cursor).map_err(to_js_err)
             }
             None => Ok(JsValue::NULL),
         }
+    }
+
+    /// Atomically handle a fork (409 from Portal).
+    ///
+    /// Finds the common ancestor in `previousBlocks`, rolls back all state after
+    /// that point, and returns `{ cursor, batch }`. Uses the internal finalized
+    /// block — no need to pass it in.
+    ///
+    /// Throws if no common ancestor is found (fork too deep / unrecoverable).
+    pub fn handle_fork(&mut self, previous_blocks: JsValue) -> Result<JsValue, JsError> {
+        let mut blocks: Vec<WasmCursor> =
+            serde_wasm_bindgen::from_value(previous_blocks).map_err(to_js_err)?;
+        // Sort DESC so we find the highest common ancestor
+        blocks.sort_unstable_by(|a, b| b.number.cmp(&a.number));
+
+        let chain: Vec<crate::types::BlockCursor> = blocks
+            .into_iter()
+            .map(|c| crate::types::BlockCursor {
+                number: c.number as u64,
+                hash: c.hash,
+            })
+            .collect();
+
+        let result = self.inner.handle_fork(chain).map_err(to_js_err)?;
+
+        let cursor = to_js(&WasmCursor {
+            number: result.cursor.number as u32,
+            hash: result.cursor.hash,
+        })
+        .map_err(to_js_err)?;
+
+        let batch = match result.batch {
+            Some(b) => to_js(&encode_batch_to_json_value(&b)).map_err(to_js_err)?,
+            None => JsValue::NULL,
+        };
+
+        let obj = js_sys::Object::new();
+        js_sys::Reflect::set(&obj, &"cursor".into(), &cursor)
+            .unwrap_throw();
+        js_sys::Reflect::set(&obj, &"batch".into(), &batch)
+            .unwrap_throw();
+        Ok(obj.into())
     }
 }
 

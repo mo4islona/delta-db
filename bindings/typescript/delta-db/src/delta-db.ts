@@ -98,6 +98,12 @@ export class DeltaDb {
     return this.#native.resolveForkCursor(previousBlocks)
   }
 
+  handleFork(previousBlocks: DeltaDbCursor[]): { cursor: DeltaDbCursor; batch: DeltaBatch | null } {
+    const result = this.#native.handleFork(previousBlocks)
+    const batch = result.batch ? (decode(result.batch) as DeltaBatch) : null
+    return { cursor: result.cursor, batch }
+  }
+
   flush(): DeltaBatch | null {
     const buf = this.#native.flush()
     return buf ? (decode(buf) as DeltaBatch) : null

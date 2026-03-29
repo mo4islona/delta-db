@@ -20,6 +20,13 @@ export interface DeltaDbCursor {
   number: number
   hash: string
 }
+/** Result of `handleFork()`. */
+export interface ForkResultJs {
+  /** The block to resume ingestion from (highest common ancestor). */
+  cursor: DeltaDbCursor
+  /** Compensating delta batch (msgpack-encoded), or null if nothing was rolled back. */
+  batch?: Buffer
+}
 /** Input for the atomic `ingest()` method. */
 export interface IngestInput {
   /** Table name → rows, msgpack-encoded as `{tableName: [{col: val}, ...], ...}`. */
@@ -68,6 +75,17 @@ export declare class DeltaDb {
    * Returns the matching block cursor, or null if no common ancestor found.
    */
   resolveForkCursor(previousBlocks: Array<DeltaDbCursor>): DeltaDbCursor | null
+  /**
+   * Atomically handle a fork (409 from Portal).
+   *
+   * Finds the common ancestor in `previousBlocks`, rolls back all state after
+   * that point, and returns the cursor to resume from plus any compensating
+   * delta batch (msgpack-encoded). Uses the internal finalized block — no need
+   * to pass it in.
+   *
+   * Throws if no common ancestor is found (fork too deep / unrecoverable).
+   */
+  handleFork(previousBlocks: Array<DeltaDbCursor>): ForkResultJs
   /**
    * Flush buffered deltas into a msgpack-encoded batch.
    * Returns null if no pending records.
