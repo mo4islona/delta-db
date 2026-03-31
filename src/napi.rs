@@ -26,7 +26,8 @@ pub struct DeltaDbConfig {
     /// Disable RocksDB automatic background compactions.
     pub disable_compaction: Option<bool>,
     /// Block cache size in bytes. Omit for RocksDB default (~8MB per CF), 0 to disable.
-    pub cache_size: Option<u32>,
+    /// Supports values up to i64::MAX (~9.2 EB). Negative values are rejected.
+    pub cache_size: Option<i64>,
 }
 
 /// Block cursor: number + hash.
@@ -101,7 +102,16 @@ impl DeltaDb {
         }
         cfg.compression = config.compression;
         cfg.disable_compaction = config.disable_compaction.unwrap_or(false);
-        cfg.cache_size = config.cache_size.map(|s| s as usize);
+        cfg.cache_size = match config.cache_size {
+            Some(s) if s < 0 => {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "cache_size must be non-negative",
+                ))
+            }
+            Some(s) => Some(s as usize),
+            None => None,
+        };
 
         let inner = DeltaDbInner::open(cfg)
             .map_err(|e| Error::new(Status::GenericFailure, format!("{e}")))?;
