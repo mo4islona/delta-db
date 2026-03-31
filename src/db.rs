@@ -6,7 +6,7 @@ use crate::engine::dag::DeltaEngine;
 use crate::error::{Error, Result};
 use crate::schema::parser::parse_schema;
 use crate::storage::memory::MemoryBackend;
-use crate::storage::rocks::RocksDbBackend;
+use crate::storage::rocks::{RocksDbBackend, RocksDbConfig};
 use crate::storage::{StorageBackend, StorageWriteBatch};
 use crate::types::{BlockCursor, BlockNumber, DeltaBatch, DeltaRecord, PerfNode, RowMap, Value};
 
@@ -21,6 +21,12 @@ pub struct Config {
     pub data_dir: Option<String>,
     /// Explicit storage backend override. Takes precedence over data_dir.
     pub storage: Option<Arc<dyn StorageBackend>>,
+    /// Compression algorithm for RocksDB: "none", "snappy" (default), "zstd", "lz4".
+    pub compression: Option<String>,
+    /// Disable RocksDB automatic background compactions.
+    pub disable_compaction: bool,
+    /// Block cache size in bytes. None = RocksDB default, 0 = disable.
+    pub cache_size: Option<usize>,
 }
 
 impl Config {
@@ -32,6 +38,9 @@ impl Config {
             max_buffer_size: 10_000,
             data_dir: None,
             storage: None,
+            compression: None,
+            disable_compaction: false,
+            cache_size: None,
         }
     }
 
@@ -42,6 +51,9 @@ impl Config {
             max_buffer_size: 10_000,
             data_dir: Some(data_dir.into()),
             storage: None,
+            compression: None,
+            disable_compaction: false,
+            cache_size: None,
         }
     }
 
@@ -90,7 +102,12 @@ impl DeltaDb {
         let storage: Arc<dyn StorageBackend> = if let Some(s) = config.storage {
             s
         } else if let Some(ref dir) = config.data_dir {
-            Arc::new(RocksDbBackend::open(dir)?)
+            let rocks_config = RocksDbConfig {
+                compression: config.compression.clone(),
+                disable_compaction: config.disable_compaction,
+                cache_size: config.cache_size,
+            };
+            Arc::new(RocksDbBackend::open(dir, &rocks_config)?)
         } else {
             Arc::new(MemoryBackend::new())
         };
