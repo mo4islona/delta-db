@@ -31,7 +31,7 @@ mod napi_bridge {
 
     /// Raw napi env + callback pointers. Stored in thread-local.
     /// We store raw pointers because napi::Ref<()> is not Clone.
-    struct ExternalContext {
+    pub(crate) struct ExternalContext {
         env: napi::Env,
         /// reducer_id → raw napi_ref (prevent GC)
         callbacks: HashMap<String, sys::napi_ref>,
